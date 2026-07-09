@@ -9,7 +9,9 @@ use crate::store::ObjectStore;
 use anyhow::{bail, Context};
 use directories::ProjectDirs;
 use filetime::FileTime;
+use fs2::FileExt;
 use serde::Serialize;
+use serde::{Deserialize, Serialize as SerdeSerialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -64,6 +66,13 @@ struct FlatEntry {
     entry: TreeEntry,
 }
 
+#[derive(Debug, SerdeSerialize, Deserialize)]
+struct RestoreIntent {
+    pre_snapshot: ObjectId,
+    target_snapshot: ObjectId,
+    paths: Vec<Vec<u8>>,
+}
+
 impl AgitRepository {
     pub fn watch(root: &Path) -> anyhow::Result<(Self, ObjectId)> {
         let root = root
@@ -95,6 +104,7 @@ impl AgitRepository {
             workspace_id,
             store,
         };
+        repository.recover_interrupted_rewind()?;
         let trigger = if repository
             .store
             .workspace_head(&repository.workspace_id)?
@@ -125,11 +135,13 @@ impl AgitRepository {
             id
         };
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
-        Ok(Self {
+        let repository = Self {
             root,
             workspace_id,
             store,
-        })
+        };
+        repository.recover_interrupted_rewind()?;
+        Ok(repository)
     }
 
     pub fn root(&self) -> &Path {
@@ -260,6 +272,7 @@ impl AgitRepository {
         paths: &[PathBuf],
         sqlite_consistent: bool,
     ) -> anyhow::Result<(ObjectId, RewindPlan)> {
+        let lock = self.acquire_mutation_lock()?;
         let plan = self.plan_rewind(target, paths)?;
         let pre = self.snapshot(
             Some(format!("before rewind to {}", &id_hex(target)[..12])),
@@ -267,6 +280,14 @@ impl AgitRepository {
         )?;
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
         let target_entries = self.flatten_tree(&target_snapshot.root_tree)?;
+        self.write_restore_intent(&RestoreIntent {
+            pre_snapshot: pre,
+            target_snapshot: *target,
+            paths: paths
+                .iter()
+                .map(|path| path.as_os_str().as_bytes().to_vec())
+                .collect(),
+        })?;
 
         let result = self
             .apply_rewind(&target_entries, &plan, paths)
@@ -282,8 +303,12 @@ impl AgitRepository {
             let rollback_plan = self.plan_rewind(&pre, paths)?;
             self.apply_rewind(&pre_entries, &rollback_plan, paths)
                 .context("rewind failed and rollback also failed")?;
+            self.clear_restore_intent()?;
+            FileExt::unlock(&lock)?;
             return Err(error.context("rewind aborted; the pre-rewind state was restored"));
         }
+        self.clear_restore_intent()?;
+        FileExt::unlock(&lock)?;
         Ok((pre, plan))
     }
 
@@ -594,6 +619,7 @@ impl AgitRepository {
         plan: &RewindPlan,
         selected_paths: &[PathBuf],
     ) -> anyhow::Result<()> {
+        let mut applied_operations = 0_usize;
         let changed: BTreeSet<Vec<u8>> = plan
             .changes
             .iter()
@@ -661,6 +687,13 @@ impl AgitRepository {
                 EntryKind::SocketMarker => {}
                 EntryKind::Directory => unreachable!(),
             }
+            applied_operations += 1;
+            if applied_operations == 1
+                && std::env::var_os("AGIT_FAILPOINT").as_deref()
+                    == Some(OsStr::new("rewind_after_first_change"))
+            {
+                std::process::exit(86);
+            }
         }
 
         // Remove paths absent from the target, deepest first.
@@ -720,6 +753,70 @@ impl AgitRepository {
         temp.persist(destination).map_err(|error| error.error)?;
         let mtime = FileTime::from_unix_time(entry.mtime_secs, entry.mtime_nanos);
         filetime::set_file_mtime(destination, mtime)?;
+        Ok(())
+    }
+
+    fn acquire_mutation_lock(&self) -> anyhow::Result<File> {
+        let path = self
+            .store
+            .workspace_data_dir(&self.workspace_id)
+            .join("mutation.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock_exclusive()?;
+        Ok(file)
+    }
+
+    fn restore_intent_path(&self) -> PathBuf {
+        self.store
+            .workspace_data_dir(&self.workspace_id)
+            .join("restore.intent")
+    }
+
+    fn write_restore_intent(&self, intent: &RestoreIntent) -> anyhow::Result<()> {
+        let path = self.restore_intent_path();
+        atomic_write(&path, &serde_json::to_vec(intent)?)?;
+        File::open(path.parent().context("restore intent has no parent")?)?.sync_all()?;
+        Ok(())
+    }
+
+    fn clear_restore_intent(&self) -> anyhow::Result<()> {
+        let path = self.restore_intent_path();
+        if path.exists() {
+            fs::remove_file(&path)?;
+            File::open(path.parent().context("restore intent has no parent")?)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn recover_interrupted_rewind(&self) -> anyhow::Result<()> {
+        let path = self.restore_intent_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        let lock = self.acquire_mutation_lock()?;
+        let intent: RestoreIntent = serde_json::from_slice(&fs::read(&path)?)?;
+        eprintln!(
+            "agit: recovering interrupted rewind; restoring pre-rewind snapshot {}",
+            &id_hex(&intent.pre_snapshot)[..12]
+        );
+        let snapshot: Snapshot = self
+            .store
+            .read_struct(&intent.pre_snapshot, ObjectKind::Snapshot)?;
+        let entries = self.flatten_tree(&snapshot.root_tree)?;
+        let paths: Vec<PathBuf> = intent
+            .paths
+            .into_iter()
+            .map(|path| PathBuf::from(OsString::from_vec(path)))
+            .collect();
+        let plan = self.plan_rewind(&intent.pre_snapshot, &paths)?;
+        self.apply_rewind(&entries, &plan, &paths)?;
+        self.clear_restore_intent()?;
+        FileExt::unlock(&lock)?;
         Ok(())
     }
 }

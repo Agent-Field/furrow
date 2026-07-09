@@ -214,6 +214,10 @@ impl ObjectStore {
         &self.root
     }
 
+    pub fn workspace_data_dir(&self, workspace_id: &str) -> PathBuf {
+        self.root.join("workspaces").join(workspace_id)
+    }
+
     pub fn stats(&self) -> anyhow::Result<StoreStats> {
         let mut physical_bytes = 0_u64;
         for entry in fs::read_dir(self.root.join("packs"))? {

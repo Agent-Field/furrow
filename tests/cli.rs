@@ -344,6 +344,38 @@ fn unchanged_snapshots_reuse_cached_blobs_and_add_only_small_metadata() {
 }
 
 #[test]
+fn interrupted_rewind_rolls_back_to_pre_rewind_state_on_next_command() {
+    let fixture = Fixture::new();
+    let snapshot = fixture.watch();
+    fs::write(fixture.repo.join(".env"), b"TOKEN=broken\n").unwrap();
+    fs::write(fixture.repo.join("app.txt"), b"broken app\n").unwrap();
+
+    fixture
+        .agit()
+        .env("AGIT_FAILPOINT", "rewind_after_first_change")
+        .args(["rewind", &snapshot, "--yes"])
+        .assert()
+        .code(86);
+
+    // Opening the repository detects the durable intent and restores the
+    // automatic pre-rewind snapshot before serving status.
+    fixture
+        .agit()
+        .arg("status")
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("recovering interrupted rewind"));
+    assert_eq!(
+        fs::read(fixture.repo.join(".env")).unwrap(),
+        b"TOKEN=broken\n"
+    );
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"broken app\n"
+    );
+}
+
+#[test]
 fn recovery_rediscovers_workspace_after_git_clean_removes_pointer() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();
