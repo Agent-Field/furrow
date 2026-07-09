@@ -311,6 +311,26 @@ fn watch_refuses_non_git_directories() {
         .stderr(predicates::str::contains("requires a Git repository"));
 }
 
+#[test]
+fn recovery_rediscovers_workspace_after_git_clean_removes_pointer() {
+    let fixture = Fixture::new();
+    let snapshot = fixture.watch();
+    git(&fixture.repo, &["clean", "-fdx"]);
+    assert!(!fixture.repo.join(".agit/workspace-id").exists());
+    assert!(!fixture.repo.join(".env").exists());
+
+    fixture
+        .agit()
+        .args(["rewind", &snapshot, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(fixture.repo.join(".env")).unwrap(),
+        b"TOKEN=original\n"
+    );
+    assert!(fixture.repo.join(".agit/workspace-id").exists());
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")

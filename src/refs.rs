@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"AGRF";
 const MAX_RECORD: usize = 1024 * 1024;
+type DecodedRecords = (Vec<(RefRecord, ObjectId)>, u64, bool);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefRecord {
@@ -56,6 +57,7 @@ impl RefLog {
     ) -> anyhow::Result<RefRecord> {
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&self.lock_path)?;
@@ -102,7 +104,7 @@ impl RefLog {
     }
 }
 
-fn read_records(file: &mut File) -> anyhow::Result<(Vec<(RefRecord, ObjectId)>, u64, bool)> {
+fn read_records(file: &mut File) -> anyhow::Result<DecodedRecords> {
     file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
     let mut offset = 0_u64;

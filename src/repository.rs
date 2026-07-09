@@ -101,11 +101,18 @@ impl AgitRepository {
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
-        let workspace_id = fs::read_to_string(root.join(WORKSPACE_FILE))
-            .context("this repository is not watched; run `agit watch` first")?
-            .trim()
-            .to_owned();
         let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
+        let workspace_path = root.join(WORKSPACE_FILE);
+        let workspace_id = if workspace_path.exists() {
+            fs::read_to_string(&workspace_path)?.trim().to_owned()
+        } else {
+            let id = store
+                .find_workspace(root.as_os_str().as_bytes())?
+                .context("this repository is not watched; run `agit watch` first")?;
+            fs::create_dir_all(root.join(".agit"))?;
+            atomic_write(&workspace_path, format!("{id}\n").as_bytes())?;
+            id
+        };
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         Ok(Self {
             root,

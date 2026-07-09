@@ -44,6 +44,7 @@ impl ObjectStore {
         let lock_path = self.root.join("locks").join("pack.lock");
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;
@@ -109,11 +110,40 @@ impl ObjectStore {
     }
 
     pub fn ensure_workspace(&mut self, id: &str, root: &[u8]) -> anyhow::Result<()> {
+        let workspace_dir = self.root.join("workspaces").join(id);
+        fs::create_dir_all(&workspace_dir)?;
+        let metadata_path = workspace_dir.join("root.path");
+        if !metadata_path.exists() {
+            let temporary = workspace_dir.join("root.path.tmp");
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(root)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &metadata_path)?;
+            File::open(&workspace_dir)?.sync_all()?;
+        }
         self.catalog.ensure_workspace(id, root)?;
         for record in RefLog::open(&self.root, id)?.records()? {
             self.index_ref_record(id, &record)?;
         }
         Ok(())
+    }
+
+    pub fn find_workspace(&self, root: &[u8]) -> anyhow::Result<Option<String>> {
+        for entry in fs::read_dir(self.root.join("workspaces"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let metadata_path = entry.path().join("root.path");
+            if metadata_path.exists() && fs::read(metadata_path)? == root {
+                return Ok(Some(entry.file_name().to_string_lossy().into_owned()));
+            }
+        }
+        Ok(None)
     }
 
     pub fn workspace_head(&self, id: &str) -> anyhow::Result<Option<ObjectId>> {
