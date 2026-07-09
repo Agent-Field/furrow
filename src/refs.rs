@@ -90,11 +90,23 @@ impl RefLog {
         let lock = self.lock()?;
         let mut log = self.open_log()?;
         self.ensure_index(&mut log)?;
+        let records = match self.read_recent_indexed(&mut log, limit) {
+            Ok(records) => records,
+            Err(_) => {
+                self.rebuild_index(&mut log)?;
+                self.read_recent_indexed(&mut log, limit)?
+            }
+        };
+        FileExt::unlock(&lock)?;
+        Ok(records)
+    }
+
+    fn read_recent_indexed(&self, log: &mut File, limit: usize) -> anyhow::Result<Vec<RefRecord>> {
         let entries = self.read_index_tail(limit.saturating_add(1))?;
         let skip = usize::from(entries.len() > limit);
         let mut decoded = Vec::with_capacity(entries.len().saturating_sub(skip));
         for entry in &entries[skip..] {
-            let frame = read_frame_at(&mut log, entry.start)?
+            let frame = read_frame_at(log, entry.start)?
                 .context("reference index points beyond the log")?;
             anyhow::ensure!(
                 frame.end == entry.end && frame.frame_hash == entry.frame_hash,
@@ -119,7 +131,6 @@ impl RefLog {
                 "broken reference hash chain"
             );
         }
-        FileExt::unlock(&lock)?;
         Ok(decoded
             .into_iter()
             .rev()
@@ -629,5 +640,37 @@ mod tests {
         file.sync_data().unwrap();
 
         assert!(log.records().unwrap_err().to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn corrupt_advisory_index_record_is_rebuilt_from_the_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RefLog::open(temp.path(), "workspace").unwrap();
+        for byte in 1..=5 {
+            append(&log, byte);
+        }
+
+        let mut index = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log.index_path)
+            .unwrap();
+        index
+            .seek(SeekFrom::Start(
+                INDEX_MAGIC.len() as u64 + INDEX_RECORD_LEN as u64 + 17,
+            ))
+            .unwrap();
+        index.write_all(b"X").unwrap();
+        index.sync_data().unwrap();
+
+        let recent = log.recent(4).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|record| record.snapshot_id)
+                .collect::<Vec<_>>(),
+            vec![snapshot(5), snapshot(4), snapshot(3), snapshot(2)]
+        );
+        assert_eq!(log.recent(5).unwrap().len(), 5);
     }
 }
