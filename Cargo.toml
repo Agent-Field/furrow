@@ -12,6 +12,7 @@ blake3 = "=1.5.5"
 clap = { version = "=4.5.31", features = ["derive"] }
 directories = "=5.0.1"
 fs2 = "=0.4.3"
+filetime = "=0.2.25"
 hex = "=0.4.3"
 libc = "=0.2.169"
 rusqlite = { version = "=0.32.1", features = ["backup", "bundled"] }

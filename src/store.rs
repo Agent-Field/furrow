@@ -1,5 +1,6 @@
-use crate::catalog::Catalog;
-use crate::model::{ObjectId, ObjectKind};
+use crate::catalog::{Catalog, TimelineRow};
+use crate::model::{ObjectId, ObjectKind, SnapshotTrigger};
+use crate::refs::{RefLog, RefRecord};
 use anyhow::Context;
 use fs2::FileExt;
 use serde::{de::DeserializeOwned, Serialize};
@@ -8,6 +9,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const PACK_NAME: &str = "pack-000001.agp";
+const OBJECT_MAGIC: &[u8; 4] = b"AGOB";
+const OBJECT_END: &[u8; 4] = b"AGND";
+const OBJECT_VERSION: u8 = 1;
+const HEADER_LEN: u64 = 4 + 1 + 1 + 8 + 32 + 32;
+const MAX_OBJECT_LEN: u64 = 256 * 1024 * 1024;
 
 pub struct ObjectStore {
     root: PathBuf,
@@ -18,19 +24,18 @@ impl ObjectStore {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(root.join("packs"))?;
         fs::create_dir_all(root.join("locks"))?;
+        fs::create_dir_all(root.join("workspaces"))?;
         let catalog = Catalog::open(&root.join("catalog.sqlite3"))?;
-        Ok(Self { root, catalog })
-    }
-
-    pub fn catalog(&self) -> &Catalog {
-        &self.catalog
-    }
-
-    pub fn catalog_mut(&mut self) -> &mut Catalog {
-        &mut self.catalog
+        let store = Self { root, catalog };
+        store.recover_pack()?;
+        Ok(store)
     }
 
     pub fn put_bytes(&self, kind: ObjectKind, bytes: &[u8]) -> anyhow::Result<ObjectId> {
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_OBJECT_LEN,
+            "object exceeds size limit"
+        );
         let id = object_id(kind, bytes);
         if self.catalog.object(&id)?.is_some() {
             return Ok(id);
@@ -51,11 +56,19 @@ impl ObjectStore {
                 .append(true)
                 .read(true)
                 .open(&pack_path)?;
-            let offset = pack.seek(SeekFrom::End(0))?;
+            let record_start = pack.seek(SeekFrom::End(0))?;
+            let checksum = blake3::hash(bytes);
+            pack.write_all(OBJECT_MAGIC)?;
+            pack.write_all(&[OBJECT_VERSION, kind as u8])?;
+            pack.write_all(&(bytes.len() as u64).to_le_bytes())?;
+            pack.write_all(&id)?;
+            pack.write_all(checksum.as_bytes())?;
+            let payload_offset = record_start + HEADER_LEN;
             pack.write_all(bytes)?;
+            pack.write_all(OBJECT_END)?;
             pack.sync_data()?;
             self.catalog
-                .insert_object(&id, kind, PACK_NAME, offset, bytes.len() as u64)?;
+                .insert_object(&id, kind, PACK_NAME, payload_offset, bytes.len() as u64)?;
         }
         FileExt::unlock(&lock)?;
         Ok(id)
@@ -95,8 +108,153 @@ impl ObjectStore {
         Ok(serde_json::from_slice(&self.read_bytes(id, expected)?)?)
     }
 
+    pub fn ensure_workspace(&mut self, id: &str, root: &[u8]) -> anyhow::Result<()> {
+        self.catalog.ensure_workspace(id, root)?;
+        for record in RefLog::open(&self.root, id)?.records()? {
+            self.index_ref_record(id, &record)?;
+        }
+        Ok(())
+    }
+
+    pub fn workspace_head(&self, id: &str) -> anyhow::Result<Option<ObjectId>> {
+        Ok(RefLog::open(&self.root, id)?
+            .records()?
+            .last()
+            .map(|record| record.snapshot_id))
+    }
+
+    pub fn timeline(&self, id: &str, limit: usize) -> anyhow::Result<Vec<TimelineRow>> {
+        let records = RefLog::open(&self.root, id)?.records()?;
+        Ok(records
+            .into_iter()
+            .rev()
+            .take(limit)
+            .map(|record| TimelineRow {
+                id: record.snapshot_id,
+                sealed_at: record.sealed_at,
+                label: record.label,
+                trigger: trigger_name(&record.trigger).to_owned(),
+            })
+            .collect())
+    }
+
+    pub fn publish_snapshot(
+        &mut self,
+        workspace_id: &str,
+        snapshot_id: ObjectId,
+        sealed_at: i64,
+        label: Option<String>,
+        trigger: SnapshotTrigger,
+    ) -> anyhow::Result<()> {
+        // The append is the visibility boundary. Every referenced object was
+        // sync'd before this call; SQLite is an advisory index rebuilt from it.
+        let record = RefLog::open(&self.root, workspace_id)?.append(
+            snapshot_id,
+            sealed_at,
+            label,
+            trigger,
+        )?;
+        self.index_ref_record(workspace_id, &record)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn index_ref_record(&mut self, workspace_id: &str, record: &RefRecord) -> anyhow::Result<()> {
+        self.catalog.commit_snapshot(
+            workspace_id,
+            &record.snapshot_id,
+            record.sealed_at,
+            record.label.as_deref(),
+            trigger_name(&record.trigger),
+        )
+    }
+
+    fn recover_pack(&self) -> anyhow::Result<()> {
+        let pack_path = self.root.join("packs").join(PACK_NAME);
+        if !pack_path.exists() {
+            return Ok(());
+        }
+        let mut pack = OpenOptions::new().read(true).write(true).open(&pack_path)?;
+        let file_len = pack.metadata()?.len();
+        let mut offset = 0_u64;
+        while offset < file_len {
+            let record_start = offset;
+            let mut magic = [0_u8; 4];
+            if pack.read_exact(&mut magic).is_err() {
+                pack.set_len(record_start)?;
+                break;
+            }
+            anyhow::ensure!(
+                &magic == OBJECT_MAGIC,
+                "object pack corruption at byte {record_start}"
+            );
+            let mut meta = [0_u8; 2];
+            if pack.read_exact(&mut meta).is_err() {
+                pack.set_len(record_start)?;
+                break;
+            }
+            anyhow::ensure!(meta[0] == OBJECT_VERSION, "unsupported object pack version");
+            let kind = ObjectKind::from_u8(meta[1]).context("invalid object kind in pack")?;
+            let mut len_bytes = [0_u8; 8];
+            if pack.read_exact(&mut len_bytes).is_err() {
+                pack.set_len(record_start)?;
+                break;
+            }
+            let len = u64::from_le_bytes(len_bytes);
+            anyhow::ensure!(
+                len <= MAX_OBJECT_LEN,
+                "object pack record exceeds size limit"
+            );
+            let mut id = [0_u8; 32];
+            let mut checksum = [0_u8; 32];
+            if pack.read_exact(&mut id).is_err() || pack.read_exact(&mut checksum).is_err() {
+                pack.set_len(record_start)?;
+                break;
+            }
+            let payload_offset = record_start + HEADER_LEN;
+            if file_len.saturating_sub(payload_offset) < len + OBJECT_END.len() as u64 {
+                pack.set_len(record_start)?;
+                break;
+            }
+            let mut remaining = len;
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            let mut content_hasher = blake3::Hasher::new();
+            content_hasher.update(kind.domain());
+            let mut checksum_hasher = blake3::Hasher::new();
+            while remaining > 0 {
+                let take = remaining.min(buffer.len() as u64) as usize;
+                pack.read_exact(&mut buffer[..take])?;
+                content_hasher.update(&buffer[..take]);
+                checksum_hasher.update(&buffer[..take]);
+                remaining -= take as u64;
+            }
+            let mut end = [0_u8; 4];
+            pack.read_exact(&mut end)?;
+            anyhow::ensure!(&end == OBJECT_END, "object pack trailer mismatch");
+            anyhow::ensure!(
+                checksum_hasher.finalize().as_bytes() == &checksum,
+                "object payload checksum mismatch"
+            );
+            anyhow::ensure!(
+                content_hasher.finalize().as_bytes() == &id,
+                "object ID mismatch"
+            );
+            self.catalog
+                .insert_object(&id, kind, PACK_NAME, payload_offset, len)?;
+            offset = pack.stream_position()?;
+        }
+        pack.sync_data()?;
+        Ok(())
+    }
+}
+
+fn trigger_name(trigger: &SnapshotTrigger) -> &'static str {
+    match trigger {
+        SnapshotTrigger::Initial => "initial",
+        SnapshotTrigger::Manual => "manual",
+        SnapshotTrigger::PreRewind => "pre_rewind",
     }
 }
 

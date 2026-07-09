@@ -6,6 +6,7 @@ use crate::model::{
 use crate::store::ObjectStore;
 use anyhow::{bail, Context};
 use directories::ProjectDirs;
+use filetime::FileTime;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -73,10 +74,8 @@ impl AgitRepository {
             !root.starts_with(&store_root),
             "workspace cannot contain the agit store"
         );
-        let store = ObjectStore::open(store_root)?;
-        store
-            .catalog()
-            .ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
+        let mut store = ObjectStore::open(store_root)?;
+        store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         let mut repository = Self {
             root,
             workspace_id,
@@ -84,7 +83,6 @@ impl AgitRepository {
         };
         let trigger = if repository
             .store
-            .catalog()
             .workspace_head(&repository.workspace_id)?
             .is_some()
         {
@@ -104,10 +102,8 @@ impl AgitRepository {
             .context("this repository is not watched; run `agit watch` first")?
             .trim()
             .to_owned();
-        let store = ObjectStore::open(data_root()?.join("store-v1"))?;
-        store
-            .catalog()
-            .ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
+        let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
+        store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         Ok(Self {
             root,
             workspace_id,
@@ -128,7 +124,7 @@ impl AgitRepository {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<ObjectId> {
-        let parent = self.store.catalog().workspace_head(&self.workspace_id)?;
+        let parent = self.store.workspace_head(&self.workspace_id)?;
         let root_tree = self.capture_directory(&self.root)?;
         let (secs, nanos) = now();
         let snapshot = Snapshot {
@@ -141,24 +137,13 @@ impl AgitRepository {
             label: label.clone(),
         };
         let id = self.store.put_struct(ObjectKind::Snapshot, &snapshot)?;
-        let trigger_name = match trigger {
-            SnapshotTrigger::Initial => "initial",
-            SnapshotTrigger::Manual => "manual",
-            SnapshotTrigger::PreRewind => "pre_rewind",
-        };
-        self.store.catalog_mut().commit_snapshot(
-            &self.workspace_id,
-            &id,
-            secs,
-            label.as_deref(),
-            trigger_name,
-        )?;
+        self.store
+            .publish_snapshot(&self.workspace_id, id, secs, label, trigger)?;
         Ok(id)
     }
 
     pub fn timeline(&self, limit: usize) -> anyhow::Result<Vec<SnapshotSummary>> {
         self.store
-            .catalog()
             .timeline(&self.workspace_id, limit)?
             .into_iter()
             .map(|row| {
@@ -184,7 +169,6 @@ impl AgitRepository {
         );
         let matches: Vec<ObjectId> = self
             .store
-            .catalog()
             .timeline(&self.workspace_id, 100_000)?
             .into_iter()
             .filter(|row| id_hex(&row.id).starts_with(value))
@@ -525,6 +509,20 @@ impl AgitRepository {
                 }
             }
         }
+
+        // Apply directory mtimes after child operations so materialization does
+        // not overwrite the captured timestamp.
+        for (path, flat) in target.iter().rev() {
+            if !changed.contains(path)
+                || !selected(path, selected_paths)
+                || flat.entry.kind != EntryKind::Directory
+            {
+                continue;
+            }
+            let destination = safe_join(&self.root, path)?;
+            let mtime = FileTime::from_unix_time(flat.entry.mtime_secs, flat.entry.mtime_nanos);
+            filetime::set_file_mtime(destination, mtime)?;
+        }
         Ok(())
     }
 
@@ -549,6 +547,8 @@ impl AgitRepository {
             }
         }
         temp.persist(destination).map_err(|error| error.error)?;
+        let mtime = FileTime::from_unix_time(entry.mtime_secs, entry.mtime_nanos);
+        filetime::set_file_mtime(destination, mtime)?;
         Ok(())
     }
 }

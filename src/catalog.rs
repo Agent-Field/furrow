@@ -122,7 +122,7 @@ impl Catalog {
     ) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO timeline(workspace_id, snapshot_id, sealed_at, label, trigger)
+            "INSERT OR IGNORE INTO timeline(workspace_id, snapshot_id, sealed_at, label, trigger)
              VALUES(?1, ?2, ?3, ?4, ?5)",
             params![
                 workspace_id,
