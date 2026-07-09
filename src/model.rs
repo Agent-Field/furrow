@@ -86,6 +86,7 @@ pub enum SealQuality {
 pub enum SnapshotTrigger {
     Initial,
     Manual,
+    Watcher,
     PreRewind,
 }
 

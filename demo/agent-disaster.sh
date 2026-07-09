@@ -6,6 +6,7 @@ BIN="$PROJECT_ROOT/target/release/agit"
 DEMO_ROOT=${AGIT_DEMO_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/agit-demo.XXXXXX")}
 REPO="$DEMO_ROOT/project"
 export AGIT_DATA_DIR="$DEMO_ROOT/agit-data"
+export AGIT_NO_DAEMON=1
 
 green='\033[0;32m'
 red='\033[0;31m'
@@ -91,4 +92,3 @@ step "Timeline proves the rewind is reversible"
 "$BIN" --repo "$REPO" timeline
 
 printf '\n%bDemo complete.%b Workspace retained at %s\n' "$green" "$reset" "$DEMO_ROOT"
-

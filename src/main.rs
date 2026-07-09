@@ -19,7 +19,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Attach a repository and create its first complete snapshot.
-    Watch,
+    Watch {
+        /// Keep running and seal after filesystem write quiescence.
+        #[arg(long)]
+        foreground: bool,
+        /// Attach and snapshot without leaving a background watcher running.
+        #[arg(long, conflicts_with = "foreground")]
+        no_daemon: bool,
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
+    },
+    #[command(name = "__daemon", hide = true)]
+    Daemon {
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
+    },
     /// Create a complete labeled snapshot now.
     Snap {
         #[arg(short, long)]
@@ -55,7 +69,11 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Watch => {
+        Command::Watch {
+            foreground,
+            no_daemon,
+            debounce_ms,
+        } => {
             let (repository, id) = AgitRepository::watch(&cli.repo)?;
             if cli.json {
                 println!(
@@ -71,6 +89,21 @@ fn main() -> anyhow::Result<()> {
                 println!("Snapshot {}", id_hex(&id));
                 println!("Store {}", repository.store_root().display());
             }
+            if foreground {
+                agit::watcher::run(
+                    repository,
+                    std::time::Duration::from_millis(debounce_ms.max(10)),
+                )?;
+            } else if !no_daemon && std::env::var_os("AGIT_NO_DAEMON").is_none() {
+                spawn_background_watcher(&repository, debounce_ms.max(10))?;
+            }
+        }
+        Command::Daemon { debounce_ms } => {
+            let repository = AgitRepository::open(&cli.repo)?;
+            agit::watcher::run(
+                repository,
+                std::time::Duration::from_millis(debounce_ms.max(10)),
+            )?;
         }
         Command::Snap { message } => {
             let mut repository = AgitRepository::open(&cli.repo)?;
@@ -158,6 +191,14 @@ fn main() -> anyhow::Result<()> {
                 println!("Snapshots: {}", status.snapshots);
                 println!("Objects:   {}", status.objects);
                 println!("Pack data: {} bytes", status.physical_bytes);
+                println!(
+                    "Watcher:   {}",
+                    if status.watcher_running {
+                        "running"
+                    } else {
+                        "stopped"
+                    }
+                );
             }
         }
         Command::Forget { purge } => {
@@ -173,4 +214,39 @@ fn print_plan(plan: &agit::RewindPlan) {
     for change in &plan.changes {
         println!("  {:<8} {}", change.action, change.path);
     }
+}
+
+fn spawn_background_watcher(repository: &AgitRepository, debounce_ms: u64) -> anyhow::Result<()> {
+    let daemon_dir = repository.workspace_data_dir();
+    std::fs::create_dir_all(&daemon_dir)?;
+    let pid_path = daemon_dir.join("daemon.pid");
+    if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                println!("Watcher already running with PID {pid}");
+                return Ok(());
+            }
+        }
+    }
+
+    let log_path = daemon_dir.join("daemon.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let stderr = stdout.try_clone()?;
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .arg("--repo")
+        .arg(repository.root())
+        .arg("__daemon")
+        .arg("--debounce-ms")
+        .arg(debounce_ms.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()?;
+    std::fs::write(&pid_path, format!("{}\n", child.id()))?;
+    println!("Watcher started with PID {}", child.id());
+    println!("Log {}", log_path.display());
+    Ok(())
 }

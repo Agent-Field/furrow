@@ -15,6 +15,7 @@ fs2 = "=0.4.3"
 filetime = "=0.2.25"
 hex = "=0.4.3"
 libc = "=0.2.169"
+notify = "=7.0.0"
 rusqlite = { version = "=0.32.1", features = ["backup", "bundled"] }
 serde = { version = "=1.0.217", features = ["derive"] }
 serde_bytes = "=0.11.15"

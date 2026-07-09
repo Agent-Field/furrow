@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -44,6 +45,7 @@ impl Fixture {
         let mut command = Command::cargo_bin("agit").unwrap();
         command
             .env("AGIT_DATA_DIR", &self.data)
+            .env("AGIT_NO_DAEMON", "1")
             .arg("--repo")
             .arg(&self.repo);
         command
@@ -303,6 +305,7 @@ fn watch_refuses_non_git_directories() {
     Command::cargo_bin("agit")
         .unwrap()
         .env("AGIT_DATA_DIR", temp.path().join("data"))
+        .env("AGIT_NO_DAEMON", "1")
         .arg("--repo")
         .arg(temp.path())
         .arg("watch")
@@ -373,6 +376,92 @@ fn interrupted_rewind_rolls_back_to_pre_rewind_state_on_next_command() {
         fs::read(fixture.repo.join("app.txt")).unwrap(),
         b"broken app\n"
     );
+}
+
+#[test]
+fn foreground_watcher_seals_after_write_quiescence() {
+    let fixture = Fixture::new();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agit"))
+        .env("AGIT_DATA_DIR", &fixture.data)
+        .arg("--repo")
+        .arg(&fixture.repo)
+        .args(["watch", "--foreground", "--debounce-ms", "100"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.repo.join(".agit/workspace-id").exists() {
+        assert!(Instant::now() < deadline, "watcher did not attach in time");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // The initial snapshot precedes watcher installation. Give the native
+    // backend time to enter its event loop before creating the test event.
+    // Avoid polling the growing pack during this one-time ingest.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "foreground watcher exited during initial protection"
+    );
+    fs::write(
+        fixture.repo.join("automatic.txt"),
+        b"captured automatically\n",
+    )
+    .unwrap();
+
+    let mut saw_watcher_snapshot = false;
+    while Instant::now() < deadline {
+        let output = fixture
+            .agit()
+            .args(["--json", "timeline"])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            saw_watcher_snapshot = value
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["trigger"] == "watcher");
+            if saw_watcher_snapshot {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    child.kill().ok();
+    child.wait().ok();
+    assert!(saw_watcher_snapshot, "watcher did not publish a snapshot");
+}
+
+#[test]
+fn default_watch_starts_background_protection_and_forget_stops_it() {
+    let fixture = Fixture::new();
+    std::process::Command::new(env!("CARGO_BIN_EXE_agit"))
+        .env("AGIT_DATA_DIR", &fixture.data)
+        .arg("--repo")
+        .arg(&fixture.repo)
+        .arg("watch")
+        .status()
+        .unwrap()
+        .success()
+        .then_some(())
+        .expect("watch failed");
+
+    let output = fixture.agit().args(["--json", "status"]).output().unwrap();
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["watcher_running"], true);
+
+    fixture.agit().arg("forget").assert().success();
+    let workspace = fixture.data.join("store-v1/workspaces");
+    let pid_files: Vec<_> = fs::read_dir(workspace)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("daemon.pid"))
+        .filter(|path| path.exists())
+        .collect();
+    assert!(pid_files.is_empty());
 }
 
 #[test]

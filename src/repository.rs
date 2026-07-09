@@ -59,6 +59,7 @@ pub struct RepositoryStatus {
     pub snapshots: usize,
     pub objects: u64,
     pub physical_bytes: u64,
+    pub watcher_running: bool,
 }
 
 #[derive(Clone)]
@@ -152,6 +153,10 @@ impl AgitRepository {
         self.store.root()
     }
 
+    pub fn workspace_data_dir(&self) -> PathBuf {
+        self.store.workspace_data_dir(&self.workspace_id)
+    }
+
     pub fn snapshot(
         &mut self,
         label: Option<String>,
@@ -202,6 +207,7 @@ impl AgitRepository {
             snapshots: timeline.len(),
             objects: stats.objects,
             physical_bytes: stats.physical_bytes,
+            watcher_running: self.watcher_running(),
         })
     }
 
@@ -313,6 +319,7 @@ impl AgitRepository {
     }
 
     pub fn forget(self, purge: bool) -> anyhow::Result<()> {
+        self.stop_watcher()?;
         let workspace_file = self.root.join(WORKSPACE_FILE);
         if workspace_file.exists() {
             fs::remove_file(workspace_file)?;
@@ -320,6 +327,36 @@ impl AgitRepository {
         if purge {
             // Reachability-aware physical collection is intentionally performed by GC.
             eprintln!("workspace detached; unreachable data will be removed by `agit gc`");
+        }
+        Ok(())
+    }
+
+    fn watcher_running(&self) -> bool {
+        let pid_path = self.workspace_data_dir().join("daemon.pid");
+        let Ok(pid) = fs::read_to_string(pid_path) else {
+            return false;
+        };
+        let Ok(pid) = pid.trim().parse::<i32>() else {
+            return false;
+        };
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn stop_watcher(&self) -> anyhow::Result<()> {
+        let pid_path = self.workspace_data_dir().join("daemon.pid");
+        if let Ok(pid) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        if pid_path.exists() {
+            fs::remove_file(pid_path)?;
         }
         Ok(())
     }

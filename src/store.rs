@@ -255,6 +255,13 @@ impl ObjectStore {
         if !pack_path.exists() {
             return Ok(());
         }
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("locks").join("pack.lock"))?;
+        lock.lock_exclusive()?;
         let mut pack = OpenOptions::new().read(true).write(true).open(&pack_path)?;
         let file_len = pack.metadata()?.len();
         let mut offset = 0_u64;
@@ -325,6 +332,7 @@ impl ObjectStore {
             offset = pack.stream_position()?;
         }
         pack.sync_data()?;
+        FileExt::unlock(&lock)?;
         Ok(())
     }
 
@@ -340,6 +348,7 @@ fn trigger_name(trigger: &SnapshotTrigger) -> &'static str {
     match trigger {
         SnapshotTrigger::Initial => "initial",
         SnapshotTrigger::Manual => "manual",
+        SnapshotTrigger::Watcher => "watcher",
         SnapshotTrigger::PreRewind => "pre_rewind",
     }
 }
