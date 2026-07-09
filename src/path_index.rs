@@ -29,9 +29,23 @@ impl PathIndex {
                 ON entries(parent, name);
              CREATE TABLE IF NOT EXISTS state (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                root_tree BLOB NOT NULL
+                root_tree BLOB NOT NULL,
+                generation TEXT NOT NULL
              );",
         )?;
+        let has_generation: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('state') WHERE name = 'generation'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_generation {
+            connection.execute(
+                "ALTER TABLE state ADD COLUMN generation TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(Self {
             connection,
             transaction_active: false,
@@ -137,21 +151,23 @@ impl PathIndex {
         .map_err(Into::into)
     }
 
-    pub fn set_root(&self, root: &ObjectId) -> anyhow::Result<()> {
+    pub fn set_root(&self, root: &ObjectId, generation: &str) -> anyhow::Result<()> {
         self.connection.execute(
-            "INSERT INTO state(singleton, root_tree) VALUES(1, ?1)
-             ON CONFLICT(singleton) DO UPDATE SET root_tree=excluded.root_tree",
-            params![root.as_slice()],
+            "INSERT INTO state(singleton, root_tree, generation) VALUES(1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                root_tree=excluded.root_tree,
+                generation=excluded.generation",
+            params![root.as_slice(), generation],
         )?;
         Ok(())
     }
 
-    pub fn root(&self) -> anyhow::Result<Option<ObjectId>> {
+    pub fn root(&self, generation: &str) -> anyhow::Result<Option<ObjectId>> {
         let bytes: Option<Vec<u8>> = self
             .connection
             .query_row(
-                "SELECT root_tree FROM state WHERE singleton = 1",
-                [],
+                "SELECT root_tree FROM state WHERE singleton = 1 AND generation = ?1",
+                params![generation],
                 |row| row.get(0),
             )
             .optional()?;
@@ -220,7 +236,7 @@ mod tests {
         index.upsert(b"dir", b"", &directory).unwrap();
         index.upsert(b"dir/a", b"dir", &entry(b"a", 2)).unwrap();
         index.upsert(b"dir/b", b"dir", &entry(b"b", 3)).unwrap();
-        index.set_root(&[9; 32]).unwrap();
+        index.set_root(&[9; 32], "pack-one").unwrap();
         index.commit().unwrap();
 
         let first = index.children_after(b"dir", None, 1).unwrap();
@@ -229,7 +245,8 @@ mod tests {
             .children_after(b"dir", Some(&first[0].name), CHILD_BATCH)
             .unwrap();
         assert_eq!(second[0].name, b"b");
-        assert_eq!(index.root().unwrap(), Some([9; 32]));
+        assert_eq!(index.root("pack-one").unwrap(), Some([9; 32]));
+        assert_eq!(index.root("pack-two").unwrap(), None);
 
         index.begin().unwrap();
         assert_eq!(index.remove_subtree(b"dir").unwrap(), 3);

@@ -510,8 +510,17 @@ fn foreground_watcher_seals_after_write_quiescence() {
         b"captured automatically\n",
     )
     .unwrap();
+    fs::write(fixture.repo.join("app.txt"), b"watcher version\n").unwrap();
+    fs::remove_file(fixture.repo.join(".env")).unwrap();
+    fs::create_dir(fixture.repo.join("watcher-dir")).unwrap();
+    fs::write(
+        fixture.repo.join("watcher-dir/nested.txt"),
+        b"nested watcher state\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(fixture.repo.join("cache")).unwrap();
 
-    let mut saw_watcher_snapshot = false;
+    let mut watcher_snapshot = None;
     while Instant::now() < deadline {
         let output = fixture
             .agit()
@@ -520,12 +529,14 @@ fn foreground_watcher_seals_after_write_quiescence() {
             .unwrap();
         if output.status.success() {
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-            saw_watcher_snapshot = value
+            watcher_snapshot = value
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|row| row["trigger"] == "watcher");
-            if saw_watcher_snapshot {
+                .find(|row| row["trigger"] == "watcher")
+                .and_then(|row| row["id"].as_str())
+                .map(str::to_owned);
+            if watcher_snapshot.is_some() {
                 break;
             }
         }
@@ -533,7 +544,28 @@ fn foreground_watcher_seals_after_write_quiescence() {
     }
     child.kill().ok();
     child.wait().ok();
-    assert!(saw_watcher_snapshot, "watcher did not publish a snapshot");
+    let watcher_snapshot = watcher_snapshot.expect("watcher did not publish a snapshot");
+
+    fs::write(fixture.repo.join("app.txt"), b"later damage\n").unwrap();
+    fs::write(fixture.repo.join(".env"), b"TOKEN=recreated\n").unwrap();
+    fs::remove_dir_all(fixture.repo.join("watcher-dir")).unwrap();
+    fs::create_dir(fixture.repo.join("cache")).unwrap();
+    fs::write(fixture.repo.join("cache/damage"), b"recreated\n").unwrap();
+    fixture
+        .agit()
+        .args(["rewind", &watcher_snapshot, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"watcher version\n"
+    );
+    assert!(!fixture.repo.join(".env").exists());
+    assert!(!fixture.repo.join("cache").exists());
+    assert_eq!(
+        fs::read(fixture.repo.join("watcher-dir/nested.txt")).unwrap(),
+        b"nested watcher state\n"
+    );
 }
 
 #[test]

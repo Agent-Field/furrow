@@ -6,6 +6,7 @@ use crate::model::{
     id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
     SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
 };
+use crate::path_index::{PathIndex, CHILD_BATCH};
 use crate::sorted_dir::SortedDirectory;
 use crate::sqlite_adapter;
 use crate::store::ObjectStore;
@@ -196,19 +197,21 @@ impl AgitRepository {
         trigger: SnapshotTrigger,
         changed_paths: &[PathBuf],
     ) -> anyhow::Result<ObjectId> {
-        let dirty_directories = self.dirty_directories(changed_paths);
-        self.snapshot_internal(label, trigger, Some(&dirty_directories))
+        self.snapshot_internal(label, trigger, Some(changed_paths))
     }
 
     fn snapshot_internal(
         &mut self,
         label: Option<String>,
         trigger: SnapshotTrigger,
-        dirty_directories: Option<&BTreeSet<Vec<u8>>>,
+        changed_paths: Option<&[PathBuf]>,
     ) -> anyhow::Result<ObjectId> {
         let _maintenance = self.store.acquire_maintenance_shared()?;
         let parent = self.store.workspace_head(&self.workspace_id)?;
-        let root_tree = self.capture_root_retry(dirty_directories)?;
+        let root_tree = match changed_paths {
+            Some(paths) if !paths.is_empty() => self.capture_changed_paths_retry(paths)?,
+            _ => self.capture_root_retry()?,
+        };
         // Continuous watcher seals keep raw database/WAL/SHM bytes (L0) and
         // avoid a second whole-tree database discovery pass. Forced boundaries
         // attach the logically consistent SQLite image (L1).
@@ -392,8 +395,9 @@ impl AgitRepository {
     }
 
     pub fn plan_rewind(&self, target: &ObjectId, paths: &[PathBuf]) -> anyhow::Result<RewindPlan> {
+        let _maintenance = self.store.acquire_maintenance_shared()?;
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
-        let current_tree = self.capture_root_retry(None)?;
+        let current_tree = self.capture_root_retry()?;
         let mut changes = Vec::new();
         self.diff_directory(
             Some(current_tree),
@@ -445,10 +449,12 @@ impl AgitRepository {
             let pre_entries = self.entries_for_plan(&pre_snapshot.root_tree, &rollback_plan)?;
             self.apply_rewind(&pre_entries, &rollback_plan, paths)
                 .context("rewind failed and rollback also failed")?;
+            self.invalidate_path_index()?;
             self.clear_restore_intent()?;
             FileExt::unlock(&lock)?;
             return Err(error.context("rewind aborted; the pre-rewind state was restored"));
         }
+        self.invalidate_path_index()?;
         self.clear_restore_intent()?;
         FileExt::unlock(&lock)?;
         Ok((pre, plan))
@@ -505,16 +511,26 @@ impl AgitRepository {
         Ok(())
     }
 
-    fn capture_root_retry(
-        &self,
-        dirty_directories: Option<&BTreeSet<Vec<u8>>>,
-    ) -> anyhow::Result<ObjectId> {
+    fn capture_root_retry(&self) -> anyhow::Result<ObjectId> {
+        let mut index = self.open_path_index()?;
         let mut last_error = None;
         for _ in 0..3 {
-            match self.capture_directory_impl(&self.root, dirty_directories) {
-                Ok(id) => return Ok(id),
-                Err(error) if is_not_found(&error) => last_error = Some(error),
-                Err(error) => return Err(error),
+            index.begin()?;
+            index.reset()?;
+            match self.capture_directory_impl(&self.root, &index) {
+                Ok(id) => {
+                    index.set_root(&id, &self.store_generation()?)?;
+                    index.commit()?;
+                    return Ok(id);
+                }
+                Err(error) if is_not_found(&error) => {
+                    index.rollback()?;
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    index.rollback()?;
+                    return Err(error);
+                }
             }
         }
         Err(last_error
@@ -522,38 +538,130 @@ impl AgitRepository {
             .context("workspace kept changing while it was captured"))
     }
 
-    fn dirty_directories(&self, paths: &[PathBuf]) -> BTreeSet<Vec<u8>> {
-        let mut dirty = BTreeSet::new();
-        dirty.insert(Vec::new());
-        for path in paths {
-            let absolute = if path.is_absolute() {
-                path.clone()
+    fn capture_changed_paths_retry(&self, changed_paths: &[PathBuf]) -> anyhow::Result<ObjectId> {
+        let mut index = self.open_path_index()?;
+        let generation = self.store_generation()?;
+        if index.root(&generation)?.is_none() {
+            return self.capture_root_retry();
+        }
+
+        let mut last_error = None;
+        for _ in 0..3 {
+            index.begin()?;
+            match self.capture_changed_paths_impl(&index, changed_paths) {
+                Ok(id) => {
+                    index.set_root(&id, &generation)?;
+                    index.commit()?;
+                    return Ok(id);
+                }
+                Err(error) if is_not_found(&error) => {
+                    index.rollback()?;
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    index.rollback()?;
+                    return Err(error);
+                }
+            }
+        }
+        Err(last_error
+            .context("incremental capture retry failed without an error")?
+            .context("workspace kept changing while its delta was captured"))
+    }
+
+    fn capture_changed_paths_impl(
+        &self,
+        index: &PathIndex,
+        changed_paths: &[PathBuf],
+    ) -> anyhow::Result<ObjectId> {
+        let mut paths = BTreeSet::new();
+        for changed in changed_paths {
+            let absolute = if changed.is_absolute() {
+                changed.clone()
             } else {
-                self.root.join(path)
+                self.root.join(changed)
             };
             let Ok(relative) = absolute.strip_prefix(&self.root) else {
                 continue;
             };
-            let mut current = Some(relative);
-            while let Some(path) = current {
-                dirty.insert(path.as_os_str().as_bytes().to_vec());
-                current = path.parent();
+            let relative = relative.as_os_str().as_bytes().to_vec();
+            if relative.is_empty() {
+                index.reset()?;
+                return self.capture_directory_impl(&self.root, index);
+            }
+            if relative == WORKSPACE_FILE_BYTES {
+                continue;
+            }
+            validate_relative_path(&relative)?;
+            paths.insert(relative);
+        }
+
+        let Some(existing_root) = index.root(&self.store_generation()?)? else {
+            bail!("path index was invalidated during incremental capture")
+        };
+        if paths.is_empty() {
+            return Ok(existing_root);
+        }
+
+        let mut dirty_directories = BTreeSet::new();
+        for relative in paths {
+            index.remove_subtree(&relative)?;
+            let absolute = safe_join(&self.root, &relative)?;
+            if fs::symlink_metadata(&absolute).is_ok() {
+                if let Some(entry) = self.capture_path_entry(&absolute, index)? {
+                    let parent = relative_parent(&relative);
+                    index.upsert(&relative, &parent, &entry)?;
+                }
+            }
+            let mut parent = relative_parent(&relative);
+            loop {
+                dirty_directories.insert(parent.clone());
+                if parent.is_empty() {
+                    break;
+                }
+                parent = relative_parent(&parent);
             }
         }
-        dirty
+
+        let mut dirty_directories: Vec<_> = dirty_directories.into_iter().collect();
+        dirty_directories.sort_by(|left, right| {
+            path_depth(right)
+                .cmp(&path_depth(left))
+                .then_with(|| right.cmp(left))
+        });
+        let mut root_tree = existing_root;
+        for relative in dirty_directories {
+            let absolute = safe_join(&self.root, &relative)?;
+            let metadata = match fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if !relative.is_empty() {
+                        index.remove_subtree(&relative)?;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("stat indexed directory {}", absolute.display()))
+                }
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let tree_id = self.rebuild_indexed_directory(index, &relative)?;
+            if relative.is_empty() {
+                root_tree = tree_id;
+            } else {
+                let entry = self.directory_entry(&absolute, tree_id)?;
+                let parent = relative_parent(&relative);
+                index.upsert(&relative, &parent, &entry)?;
+            }
+        }
+        Ok(root_tree)
     }
 
-    fn capture_directory_impl(
-        &self,
-        path: &Path,
-        dirty_directories: Option<&BTreeSet<Vec<u8>>>,
-    ) -> anyhow::Result<ObjectId> {
+    fn capture_directory_impl(&self, path: &Path, index: &PathIndex) -> anyhow::Result<ObjectId> {
         let relative = path.strip_prefix(&self.root)?.as_os_str().as_bytes();
-        if dirty_directories.is_some_and(|dirty| !dirty.contains(relative)) {
-            if let Some(tree_id) = self.store.cached_directory(&self.workspace_id, relative)? {
-                return Ok(tree_id);
-            }
-        }
         let children = SortedDirectory::open(path)
             .with_context(|| format!("read directory {}", path.display()))?;
         let mut tree = tree::Builder::new(&self.store);
@@ -567,79 +675,160 @@ impl AgitRepository {
             if child_path == self.root.join(WORKSPACE_FILE) {
                 continue;
             }
-            let metadata = fs::symlink_metadata(&child_path)
-                .with_context(|| format!("stat {}", child_path.display()))?;
-            let file_type = metadata.file_type();
-            let (secs, nanos) = metadata_time(&metadata);
-            let name = child_name.as_bytes().to_vec();
-            let mode = metadata.permissions().mode();
-            let xattrs = if file_type.is_file() || file_type.is_dir() {
-                self.capture_xattrs(&child_path)
-                    .with_context(|| format!("capture xattrs for {}", child_path.display()))?
-            } else {
-                None
-            };
-
-            let entry = if file_type.is_dir() {
-                let target = self
-                    .capture_directory_impl(&child_path, dirty_directories)
-                    .with_context(|| format!("capture directory {}", child_path.display()))?;
-                TreeEntry {
-                    name,
-                    kind: EntryKind::Directory,
-                    target: Some(target),
-                    link_target: Vec::new(),
-                    mode,
-                    size: 0,
-                    mtime_secs: secs,
-                    mtime_nanos: nanos,
-                    xattrs,
-                }
-            } else if file_type.is_file() {
-                let relative = child_path.strip_prefix(&self.root)?.as_os_str().as_bytes();
-                let target = self
-                    .capture_file(&child_path, Some(relative))
-                    .with_context(|| format!("capture file {}", child_path.display()))?;
-                TreeEntry {
-                    name,
-                    kind: EntryKind::File,
-                    target: Some(target),
-                    link_target: Vec::new(),
-                    mode,
-                    size: metadata.len(),
-                    mtime_secs: secs,
-                    mtime_nanos: nanos,
-                    xattrs,
-                }
-            } else if file_type.is_symlink() {
-                TreeEntry {
-                    name,
-                    kind: EntryKind::Symlink,
-                    target: None,
-                    link_target: fs::read_link(&child_path)?.as_os_str().as_bytes().to_vec(),
-                    mode,
-                    size: metadata.len(),
-                    mtime_secs: secs,
-                    mtime_nanos: nanos,
-                    xattrs: None,
-                }
-            } else if file_type.is_fifo() {
-                special_entry(name, EntryKind::Fifo, mode, secs, nanos)
-            } else if file_type.is_socket() {
-                special_entry(name, EntryKind::SocketMarker, mode, secs, nanos)
-            } else {
-                eprintln!(
-                    "warning: unsupported special file skipped: {}",
-                    child_path.display()
-                );
+            let Some(entry) = self.capture_path_entry(&child_path, index)? else {
                 continue;
             };
+            let child_relative = child_path
+                .strip_prefix(&self.root)?
+                .as_os_str()
+                .as_bytes()
+                .to_vec();
+            index.upsert(&child_relative, relative, &entry)?;
             tree.push(entry)?;
         }
         let tree_id = tree.finish()?;
         self.store
             .cache_directory(&self.workspace_id, relative, &tree_id)?;
         Ok(tree_id)
+    }
+
+    fn capture_path_entry(
+        &self,
+        path: &Path,
+        index: &PathIndex,
+    ) -> anyhow::Result<Option<TreeEntry>> {
+        let metadata =
+            fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        let file_type = metadata.file_type();
+        let (secs, nanos) = metadata_time(&metadata);
+        let name = path
+            .file_name()
+            .context("captured path has no filename")?
+            .as_bytes()
+            .to_vec();
+        let mode = metadata.permissions().mode();
+        let xattrs = if file_type.is_file() || file_type.is_dir() {
+            self.capture_xattrs(path)
+                .with_context(|| format!("capture xattrs for {}", path.display()))?
+        } else {
+            None
+        };
+
+        let entry = if file_type.is_dir() {
+            let target = self
+                .capture_directory_impl(path, index)
+                .with_context(|| format!("capture directory {}", path.display()))?;
+            TreeEntry {
+                name,
+                kind: EntryKind::Directory,
+                target: Some(target),
+                link_target: Vec::new(),
+                mode,
+                size: 0,
+                mtime_secs: secs,
+                mtime_nanos: nanos,
+                xattrs,
+            }
+        } else if file_type.is_file() {
+            let relative = path.strip_prefix(&self.root)?.as_os_str().as_bytes();
+            let target = self
+                .capture_file(path, Some(relative))
+                .with_context(|| format!("capture file {}", path.display()))?;
+            TreeEntry {
+                name,
+                kind: EntryKind::File,
+                target: Some(target),
+                link_target: Vec::new(),
+                mode,
+                size: metadata.len(),
+                mtime_secs: secs,
+                mtime_nanos: nanos,
+                xattrs,
+            }
+        } else if file_type.is_symlink() {
+            TreeEntry {
+                name,
+                kind: EntryKind::Symlink,
+                target: None,
+                link_target: fs::read_link(path)?.as_os_str().as_bytes().to_vec(),
+                mode,
+                size: metadata.len(),
+                mtime_secs: secs,
+                mtime_nanos: nanos,
+                xattrs: None,
+            }
+        } else if file_type.is_fifo() {
+            special_entry(name, EntryKind::Fifo, mode, secs, nanos)
+        } else if file_type.is_socket() {
+            special_entry(name, EntryKind::SocketMarker, mode, secs, nanos)
+        } else {
+            eprintln!(
+                "warning: unsupported special file skipped: {}",
+                path.display()
+            );
+            return Ok(None);
+        };
+        Ok(Some(entry))
+    }
+
+    fn directory_entry(&self, path: &Path, target: ObjectId) -> anyhow::Result<TreeEntry> {
+        let metadata = fs::symlink_metadata(path)?;
+        let (mtime_secs, mtime_nanos) = metadata_time(&metadata);
+        Ok(TreeEntry {
+            name: path
+                .file_name()
+                .context("directory has no filename")?
+                .as_bytes()
+                .to_vec(),
+            kind: EntryKind::Directory,
+            target: Some(target),
+            link_target: Vec::new(),
+            mode: metadata.permissions().mode(),
+            size: 0,
+            mtime_secs,
+            mtime_nanos,
+            xattrs: self.capture_xattrs(path)?,
+        })
+    }
+
+    fn rebuild_indexed_directory(
+        &self,
+        index: &PathIndex,
+        relative: &[u8],
+    ) -> anyhow::Result<ObjectId> {
+        let mut tree = tree::Builder::new(&self.store);
+        let mut after_name: Option<Vec<u8>> = None;
+        loop {
+            let entries = index.children_after(relative, after_name.as_deref(), CHILD_BATCH)?;
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                after_name = Some(entry.name.clone());
+                tree.push(entry)?;
+            }
+        }
+        let tree_id = tree.finish()?;
+        self.store
+            .cache_directory(&self.workspace_id, relative, &tree_id)?;
+        Ok(tree_id)
+    }
+
+    fn open_path_index(&self) -> anyhow::Result<PathIndex> {
+        PathIndex::open(&self.workspace_data_dir().join("paths.sqlite3"))
+    }
+
+    fn store_generation(&self) -> anyhow::Result<String> {
+        Ok(fs::read_to_string(self.store.root().join("packs/CURRENT"))?
+            .trim()
+            .to_owned())
+    }
+
+    fn invalidate_path_index(&self) -> anyhow::Result<()> {
+        let mut index = self.open_path_index()?;
+        index.begin()?;
+        index.reset()?;
+        index.commit()
     }
 
     fn capture_file(&self, path: &Path, cache_key: Option<&[u8]>) -> anyhow::Result<ObjectId> {
@@ -1141,6 +1330,7 @@ impl AgitRepository {
         let plan = self.plan_rewind(&intent.pre_snapshot, &paths)?;
         let entries = self.entries_for_plan(&snapshot.root_tree, &plan)?;
         self.apply_rewind(&entries, &plan, &paths)?;
+        self.invalidate_path_index()?;
         self.clear_restore_intent()?;
         FileExt::unlock(&lock)?;
         Ok(())
@@ -1295,6 +1485,26 @@ fn validate_name(name: &[u8]) -> anyhow::Result<()> {
         "invalid path component in snapshot"
     );
     Ok(())
+}
+
+fn validate_relative_path(path: &[u8]) -> anyhow::Result<()> {
+    let path = Path::new(OsStr::from_bytes(path));
+    anyhow::ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "invalid changed path"
+    );
+    Ok(())
+}
+
+fn relative_parent(path: &[u8]) -> Vec<u8> {
+    Path::new(OsStr::from_bytes(path))
+        .parent()
+        .map_or_else(Vec::new, |parent| parent.as_os_str().as_bytes().to_vec())
+}
+
+fn path_depth(path: &[u8]) -> usize {
+    Path::new(OsStr::from_bytes(path)).components().count()
 }
 
 fn safe_join(root: &Path, relative: &[u8]) -> anyhow::Result<PathBuf> {

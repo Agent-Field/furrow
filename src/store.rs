@@ -21,7 +21,7 @@ const MAX_OBJECT_LEN: u64 = 256 * 1024 * 1024;
 pub struct ObjectStore {
     root: PathBuf,
     catalog: Catalog,
-    active_pack: String,
+    active_pack: RefCell<String>,
     maintenance: Rc<MaintenanceState>,
 }
 
@@ -79,7 +79,7 @@ impl ObjectStore {
         let mut store = Self {
             root,
             catalog,
-            active_pack,
+            active_pack: RefCell::new(active_pack),
             maintenance,
         };
         let startup_guard = MaintenanceGuard {
@@ -116,7 +116,8 @@ impl ObjectStore {
         lock.lock_exclusive()?;
 
         if self.catalog.object(&id)?.is_none() {
-            let pack_path = self.root.join("packs").join(&self.active_pack);
+            let active_pack = self.active_pack.borrow().clone();
+            let pack_path = self.root.join("packs").join(&active_pack);
             let mut pack = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -135,7 +136,7 @@ impl ObjectStore {
             self.catalog.insert_object(
                 &id,
                 kind,
-                &self.active_pack,
+                &active_pack,
                 payload_offset,
                 bytes.len() as u64,
             )?;
@@ -175,6 +176,7 @@ impl ObjectStore {
         } else {
             FileExt::lock_shared(&file)?;
         }
+        *self.active_pack.borrow_mut() = read_or_initialize_current(&self.root)?;
         self.maintenance.depth.set(1);
         self.maintenance.exclusive.set(exclusive);
         *self.maintenance.file.borrow_mut() = Some(file);
@@ -443,7 +445,7 @@ impl ObjectStore {
         file.sync_all()?;
         fs::rename(temporary, packs.join(CURRENT_FILE))?;
         File::open(&packs)?.sync_all()?;
-        self.active_pack = pack.to_owned();
+        *self.active_pack.borrow_mut() = pack.to_owned();
         Ok(())
     }
 
@@ -458,7 +460,10 @@ impl ObjectStore {
     }
 
     fn sync_active_pack(&self) -> anyhow::Result<()> {
-        let path = self.root.join("packs").join(&self.active_pack);
+        let path = self
+            .root
+            .join("packs")
+            .join(self.active_pack.borrow().as_str());
         if path.exists() {
             File::open(path)?.sync_data()?;
         }
@@ -466,7 +471,7 @@ impl ObjectStore {
     }
 
     fn recover_pack(&mut self) -> anyhow::Result<()> {
-        let pack_name = self.active_pack.clone();
+        let pack_name = self.active_pack.borrow().clone();
         let pack_path = self.root.join("packs").join(&pack_name);
         if !pack_path.exists() {
             return Ok(());
@@ -597,14 +602,14 @@ impl ObjectStore {
         checkpoint: &PackCheckpoint,
     ) -> anyhow::Result<bool> {
         if checkpoint.verified_len > file_len
-            || self
-                .catalog
-                .pack_prefix_object_count(&self.active_pack, checkpoint.verified_len)?
-                != checkpoint.object_count
-            || self
-                .catalog
-                .pack_crossing_object_count(&self.active_pack, checkpoint.verified_len)?
-                != 0
+            || self.catalog.pack_prefix_object_count(
+                self.active_pack.borrow().as_str(),
+                checkpoint.verified_len,
+            )? != checkpoint.object_count
+            || self.catalog.pack_crossing_object_count(
+                self.active_pack.borrow().as_str(),
+                checkpoint.verified_len,
+            )? != 0
         {
             return Ok(false);
         }
@@ -617,7 +622,7 @@ impl ObjectStore {
         let Some(location) = self.catalog.object(&last_id)? else {
             return Ok(false);
         };
-        if location.pack != self.active_pack
+        if location.pack != *self.active_pack.borrow()
             || location.offset != checkpoint.last_record_start + HEADER_LEN
             || location.offset + location.len + OBJECT_END.len() as u64 != checkpoint.verified_len
         {
@@ -645,8 +650,10 @@ impl ObjectStore {
 
     fn truncate_pack_tail(&self, pack: &File, record_start: u64) -> anyhow::Result<()> {
         pack.set_len(record_start)?;
-        self.catalog
-            .delete_pack_objects_from(&self.active_pack, record_start.saturating_add(HEADER_LEN))?;
+        self.catalog.delete_pack_objects_from(
+            self.active_pack.borrow().as_str(),
+            record_start.saturating_add(HEADER_LEN),
+        )?;
         Ok(())
     }
 }
@@ -730,6 +737,28 @@ mod tests {
         );
         drop(store);
         (directory, first, second, verified_len)
+    }
+
+    #[test]
+    fn long_lived_store_refreshes_current_after_external_pack_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = ObjectStore::open(directory.path().to_owned()).unwrap();
+        first.put_bytes(ObjectKind::Chunk, b"before gc").unwrap();
+        let initial = directory.path().join("packs/pack-000001.agp");
+        let initial_len = fs::metadata(&initial).unwrap().len();
+
+        let mut gc_process = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let _exclusive = gc_process.acquire_maintenance_exclusive().unwrap();
+        gc_process.activate_pack("pack-gc-test.agp").unwrap();
+        drop(_exclusive);
+
+        let id = first.put_bytes(ObjectKind::Chunk, b"after gc").unwrap();
+        assert_eq!(fs::metadata(initial).unwrap().len(), initial_len);
+        assert!(directory.path().join("packs/pack-gc-test.agp").exists());
+        assert_eq!(
+            first.catalog.object(&id).unwrap().unwrap().pack,
+            "pack-gc-test.agp"
+        );
     }
 
     #[test]
