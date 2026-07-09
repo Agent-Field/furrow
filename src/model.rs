@@ -73,7 +73,20 @@ pub struct TreeEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tree {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<TreeEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<TreePage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreePage {
+    #[serde(with = "serde_bytes")]
+    pub first_name: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub last_name: Vec<u8>,
+    pub entry_count: u64,
+    pub target: ObjectId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

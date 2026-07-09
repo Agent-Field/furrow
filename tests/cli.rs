@@ -418,6 +418,36 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
 }
 
 #[test]
+fn paged_flat_directory_snapshot_restores_entries_across_pages() {
+    let fixture = Fixture::new();
+    let flat = fixture.repo.join("flat");
+    fs::create_dir(&flat).unwrap();
+    for index in 0..1_200 {
+        fs::write(
+            flat.join(format!("entry-{index:04}.txt")),
+            format!("value {index}\n"),
+        )
+        .unwrap();
+    }
+    let snapshot = fixture.watch();
+    for index in [0, 599, 1_199] {
+        fs::remove_file(flat.join(format!("entry-{index:04}.txt"))).unwrap();
+    }
+
+    fixture
+        .agit()
+        .args(["rewind", &snapshot, "--paths", "flat", "--yes"])
+        .assert()
+        .success();
+    for index in [0, 599, 1_199] {
+        assert_eq!(
+            fs::read(flat.join(format!("entry-{index:04}.txt"))).unwrap(),
+            format!("value {index}\n").as_bytes()
+        );
+    }
+}
+
+#[test]
 fn interrupted_rewind_rolls_back_to_pre_rewind_state_on_next_command() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();

@@ -3,10 +3,12 @@ use crate::chunker::ChunkStream;
 use crate::fork::{fork_workspace, ForkReport, ForkTier};
 use crate::model::{
     id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
-    SnapshotTrigger, SqliteBackup, Tree, TreeEntry, XattrEntry, Xattrs,
+    SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
 };
+use crate::sorted_dir::SortedDirectory;
 use crate::sqlite_adapter;
 use crate::store::ObjectStore;
+use crate::tree;
 use anyhow::{bail, Context};
 use directories::ProjectDirs;
 use filetime::FileTime;
@@ -553,14 +555,13 @@ impl AgitRepository {
                 return Ok(tree_id);
             }
         }
-        let mut entries = Vec::new();
-        let mut children: Vec<_> = fs::read_dir(path)
-            .with_context(|| format!("read directory {}", path.display()))?
-            .collect::<Result<_, _>>()?;
-        children.sort_by(|a, b| a.file_name().as_bytes().cmp(b.file_name().as_bytes()));
+        let children = SortedDirectory::open(path)
+            .with_context(|| format!("read directory {}", path.display()))?;
+        let mut tree = tree::Builder::new(&self.store);
 
-        for child in children {
-            let child_path = child.path();
+        for child_name in children {
+            let child_name = child_name?;
+            let child_path = path.join(&child_name);
             if child_path.starts_with(self.store.root()) {
                 continue;
             }
@@ -571,7 +572,7 @@ impl AgitRepository {
                 .with_context(|| format!("stat {}", child_path.display()))?;
             let file_type = metadata.file_type();
             let (secs, nanos) = metadata_time(&metadata);
-            let name = child.file_name().as_bytes().to_vec();
+            let name = child_name.as_bytes().to_vec();
             let mode = metadata.permissions().mode();
             let xattrs = if file_type.is_file() || file_type.is_dir() {
                 self.capture_xattrs(&child_path)
@@ -634,10 +635,9 @@ impl AgitRepository {
                 );
                 continue;
             };
-            entries.push(entry);
+            tree.push(entry)?;
         }
-        let tree = Tree { entries };
-        let tree_id = self.store.put_struct(ObjectKind::Tree, &tree)?;
+        let tree_id = tree.finish()?;
         self.store
             .cache_directory(&self.workspace_id, relative, &tree_id)?;
         Ok(tree_id)
@@ -804,8 +804,7 @@ impl AgitRepository {
         prefix: Vec<u8>,
         output: &mut BTreeMap<Vec<u8>, FlatEntry>,
     ) -> anyhow::Result<()> {
-        let tree: Tree = self.store.read_struct(tree_id, ObjectKind::Tree)?;
-        for entry in tree.entries {
+        tree::for_each_entry(&self.store, tree_id, |entry| {
             validate_name(&entry.name)?;
             let mut path = prefix.clone();
             if !path.is_empty() {
@@ -825,8 +824,8 @@ impl AgitRepository {
                     output,
                 )?;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn apply_rewind(
