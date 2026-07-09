@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod chunker;
 pub mod fork;
 pub mod model;
+pub mod path_index;
 pub mod refs;
 pub mod repository;
 pub mod sorted_dir;
