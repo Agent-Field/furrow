@@ -2,9 +2,12 @@ use crate::model::SnapshotTrigger;
 use crate::repository::AgitRepository;
 use anyhow::Context;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use std::time::Instant;
 
 const EVENT_QUEUE: usize = 4096;
 
@@ -25,18 +28,12 @@ pub fn run(mut repository: AgitRepository, debounce: Duration) -> anyhow::Result
 
     loop {
         let first = receiver.recv().context("filesystem watcher stopped")?;
-        if let Err(error) = first {
-            eprintln!("agit: watcher warning: {error}");
-            overflow.store(true, Ordering::Release);
-        }
+        let mut changed_paths = BTreeSet::new();
+        record_event(first, &mut changed_paths, &overflow);
 
         loop {
             match receiver.recv_timeout(debounce) {
-                Ok(Ok(_)) => continue,
-                Ok(Err(error)) => {
-                    eprintln!("agit: watcher warning: {error}");
-                    overflow.store(true, Ordering::Release);
-                }
+                Ok(event) => record_event(event, &mut changed_paths, &overflow),
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("filesystem watcher disconnected")
@@ -44,14 +41,44 @@ pub fn run(mut repository: AgitRepository, debounce: Duration) -> anyhow::Result
             }
         }
 
-        let label = if overflow.swap(false, Ordering::AcqRel) {
+        let overflowed = overflow.swap(false, Ordering::AcqRel);
+        let label = if overflowed {
             "automatic snapshot after watcher overflow/rescan"
         } else {
             "automatic snapshot after write quiescence"
         };
-        match repository.snapshot(Some(label.to_owned()), SnapshotTrigger::Watcher) {
-            Ok(id) => eprintln!("agit: sealed {}", &hex::encode(id)[..12]),
+        let seal_started = Instant::now();
+        let result = if overflowed || changed_paths.is_empty() {
+            repository.snapshot(Some(label.to_owned()), SnapshotTrigger::Watcher)
+        } else {
+            let changed_paths: Vec<_> = changed_paths.into_iter().collect();
+            repository.snapshot_changed_paths(
+                Some(label.to_owned()),
+                SnapshotTrigger::Watcher,
+                &changed_paths,
+            )
+        };
+        match result {
+            Ok(id) => eprintln!(
+                "agit: sealed {} in {:.3}s",
+                &hex::encode(id)[..12],
+                seal_started.elapsed().as_secs_f64()
+            ),
             Err(error) => eprintln!("agit: automatic snapshot deferred: {error:#}"),
+        }
+    }
+}
+
+fn record_event(
+    event: notify::Result<Event>,
+    changed_paths: &mut BTreeSet<PathBuf>,
+    overflow: &AtomicBool,
+) {
+    match event {
+        Ok(event) => changed_paths.extend(event.paths),
+        Err(error) => {
+            eprintln!("agit: watcher warning: {error}");
+            overflow.store(true, Ordering::Release);
         }
     }
 }

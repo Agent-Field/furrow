@@ -190,6 +190,23 @@ impl ObjectStore {
         self.catalog.cache_file(workspace_id, path, file)
     }
 
+    pub fn cached_directory(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+    ) -> anyhow::Result<Option<ObjectId>> {
+        self.catalog.cached_directory(workspace_id, path)
+    }
+
+    pub fn cache_directory(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+        tree_id: &ObjectId,
+    ) -> anyhow::Result<()> {
+        self.catalog.cache_directory(workspace_id, path, tree_id)
+    }
+
     pub fn publish_snapshot(
         &mut self,
         workspace_id: &str,
@@ -350,6 +367,7 @@ fn trigger_name(trigger: &SnapshotTrigger) -> &'static str {
         SnapshotTrigger::Manual => "manual",
         SnapshotTrigger::Watcher => "watcher",
         SnapshotTrigger::PreRewind => "pre_rewind",
+        SnapshotTrigger::ForkBase => "fork_base",
     }
 }
 

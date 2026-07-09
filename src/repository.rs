@@ -1,5 +1,6 @@
 use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
+use crate::fork::{fork_workspace, ForkReport, ForkTier};
 use crate::model::{
     id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
     SnapshotTrigger, SqliteBackup, Tree, TreeEntry, XattrEntry, Xattrs,
@@ -15,13 +16,14 @@ use serde::{Deserialize, Serialize as SerdeSerialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WORKSPACE_FILE: &str = ".agit/workspace-id";
+const WORKSPACE_FILE_BYTES: &[u8] = b".agit/workspace-id";
 
 pub struct AgitRepository {
     root: PathBuf,
@@ -60,6 +62,26 @@ pub struct RepositoryStatus {
     pub objects: u64,
     pub physical_bytes: u64,
     pub watcher_running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkSummary {
+    pub name: String,
+    pub destination: PathBuf,
+    pub base_snapshot: String,
+    pub head_snapshot: String,
+    pub tier: ForkTier,
+    pub files: u64,
+    pub directories: u64,
+    pub symlinks: u64,
+    pub fifos: u64,
+    pub skipped_special: u64,
+    pub logical_bytes: u64,
+    pub cloned_bytes: u64,
+    pub copied_bytes: u64,
+    pub hardlinked_files: u64,
+    pub elapsed_ms: u64,
+    pub created_at: i64,
 }
 
 #[derive(Clone)]
@@ -162,9 +184,35 @@ impl AgitRepository {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<ObjectId> {
+        self.snapshot_internal(label, trigger, None)
+    }
+
+    pub fn snapshot_changed_paths(
+        &mut self,
+        label: Option<String>,
+        trigger: SnapshotTrigger,
+        changed_paths: &[PathBuf],
+    ) -> anyhow::Result<ObjectId> {
+        let dirty_directories = self.dirty_directories(changed_paths);
+        self.snapshot_internal(label, trigger, Some(&dirty_directories))
+    }
+
+    fn snapshot_internal(
+        &mut self,
+        label: Option<String>,
+        trigger: SnapshotTrigger,
+        dirty_directories: Option<&BTreeSet<Vec<u8>>>,
+    ) -> anyhow::Result<ObjectId> {
         let parent = self.store.workspace_head(&self.workspace_id)?;
-        let root_tree = self.capture_root_retry()?;
-        let sqlite_backups = self.capture_sqlite_backups()?;
+        let root_tree = self.capture_root_retry(dirty_directories)?;
+        // Continuous watcher seals keep raw database/WAL/SHM bytes (L0) and
+        // avoid a second whole-tree database discovery pass. Forced boundaries
+        // attach the logically consistent SQLite image (L1).
+        let sqlite_backups = if trigger == SnapshotTrigger::Watcher {
+            Vec::new()
+        } else {
+            self.capture_sqlite_backups()?
+        };
         let (secs, nanos) = now();
         let snapshot = Snapshot {
             root_tree,
@@ -211,6 +259,101 @@ impl AgitRepository {
         })
     }
 
+    pub fn fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkSummary> {
+        validate_fork_name(name)?;
+        let destination = absolute_destination(destination)?;
+        anyhow::ensure!(
+            !destination.exists(),
+            "fork destination already exists: {}",
+            destination.display()
+        );
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create fork parent {}", parent.display()))?;
+        }
+
+        let base = self.snapshot(
+            Some(format!("fork base: {name}")),
+            SnapshotTrigger::ForkBase,
+        )?;
+        let report = fork_workspace(&self.root, &destination)?;
+
+        // A copied workspace identity would alias two mutable directories onto
+        // one timeline. It is transport metadata, not captured user state.
+        let copied_identity = destination.join(WORKSPACE_FILE);
+        if copied_identity.exists() {
+            fs::remove_file(&copied_identity)?;
+        }
+        let (fork_repository, fork_head) = AgitRepository::watch(&destination)?;
+        if !self.snapshots_match_fork(&base, &fork_repository, &fork_head)? {
+            bail!(
+                "source changed while the fork was being created; the isolated copy remains at {} for inspection",
+                destination.display()
+            );
+        }
+
+        let summary = fork_summary(name, destination, base, fork_head, report);
+        let record_path = self.forks_dir().join(format!("{name}.json"));
+        fs::create_dir_all(self.forks_dir())?;
+        atomic_write(&record_path, &serde_json::to_vec_pretty(&summary)?)?;
+        Ok(summary)
+    }
+
+    pub fn forks(&self) -> anyhow::Result<Vec<ForkSummary>> {
+        let directory = self.forks_dir();
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut forks = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && entry.path().extension() == Some(OsStr::new("json"))
+            {
+                forks.push(serde_json::from_slice(&fs::read(entry.path())?)?);
+            }
+        }
+        forks.sort_by(|left: &ForkSummary, right: &ForkSummary| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(forks)
+    }
+
+    fn forks_dir(&self) -> PathBuf {
+        self.workspace_data_dir().join("forks")
+    }
+
+    fn snapshots_match_fork(
+        &self,
+        base: &ObjectId,
+        fork_repository: &AgitRepository,
+        fork_head: &ObjectId,
+    ) -> anyhow::Result<bool> {
+        let base_snapshot: Snapshot = self.store.read_struct(base, ObjectKind::Snapshot)?;
+        let fork_snapshot: Snapshot = fork_repository
+            .store
+            .read_struct(fork_head, ObjectKind::Snapshot)?;
+        let mut base_entries = self.flatten_tree(&base_snapshot.root_tree)?;
+        let mut fork_entries = fork_repository.flatten_tree(&fork_snapshot.root_tree)?;
+
+        // Attaching the destination updates the .agit directory timestamp, but
+        // its actual policy and hook children still participate in comparison.
+        for internal in [b".agit".as_slice(), WORKSPACE_FILE_BYTES] {
+            base_entries.remove(internal);
+            fork_entries.remove(internal);
+        }
+        base_entries.retain(|_, entry| entry.entry.kind != EntryKind::SocketMarker);
+        fork_entries.retain(|_, entry| entry.entry.kind != EntryKind::SocketMarker);
+        Ok(base_entries
+            .iter()
+            .map(|(path, entry)| (path, &entry.entry))
+            .eq(fork_entries
+                .iter()
+                .map(|(path, entry)| (path, &entry.entry))))
+    }
+
     pub fn resolve_snapshot(&self, value: &str) -> anyhow::Result<ObjectId> {
         if value.len() == 64 {
             let id = parse_id(value)?;
@@ -238,7 +381,7 @@ impl AgitRepository {
     pub fn plan_rewind(&self, target: &ObjectId, paths: &[PathBuf]) -> anyhow::Result<RewindPlan> {
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
         let target_entries = self.flatten_tree(&target_snapshot.root_tree)?;
-        let current_tree = self.capture_root_retry()?;
+        let current_tree = self.capture_root_retry(None)?;
         let current_entries = self.flatten_tree(&current_tree)?;
         let mut all_paths = BTreeSet::new();
         all_paths.extend(target_entries.keys().cloned());
@@ -361,14 +504,13 @@ impl AgitRepository {
         Ok(())
     }
 
-    fn capture_directory(&self, path: &Path) -> anyhow::Result<ObjectId> {
-        self.capture_directory_impl(path, true)
-    }
-
-    fn capture_root_retry(&self) -> anyhow::Result<ObjectId> {
+    fn capture_root_retry(
+        &self,
+        dirty_directories: Option<&BTreeSet<Vec<u8>>>,
+    ) -> anyhow::Result<ObjectId> {
         let mut last_error = None;
         for _ in 0..3 {
-            match self.capture_directory(&self.root) {
+            match self.capture_directory_impl(&self.root, dirty_directories) {
                 Ok(id) => return Ok(id),
                 Err(error) if is_not_found(&error) => last_error = Some(error),
                 Err(error) => return Err(error),
@@ -379,7 +521,38 @@ impl AgitRepository {
             .context("workspace kept changing while it was captured"))
     }
 
-    fn capture_directory_impl(&self, path: &Path, _publication: bool) -> anyhow::Result<ObjectId> {
+    fn dirty_directories(&self, paths: &[PathBuf]) -> BTreeSet<Vec<u8>> {
+        let mut dirty = BTreeSet::new();
+        dirty.insert(Vec::new());
+        for path in paths {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                self.root.join(path)
+            };
+            let Ok(relative) = absolute.strip_prefix(&self.root) else {
+                continue;
+            };
+            let mut current = Some(relative);
+            while let Some(path) = current {
+                dirty.insert(path.as_os_str().as_bytes().to_vec());
+                current = path.parent();
+            }
+        }
+        dirty
+    }
+
+    fn capture_directory_impl(
+        &self,
+        path: &Path,
+        dirty_directories: Option<&BTreeSet<Vec<u8>>>,
+    ) -> anyhow::Result<ObjectId> {
+        let relative = path.strip_prefix(&self.root)?.as_os_str().as_bytes();
+        if dirty_directories.is_some_and(|dirty| !dirty.contains(relative)) {
+            if let Some(tree_id) = self.store.cached_directory(&self.workspace_id, relative)? {
+                return Ok(tree_id);
+            }
+        }
         let mut entries = Vec::new();
         let mut children: Vec<_> = fs::read_dir(path)
             .with_context(|| format!("read directory {}", path.display()))?
@@ -389,6 +562,9 @@ impl AgitRepository {
         for child in children {
             let child_path = child.path();
             if child_path.starts_with(self.store.root()) {
+                continue;
+            }
+            if child_path == self.root.join(WORKSPACE_FILE) {
                 continue;
             }
             let metadata = fs::symlink_metadata(&child_path)
@@ -406,7 +582,7 @@ impl AgitRepository {
 
             let entry = if file_type.is_dir() {
                 let target = self
-                    .capture_directory_impl(&child_path, _publication)
+                    .capture_directory_impl(&child_path, dirty_directories)
                     .with_context(|| format!("capture directory {}", child_path.display()))?;
                 TreeEntry {
                     name,
@@ -461,7 +637,10 @@ impl AgitRepository {
             entries.push(entry);
         }
         let tree = Tree { entries };
-        self.store.put_struct(ObjectKind::Tree, &tree)
+        let tree_id = self.store.put_struct(ObjectKind::Tree, &tree)?;
+        self.store
+            .cache_directory(&self.workspace_id, relative, &tree_id)?;
+        Ok(tree_id)
     }
 
     fn capture_file(&self, path: &Path, cache_key: Option<&[u8]>) -> anyhow::Result<ObjectId> {
@@ -477,7 +656,7 @@ impl AgitRepository {
                     }
                 }
             }
-            let mut stream = ChunkStream::new(file);
+            let mut stream = ChunkStream::new(BufReader::with_capacity(256 * 1024, file));
             let mut chunks = Vec::new();
             let mut total_len = 0_u64;
             while let Some(chunk) = stream.next_chunk()? {
@@ -946,6 +1125,53 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+fn validate_fork_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!name.is_empty(), "fork name cannot be empty");
+    anyhow::ensure!(name.len() <= 96, "fork name cannot exceed 96 bytes");
+    anyhow::ensure!(
+        name.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "fork name may contain only letters, numbers, dot, dash, and underscore"
+    );
+    anyhow::ensure!(name != "." && name != "..", "invalid fork name");
+    Ok(())
+}
+
+fn absolute_destination(destination: &Path) -> anyhow::Result<PathBuf> {
+    if destination.is_absolute() {
+        Ok(destination.to_owned())
+    } else {
+        Ok(std::env::current_dir()?.join(destination))
+    }
+}
+
+fn fork_summary(
+    name: &str,
+    destination: PathBuf,
+    base: ObjectId,
+    head: ObjectId,
+    report: ForkReport,
+) -> ForkSummary {
+    ForkSummary {
+        name: name.to_owned(),
+        destination,
+        base_snapshot: id_hex(&base),
+        head_snapshot: id_hex(&head),
+        tier: report.tier,
+        files: report.files,
+        directories: report.directories,
+        symlinks: report.symlinks,
+        fifos: report.fifos,
+        skipped_special: report.skipped_special,
+        logical_bytes: report.logical_bytes,
+        cloned_bytes: report.cloned_bytes,
+        copied_bytes: report.copied_bytes,
+        hardlinked_files: report.hardlinked_files,
+        elapsed_ms: report.elapsed.as_millis().min(u64::MAX as u128) as u64,
+        created_at: now().0,
+    }
 }
 
 fn validate_name(name: &[u8]) -> anyhow::Result<()> {

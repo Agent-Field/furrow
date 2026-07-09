@@ -10,6 +10,7 @@ Git protects commits. Agent checkpoints usually protect edits made through one a
 
 ```bash
 ./demo/agent-disaster.sh
+./demo/parallel-agent-forks.sh
 ```
 
 The demo creates a real Git repository containing:
@@ -21,6 +22,8 @@ The demo creates a real Git repository containing:
 - A SQLite development database
 
 It then snapshots the workspace, runs `git clean -fdx`, damages the tracked application, previews the impact, and rewinds everything. Independent shell and SQLite checks verify the result.
+
+The parallel-fork demo creates two independent full-state workspaces from one dirty repository, including a 32 MiB ignored dependency cache and local configuration. Two simulated agents modify them concurrently while checks prove the source remains untouched.
 
 ## Install
 
@@ -51,6 +54,12 @@ agit rewind <snapshot>
 
 # Prefer the logically consistent SQLite image captured with the snapshot.
 agit rewind <snapshot> --sqlite-consistent
+
+# Give an agent or risky command an isolated copy of the complete dirty state.
+agit fork auth-refactor -- claude
+
+# Inspect active parallel workspaces and their actual clone/copy cost.
+agit forks
 ```
 
 Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding is therefore itself rewindable.
@@ -71,8 +80,11 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Raw filesystem-exact SQLite bytes plus an auxiliary SQLite-consistent backup
 - Rewind path traversal and symlink-parent escape protection
 - macOS and Linux builds
+- Native APFS clonefile and Linux FICLONE warm workspace forks
+- Streaming-copy fallback with disclosed physical copy cost
+- Independent fork timelines, full-state consistency verification, and command launch
 
-The current milestone is the Phase 0 proof of concept from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md). Continuous background watching, warm CoW forks, agent hooks, merge, multi-machine sync, and teleport are subsequent phases.
+The current implementation covers the Phase 0 recovery proof and the first Phase 2 warm-fork path from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md). Agent hooks, merge, multi-machine sync, and teleport remain subsequent milestones.
 
 ## Safety Model
 
@@ -103,9 +115,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-The black-box suite uses independent temporary Git repositories and isolated stores. It verifies ignored secret recovery, reversible full rewind, metadata fidelity, SQLite logical recovery, index reconstruction, truncated-pack recovery, and path-escape rejection.
+The black-box suite uses independent temporary Git repositories and isolated stores. It verifies ignored secret recovery, reversible full rewind, metadata fidelity, SQLite logical recovery, index reconstruction, truncated-pack recovery, path-escape rejection, continuous watching, interrupted-rewind recovery, and independent warm forks.
 
 ## License
 
 Apache-2.0
-

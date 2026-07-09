@@ -88,6 +88,7 @@ pub enum SnapshotTrigger {
     Manual,
     Watcher,
     PreRewind,
+    ForkBase,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -347,6 +347,77 @@ fn unchanged_snapshots_reuse_cached_blobs_and_add_only_small_metadata() {
 }
 
 #[test]
+fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let destination = fixture._temp.path().join("agent-one");
+
+    let output = fixture
+        .agit()
+        .args(["--json", "fork", "agent-one", "--destination"])
+        .arg(&destination)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summary: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(summary["name"], "agent-one");
+    assert!(
+        summary["cloned_bytes"].as_u64().unwrap() + summary["copied_bytes"].as_u64().unwrap() > 0
+    );
+    assert_eq!(
+        fs::read(destination.join(".env")).unwrap(),
+        b"TOKEN=original\n"
+    );
+    assert_eq!(
+        fs::read(destination.join("cache/dependency.bin"))
+            .unwrap()
+            .len(),
+        180_000
+    );
+    assert_ne!(
+        fs::read_to_string(destination.join(".agit/workspace-id")).unwrap(),
+        fs::read_to_string(fixture.repo.join(".agit/workspace-id")).unwrap()
+    );
+
+    fs::write(destination.join("app.txt"), b"fork-only change\n").unwrap();
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"tracked original\n"
+    );
+
+    let listed = fixture
+        .agit()
+        .args(["--json", "forks"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: Value = serde_json::from_slice(&listed).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(
+        listed[0]["destination"],
+        destination.to_string_lossy().as_ref()
+    );
+
+    let command_destination = fixture._temp.path().join("agent-command");
+    fixture
+        .agit()
+        .args(["fork", "agent-command", "--destination"])
+        .arg(&command_destination)
+        .args(["--", "sh", "-c", "printf isolated > command-result.txt"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(command_destination.join("command-result.txt")).unwrap(),
+        b"isolated"
+    );
+    assert!(!fixture.repo.join("command-result.txt").exists());
+}
+
+#[test]
 fn interrupted_rewind_rolls_back_to_pre_rewind_state_on_next_command() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();

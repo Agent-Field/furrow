@@ -59,6 +59,12 @@ impl Catalog {
                 blob_id BLOB NOT NULL,
                 PRIMARY KEY(workspace_id, path)
             ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS directory_cache (
+                workspace_id TEXT NOT NULL,
+                path BLOB NOT NULL,
+                tree_id BLOB NOT NULL,
+                PRIMARY KEY(workspace_id, path)
+            ) WITHOUT ROWID;
             ",
         )?;
         Ok(Self { conn })
@@ -148,6 +154,36 @@ impl Catalog {
                 file.mode,
                 file.blob_id.as_slice(),
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn cached_directory(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+    ) -> anyhow::Result<Option<ObjectId>> {
+        let value: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT tree_id FROM directory_cache WHERE workspace_id = ?1 AND path = ?2",
+                params![workspace_id, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value.map(vec_to_id).transpose()
+    }
+
+    pub fn cache_directory(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+        tree_id: &ObjectId,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO directory_cache(workspace_id, path, tree_id) VALUES(?1, ?2, ?3)
+             ON CONFLICT(workspace_id, path) DO UPDATE SET tree_id=excluded.tree_id",
+            params![workspace_id, path, tree_id.as_slice()],
         )?;
         Ok(())
     }

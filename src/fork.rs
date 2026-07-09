@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context};
 use filetime::{set_file_times, set_symlink_file_times, FileTime};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -15,7 +16,7 @@ use std::io::{self, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -23,7 +24,8 @@ use std::time::{Duration, Instant};
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The least efficient file-copy mechanism used by a fork.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ForkTier {
     /// Every unique regular file was created with the native CoW primitive.
     NativeCow,
@@ -52,6 +54,9 @@ pub struct ForkReport {
     /// Directories, including the workspace root.
     pub directories: u64,
     pub symlinks: u64,
+    pub fifos: u64,
+    /// Runtime-only sockets and unsupported device nodes intentionally omitted.
+    pub skipped_special: u64,
     /// Sum of file lengths as visible through every directory entry.
     pub logical_bytes: u64,
     /// Logical bytes backed by a newly created CoW clone.
@@ -68,6 +73,8 @@ struct Counters {
     files: u64,
     directories: u64,
     symlinks: u64,
+    fifos: u64,
+    skipped_special: u64,
     logical_bytes: u64,
     cloned_bytes: u64,
     copied_bytes: u64,
@@ -264,11 +271,13 @@ pub fn fork_workspace(
             })?;
             apply_metadata(&source_path, &destination_path, &metadata, true)?;
             counters.symlinks += 1;
+        } else if file_type.is_fifo() {
+            create_fifo(&destination_path, metadata.permissions().mode())
+                .with_context(|| format!("create FIFO {}", destination_path.display()))?;
+            apply_metadata(&source_path, &destination_path, &metadata, false)?;
+            counters.fifos += 1;
         } else {
-            bail!(
-                "unsupported special file in workspace fork: {}",
-                source_path.display()
-            );
+            counters.skipped_special += 1;
         }
     }
 
@@ -291,12 +300,27 @@ pub fn fork_workspace(
         files: counters.files,
         directories: counters.directories,
         symlinks: counters.symlinks,
+        fifos: counters.fifos,
+        skipped_special: counters.skipped_special,
         logical_bytes: counters.logical_bytes,
         cloned_bytes: counters.cloned_bytes,
         copied_bytes: counters.copied_bytes,
         hardlinked_files: counters.hardlinked_files,
         elapsed: started.elapsed(),
     })
+}
+
+fn create_fifo(path: &Path, mode: u32) -> io::Result<()> {
+    use std::ffi::CString;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "FIFO path contains NUL"))?;
+    // SAFETY: the C string is valid for the call and mkfifo does not retain it.
+    if unsafe { libc::mkfifo(path.as_ptr(), mode as libc::mode_t) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn unique_staging_path(parent: &Path, destination_name: &std::ffi::OsStr) -> PathBuf {
@@ -446,6 +470,16 @@ fn copy_xattrs(source: &Path, destination: &Path) -> anyhow::Result<()> {
         if let Some(value) = xattr::get(source, &name).with_context(|| {
             format!("read extended attribute {:?} on {}", name, source.display())
         })? {
+            if xattr::get(destination, &name).with_context(|| {
+                format!(
+                    "read existing extended attribute {:?} on {}",
+                    name,
+                    destination.display()
+                )
+            })? == Some(value.clone())
+            {
+                continue;
+            }
             xattr::set(destination, &name, &value).with_context(|| {
                 format!(
                     "set extended attribute {:?} on {}",

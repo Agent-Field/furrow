@@ -2,6 +2,7 @@ use agit::model::{id_hex, SnapshotTrigger};
 use agit::AgitRepository;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -59,6 +60,19 @@ enum Command {
     },
     /// Show workspace protection and store status.
     Status,
+    /// Create an isolated full-state workspace, optionally running a command inside it.
+    Fork {
+        /// Stable name used by `agit forks` and as the default directory name.
+        name: Option<String>,
+        /// Destination directory. Defaults to <repo>.agit-forks/<name> beside the repository.
+        #[arg(long)]
+        destination: Option<PathBuf>,
+        /// Command to run inside the completed fork, supplied after `--`.
+        #[arg(last = true)]
+        command: Vec<OsString>,
+    },
+    /// List full-state workspace forks created from this repository.
+    Forks,
     /// Stop watching this repository.
     Forget {
         #[arg(long)]
@@ -201,12 +215,91 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::Fork {
+            name,
+            destination,
+            command,
+        } => {
+            anyhow::ensure!(
+                !cli.json || command.is_empty(),
+                "--json cannot be combined with a fork command"
+            );
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let name = name.unwrap_or_else(default_fork_name);
+            let destination =
+                destination.unwrap_or_else(|| default_fork_destination(&repository, &name));
+            let summary = repository.fork(&name, &destination)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("Fork {}", summary.name);
+                println!("Path {}", summary.destination.display());
+                println!(
+                    "Tier {} | {} files | {} logical bytes | {} cloned | {} copied | {} ms",
+                    summary.tier,
+                    summary.files,
+                    summary.logical_bytes,
+                    summary.cloned_bytes,
+                    summary.copied_bytes,
+                    summary.elapsed_ms
+                );
+                println!("Base {}", &summary.base_snapshot[..12]);
+            }
+            if let Some((program, arguments)) = command.split_first() {
+                let status = std::process::Command::new(program)
+                    .args(arguments)
+                    .current_dir(&summary.destination)
+                    .env("AGIT_FORK_NAME", &summary.name)
+                    .env("AGIT_FORK_BASE", &summary.base_snapshot)
+                    .status()
+                    .with_context(|| format!("run {:?} in fork", program))?;
+                anyhow::ensure!(status.success(), "fork command exited with {status}");
+            }
+        }
+        Command::Forks => {
+            let repository = AgitRepository::open(&cli.repo)?;
+            let forks = repository.forks()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&forks)?);
+            } else if forks.is_empty() {
+                println!("No forks");
+            } else {
+                for fork in forks {
+                    println!(
+                        "{:<20} {:<14} {:>8} ms  {}",
+                        fork.name,
+                        fork.tier,
+                        fork.elapsed_ms,
+                        fork.destination.display()
+                    );
+                }
+            }
+        }
         Command::Forget { purge } => {
             AgitRepository::open(&cli.repo)?.forget(purge)?;
             println!("Repository detached from agit");
         }
     }
     Ok(())
+}
+
+fn default_fork_name() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("fork-{seconds}")
+}
+
+fn default_fork_destination(repository: &AgitRepository, name: &str) -> PathBuf {
+    let root = repository.root();
+    let parent = root.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let repository_name = root
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("workspace"));
+    let mut forks_name = repository_name.to_os_string();
+    forks_name.push(".agit-forks");
+    parent.join(forks_name).join(name)
 }
 
 fn print_plan(plan: &agit::RewindPlan) {
