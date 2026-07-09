@@ -11,6 +11,14 @@ pub struct ObjectLocation {
     pub kind: ObjectKind,
 }
 
+#[derive(Debug, Clone)]
+pub struct PackCheckpoint {
+    pub verified_len: u64,
+    pub object_count: u64,
+    pub last_object: Option<ObjectId>,
+    pub last_record_start: u64,
+}
+
 pub struct Catalog {
     conn: Connection,
 }
@@ -64,6 +72,13 @@ impl Catalog {
                 path BLOB NOT NULL,
                 tree_id BLOB NOT NULL,
                 PRIMARY KEY(workspace_id, path)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS pack_checkpoints (
+                pack TEXT PRIMARY KEY,
+                verified_len INTEGER NOT NULL,
+                object_count INTEGER NOT NULL,
+                last_object BLOB,
+                last_record_start INTEGER NOT NULL
             ) WITHOUT ROWID;
             ",
         )?;
@@ -220,6 +235,90 @@ impl Catalog {
             .query_row("SELECT COUNT(*) FROM objects", [], |row| {
                 row.get::<_, i64>(0)
             })? as u64)
+    }
+
+    pub fn pack_checkpoint(&self, pack: &str) -> anyhow::Result<Option<PackCheckpoint>> {
+        self.conn
+            .query_row(
+                "SELECT verified_len, object_count, last_object, last_record_start
+                 FROM pack_checkpoints WHERE pack = ?1",
+                params![pack],
+                |row| {
+                    let last_object: Option<Vec<u8>> = row.get(2)?;
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        last_object,
+                        row.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(verified_len, object_count, last_object, last_record_start)| {
+                    Ok(PackCheckpoint {
+                        verified_len,
+                        object_count,
+                        last_object: last_object.map(vec_to_id).transpose()?,
+                        last_record_start,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn set_pack_checkpoint(
+        &self,
+        pack: &str,
+        checkpoint: &PackCheckpoint,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO pack_checkpoints(
+                pack, verified_len, object_count, last_object, last_record_start
+             ) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(pack) DO UPDATE SET
+                verified_len=excluded.verified_len,
+                object_count=excluded.object_count,
+                last_object=excluded.last_object,
+                last_record_start=excluded.last_record_start",
+            params![
+                pack,
+                checkpoint.verified_len as i64,
+                checkpoint.object_count as i64,
+                checkpoint.last_object.as_ref().map(|id| id.as_slice()),
+                checkpoint.last_record_start as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pack_prefix_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM objects
+             WHERE pack = ?1 AND offset + len + 4 <= ?2",
+            params![pack, verified_len as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    pub fn pack_crossing_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM objects
+             WHERE pack = ?1 AND offset < ?2 AND offset + len + 4 > ?2",
+            params![pack, verified_len as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    pub fn reset_pack_index(&mut self, pack: &str) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM objects WHERE pack = ?1", params![pack])?;
+        tx.execute(
+            "DELETE FROM pack_checkpoints WHERE pack = ?1",
+            params![pack],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn insert_object(

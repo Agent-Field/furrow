@@ -1,4 +1,4 @@
-use crate::catalog::{CachedFile, Catalog, TimelineRow};
+use crate::catalog::{CachedFile, Catalog, PackCheckpoint, TimelineRow};
 use crate::model::{ObjectId, ObjectKind, SnapshotTrigger};
 use crate::refs::{RefLog, RefRecord};
 use anyhow::Context;
@@ -32,7 +32,7 @@ impl ObjectStore {
         fs::create_dir_all(root.join("locks"))?;
         fs::create_dir_all(root.join("workspaces"))?;
         let catalog = Catalog::open(&root.join("catalog.sqlite3"))?;
-        let store = Self { root, catalog };
+        let mut store = Self { root, catalog };
         store.recover_pack()?;
         Ok(store)
     }
@@ -131,8 +131,12 @@ impl ObjectStore {
             File::open(&workspace_dir)?.sync_all()?;
         }
         self.catalog.ensure_workspace(id, root)?;
-        for record in RefLog::open(&self.root, id)?.records()? {
-            self.index_ref_record(id, &record)?;
+        let refs = RefLog::open(&self.root, id)?;
+        let ref_head = refs.head()?.map(|record| record.snapshot_id);
+        if self.catalog.workspace_head(id)? != ref_head {
+            for record in refs.records()? {
+                self.index_ref_record(id, &record)?;
+            }
         }
         Ok(())
     }
@@ -153,17 +157,14 @@ impl ObjectStore {
 
     pub fn workspace_head(&self, id: &str) -> anyhow::Result<Option<ObjectId>> {
         Ok(RefLog::open(&self.root, id)?
-            .records()?
-            .last()
+            .head()?
             .map(|record| record.snapshot_id))
     }
 
     pub fn timeline(&self, id: &str, limit: usize) -> anyhow::Result<Vec<TimelineRow>> {
-        let records = RefLog::open(&self.root, id)?.records()?;
-        Ok(records
+        Ok(RefLog::open(&self.root, id)?
+            .recent(limit)?
             .into_iter()
-            .rev()
-            .take(limit)
             .map(|record| TimelineRow {
                 id: record.snapshot_id,
                 sealed_at: record.sealed_at,
@@ -267,7 +268,7 @@ impl ObjectStore {
         Ok(())
     }
 
-    fn recover_pack(&self) -> anyhow::Result<()> {
+    fn recover_pack(&mut self) -> anyhow::Result<()> {
         let pack_path = self.root.join("packs").join(PACK_NAME);
         if !pack_path.exists() {
             return Ok(());
@@ -281,7 +282,34 @@ impl ObjectStore {
         lock.lock_exclusive()?;
         let mut pack = OpenOptions::new().read(true).write(true).open(&pack_path)?;
         let file_len = pack.metadata()?.len();
-        let mut offset = 0_u64;
+        let checkpoint = self.catalog.pack_checkpoint(PACK_NAME)?;
+        let checkpoint_valid = checkpoint
+            .as_ref()
+            .map(|checkpoint| self.validate_checkpoint(&mut pack, file_len, checkpoint))
+            .transpose()?
+            .unwrap_or(false);
+        if !checkpoint_valid {
+            self.catalog.reset_pack_index(PACK_NAME)?;
+        }
+
+        let mut offset = checkpoint
+            .as_ref()
+            .filter(|_| checkpoint_valid)
+            .map_or(0, |checkpoint| checkpoint.verified_len);
+        let mut object_count = checkpoint
+            .as_ref()
+            .filter(|_| checkpoint_valid)
+            .map_or(0, |checkpoint| checkpoint.object_count);
+        let mut last_object = checkpoint
+            .as_ref()
+            .filter(|_| checkpoint_valid)
+            .and_then(|checkpoint| checkpoint.last_object);
+        let mut last_record_start = checkpoint
+            .as_ref()
+            .filter(|_| checkpoint_valid)
+            .map_or(0, |checkpoint| checkpoint.last_record_start);
+        pack.seek(SeekFrom::Start(offset))?;
+        let mut buffer = vec![0_u8; 1024 * 1024];
         while offset < file_len {
             let record_start = offset;
             let mut magic = [0_u8; 4];
@@ -322,7 +350,6 @@ impl ObjectStore {
                 break;
             }
             let mut remaining = len;
-            let mut buffer = vec![0_u8; 1024 * 1024];
             let mut content_hasher = blake3::Hasher::new();
             content_hasher.update(kind.domain());
             let mut checksum_hasher = blake3::Hasher::new();
@@ -347,10 +374,75 @@ impl ObjectStore {
             self.catalog
                 .insert_object(&id, kind, PACK_NAME, payload_offset, len)?;
             offset = pack.stream_position()?;
+            object_count += 1;
+            last_object = Some(id);
+            last_record_start = record_start;
         }
         pack.sync_data()?;
+        self.catalog.set_pack_checkpoint(
+            PACK_NAME,
+            &PackCheckpoint {
+                verified_len: offset,
+                object_count,
+                last_object,
+                last_record_start,
+            },
+        )?;
         FileExt::unlock(&lock)?;
         Ok(())
+    }
+
+    fn validate_checkpoint(
+        &self,
+        pack: &mut File,
+        file_len: u64,
+        checkpoint: &PackCheckpoint,
+    ) -> anyhow::Result<bool> {
+        if checkpoint.verified_len > file_len
+            || self
+                .catalog
+                .pack_prefix_object_count(PACK_NAME, checkpoint.verified_len)?
+                != checkpoint.object_count
+            || self
+                .catalog
+                .pack_crossing_object_count(PACK_NAME, checkpoint.verified_len)?
+                != 0
+        {
+            return Ok(false);
+        }
+        if checkpoint.object_count == 0 {
+            return Ok(checkpoint.verified_len == 0 && checkpoint.last_object.is_none());
+        }
+        let Some(last_id) = checkpoint.last_object else {
+            return Ok(false);
+        };
+        let Some(location) = self.catalog.object(&last_id)? else {
+            return Ok(false);
+        };
+        if location.pack != PACK_NAME
+            || location.offset != checkpoint.last_record_start + HEADER_LEN
+            || location.offset + location.len + OBJECT_END.len() as u64 != checkpoint.verified_len
+        {
+            return Ok(false);
+        }
+
+        pack.seek(SeekFrom::Start(checkpoint.last_record_start))?;
+        let mut header = [0_u8; HEADER_LEN as usize];
+        if pack.read_exact(&mut header).is_err()
+            || &header[..4] != OBJECT_MAGIC
+            || header[4] != OBJECT_VERSION
+            || ObjectKind::from_u8(header[5]) != Some(location.kind)
+        {
+            return Ok(false);
+        }
+        let mut len_bytes = [0_u8; 8];
+        len_bytes.copy_from_slice(&header[6..14]);
+        if u64::from_le_bytes(len_bytes) != location.len || header[14..46] != last_id {
+            return Ok(false);
+        }
+        pack.seek(SeekFrom::Start(checkpoint.verified_len - 4))?;
+        let mut trailer = [0_u8; 4];
+        Ok(pack.read_exact(&mut trailer).is_ok() && &trailer == OBJECT_END)
     }
 
     fn truncate_pack_tail(&self, pack: &File, record_start: u64) -> anyhow::Result<()> {
@@ -376,4 +468,106 @@ pub fn object_id(kind: ObjectKind, bytes: &[u8]) -> ObjectId {
     hasher.update(kind.domain());
     hasher.update(bytes);
     *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn checkpointed_store() -> (tempfile::TempDir, ObjectId, ObjectId, u64) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let first = store
+            .put_bytes(ObjectKind::Chunk, &vec![b'a'; 128 * 1024])
+            .unwrap();
+        let second = store.put_bytes(ObjectKind::Chunk, b"second").unwrap();
+        drop(store);
+
+        // The first reopen verifies the legacy/uncheckpointed pack and records
+        // the durable boundary used by subsequent startups.
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let verified_len = fs::metadata(directory.path().join("packs").join(PACK_NAME))
+            .unwrap()
+            .len();
+        assert_eq!(
+            store
+                .catalog
+                .pack_checkpoint(PACK_NAME)
+                .unwrap()
+                .unwrap()
+                .verified_len,
+            verified_len
+        );
+        drop(store);
+        (directory, first, second, verified_len)
+    }
+
+    #[test]
+    fn valid_checkpoint_does_not_rehash_the_pack_prefix() {
+        let (directory, first, second, _) = checkpointed_store();
+        let catalog = Catalog::open(&directory.path().join("catalog.sqlite3")).unwrap();
+        let first_location = catalog.object(&first).unwrap().unwrap();
+        drop(catalog);
+
+        let pack_path = directory.path().join("packs").join(PACK_NAME);
+        let mut pack = OpenOptions::new().write(true).open(pack_path).unwrap();
+        pack.seek(SeekFrom::Start(first_location.offset + 17))
+            .unwrap();
+        pack.write_all(b"Z").unwrap();
+        pack.sync_data().unwrap();
+        drop(pack);
+
+        // Constant-size boundary validation succeeds without reading the old
+        // payload. Reads retain their independent object-integrity check.
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert!(store.read_bytes(&first, ObjectKind::Chunk).is_err());
+        assert_eq!(
+            store.read_bytes(&second, ObjectKind::Chunk).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_index_forces_a_full_verified_rebuild() {
+        let (directory, first, second, _) = checkpointed_store();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        connection.execute("DELETE FROM objects", []).unwrap();
+        drop(connection);
+
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert_eq!(
+            store.read_bytes(&first, ObjectKind::Chunk).unwrap(),
+            vec![b'a'; 128 * 1024]
+        );
+        assert_eq!(
+            store.read_bytes(&second, ObjectKind::Chunk).unwrap(),
+            b"second"
+        );
+        assert_eq!(store.catalog.object_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn checkpointed_recovery_verifies_and_truncates_only_the_new_tail() {
+        let (directory, first, second, verified_len) = checkpointed_store();
+        let pack_path = directory.path().join("packs").join(PACK_NAME);
+        let mut pack = OpenOptions::new().append(true).open(&pack_path).unwrap();
+        pack.write_all(b"AGOB\x01").unwrap();
+        pack.sync_data().unwrap();
+        drop(pack);
+
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert_eq!(fs::metadata(pack_path).unwrap().len(), verified_len);
+        assert!(store.catalog.object(&first).unwrap().is_some());
+        assert!(store.catalog.object(&second).unwrap().is_some());
+        assert_eq!(
+            store
+                .catalog
+                .pack_checkpoint(PACK_NAME)
+                .unwrap()
+                .unwrap()
+                .verified_len,
+            verified_len
+        );
+    }
 }
