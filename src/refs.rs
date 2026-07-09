@@ -81,6 +81,43 @@ impl RefLog {
         Ok(self.recent(1)?.pop())
     }
 
+    /// Streams every authoritative snapshot reference in log order using
+    /// constant memory. Unlike the reverse index fast path, this verifies every
+    /// frame and the complete hash chain before returning.
+    pub fn for_each_snapshot(
+        &self,
+        mut visit: impl FnMut(ObjectId) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let lock = self.lock()?;
+        let mut log = self.open_log()?;
+        self.ensure_index(&mut log)?;
+        let length = log.metadata()?.len();
+        let mut offset = 0_u64;
+        let mut previous = [0_u8; 32];
+        let mut sequence = 1_u64;
+        while offset < length {
+            let frame = read_frame_at(&mut log, offset)?
+                .context("reference log ended before its indexed boundary")?;
+            anyhow::ensure!(
+                frame.record.sequence == sequence,
+                "non-monotonic reference sequence"
+            );
+            anyhow::ensure!(
+                frame.record.previous_frame == previous,
+                "broken reference hash chain"
+            );
+            visit(frame.record.snapshot_id)?;
+            offset = frame.end;
+            previous = frame.frame_hash;
+            sequence += 1;
+        }
+        FileExt::unlock(&lock)?;
+        Ok(())
+    }
+
     /// Returns newest-first records while reading only O(limit) log frames once
     /// the reverse index has been validated.
     pub fn recent(&self, limit: usize) -> anyhow::Result<Vec<RefRecord>> {

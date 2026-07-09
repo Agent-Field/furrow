@@ -585,6 +585,111 @@ fn recovery_rediscovers_workspace_after_git_clean_removes_pointer() {
     assert!(fixture.repo.join(".agit/workspace-id").exists());
 }
 
+#[test]
+fn plain_forget_stays_detached_instead_of_being_rediscovered() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let workspace_id = fs::read_to_string(fixture.repo.join(".agit/workspace-id")).unwrap();
+
+    fixture.agit().arg("forget").assert().success();
+    assert!(!fixture.repo.join(".agit/workspace-id").exists());
+    fixture
+        .agit()
+        .arg("status")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not watched"));
+    let output = fixture
+        .agit()
+        .args(["--json", "gc", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert!(report["roots"].as_u64().unwrap() > 0);
+
+    fixture
+        .agit()
+        .args(["watch", "--no-daemon"])
+        .assert()
+        .success();
+    let new_workspace_id = fs::read_to_string(fixture.repo.join(".agit/workspace-id")).unwrap();
+    assert_ne!(workspace_id, new_workspace_id);
+}
+
+#[test]
+fn purge_then_gc_reclaims_only_unshared_history() {
+    let fixture = Fixture::new();
+    fixture.watch();
+
+    let second = fixture.repo.parent().unwrap().join("second");
+    git(
+        fixture.repo.parent().unwrap(),
+        &["clone", fixture.repo.to_str().unwrap(), "second"],
+    );
+    let second_agit = || {
+        let mut command = Command::cargo_bin("agit").unwrap();
+        command
+            .env("AGIT_DATA_DIR", &fixture.data)
+            .env("AGIT_NO_DAEMON", "1")
+            .arg("--repo")
+            .arg(&second);
+        command
+    };
+    let output = second_agit()
+        .args(["--json", "watch", "--no-daemon"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_snapshot = serde_json::from_slice::<Value>(&output).unwrap()["snapshot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    fixture
+        .agit()
+        .args(["forget", "--purge"])
+        .assert()
+        .success();
+    let preview_output = fixture
+        .agit()
+        .args(["--json", "gc", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let preview: Value = serde_json::from_slice(&preview_output).unwrap();
+    assert_eq!(preview["dry_run"], true);
+    assert!(preview["unreachable_objects"].as_u64().unwrap() > 0);
+
+    let output = fixture
+        .agit()
+        .args(["--json", "gc"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert!(report["unreachable_objects"].as_u64().unwrap() > 0);
+    assert!(report["reclaimed_bytes"].as_u64().unwrap() > 0);
+
+    fs::write(second.join("app.txt"), b"destroyed after gc\n").unwrap();
+    second_agit()
+        .args(["rewind", &second_snapshot, "--paths", "app.txt", "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(second.join("app.txt")).unwrap(),
+        b"tracked original\n"
+    );
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")

@@ -1,6 +1,7 @@
 use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::fork::{fork_workspace, ForkReport, ForkTier};
+use crate::gc::{self, GcReport};
 use crate::model::{
     id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
     SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
@@ -205,6 +206,7 @@ impl AgitRepository {
         trigger: SnapshotTrigger,
         dirty_directories: Option<&BTreeSet<Vec<u8>>>,
     ) -> anyhow::Result<ObjectId> {
+        let _maintenance = self.store.acquire_maintenance_shared()?;
         let parent = self.store.workspace_head(&self.workspace_id)?;
         let root_tree = self.capture_root_retry(dirty_directories)?;
         // Continuous watcher seals keep raw database/WAL/SHM bytes (L0) and
@@ -259,6 +261,15 @@ impl AgitRepository {
             physical_bytes: stats.physical_bytes,
             watcher_running: self.watcher_running(),
         })
+    }
+
+    pub fn gc(&mut self, dry_run: bool) -> anyhow::Result<GcReport> {
+        gc::collect(&mut self.store, dry_run)
+    }
+
+    pub fn gc_global(dry_run: bool) -> anyhow::Result<GcReport> {
+        let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
+        gc::collect(&mut store, dry_run)
     }
 
     pub fn fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkSummary> {
@@ -443,14 +454,22 @@ impl AgitRepository {
         Ok((pre, plan))
     }
 
-    pub fn forget(self, purge: bool) -> anyhow::Result<()> {
+    pub fn forget(mut self, purge: bool) -> anyhow::Result<()> {
         self.stop_watcher()?;
+        let _maintenance = self.store.acquire_maintenance_exclusive()?;
+        self.store.detach_workspace(&self.workspace_id)?;
         let workspace_file = self.root.join(WORKSPACE_FILE);
         if workspace_file.exists() {
-            fs::remove_file(workspace_file)?;
+            fs::remove_file(&workspace_file)?;
+            File::open(
+                workspace_file
+                    .parent()
+                    .context("workspace file has no parent")?,
+            )?
+            .sync_all()?;
         }
         if purge {
-            // Reachability-aware physical collection is intentionally performed by GC.
+            self.store.purge_workspace(&self.workspace_id)?;
             eprintln!("workspace detached; unreachable data will be removed by `agit gc`");
         }
         Ok(())

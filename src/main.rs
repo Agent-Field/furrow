@@ -78,6 +78,12 @@ enum Command {
         #[arg(long)]
         purge: bool,
     },
+    /// Reclaim objects unreachable from every retained workspace timeline.
+    Gc {
+        /// Report what would be reclaimed without changing the store.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -278,6 +284,24 @@ fn main() -> anyhow::Result<()> {
         Command::Forget { purge } => {
             AgitRepository::open(&cli.repo)?.forget(purge)?;
             println!("Repository detached from agit");
+        }
+        Command::Gc { dry_run } => {
+            let report = AgitRepository::gc_global(dry_run)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{} objects reachable; {} unreachable",
+                    report.reachable_objects, report.unreachable_objects
+                );
+                println!(
+                    "{} bytes {} ({} -> {})",
+                    report.reclaimed_bytes,
+                    if dry_run { "reclaimable" } else { "reclaimed" },
+                    report.physical_bytes_before,
+                    report.physical_bytes_after
+                );
+            }
         }
     }
     Ok(())

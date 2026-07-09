@@ -237,6 +237,94 @@ impl Catalog {
             })? as u64)
     }
 
+    pub fn object_payload_bytes(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(SUM(len), 0) FROM objects", [], |row| {
+                row.get::<_, i64>(0)
+            })? as u64)
+    }
+
+    pub fn remove_workspace(&mut self, workspace_id: &str) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM file_cache WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM directory_cache WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM timeline WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM workspaces WHERE id = ?1",
+            params![workspace_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn detach_workspace(&mut self, workspace_id: &str) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM file_cache WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM directory_cache WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM workspaces WHERE id = ?1",
+            params![workspace_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn replace_objects_from_gc(
+        &mut self,
+        mark_database: &Path,
+        pack: &str,
+        checkpoint: &PackCheckpoint,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS gcmark",
+            params![mark_database.as_os_str().to_string_lossy().as_ref()],
+        )?;
+        let result = (|| {
+            let tx = self.conn.transaction()?;
+            tx.execute("DELETE FROM objects", [])?;
+            tx.execute(
+                "INSERT INTO objects(id, kind, pack, offset, len)
+                 SELECT id, kind, ?1, offset, len FROM gcmark.locations",
+                params![pack],
+            )?;
+            tx.execute("DELETE FROM pack_checkpoints", [])?;
+            tx.execute(
+                "INSERT INTO pack_checkpoints(
+                    pack, verified_len, object_count, last_object, last_record_start
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    pack,
+                    checkpoint.verified_len as i64,
+                    checkpoint.object_count as i64,
+                    checkpoint.last_object.as_ref().map(|id| id.as_slice()),
+                    checkpoint.last_record_start as i64,
+                ],
+            )?;
+            tx.commit()?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        let detached = self.conn.execute("DETACH DATABASE gcmark", []);
+        result?;
+        detached?;
+        Ok(())
+    }
+
     pub fn pack_checkpoint(&self, pack: &str) -> anyhow::Result<Option<PackCheckpoint>> {
         self.conn
             .query_row(
