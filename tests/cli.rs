@@ -312,6 +312,38 @@ fn watch_refuses_non_git_directories() {
 }
 
 #[test]
+fn unchanged_snapshots_reuse_cached_blobs_and_add_only_small_metadata() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let pack = fixture.data.join("store-v1/packs/pack-000001.agp");
+    let initial = fs::metadata(&pack).unwrap().len();
+
+    fixture
+        .agit()
+        .args(["snap", "-m", "unchanged"])
+        .assert()
+        .success();
+    let unchanged_growth = fs::metadata(&pack).unwrap().len() - initial;
+    assert!(
+        unchanged_growth < 16 * 1024,
+        "unchanged snapshot added {unchanged_growth} bytes"
+    );
+
+    fs::write(fixture.repo.join("notes.txt"), b"one small delta\n").unwrap();
+    let before_delta = fs::metadata(&pack).unwrap().len();
+    fixture
+        .agit()
+        .args(["snap", "-m", "small delta"])
+        .assert()
+        .success();
+    let delta_growth = fs::metadata(&pack).unwrap().len() - before_delta;
+    assert!(
+        delta_growth < 32 * 1024,
+        "small delta added {delta_growth} bytes"
+    );
+}
+
+#[test]
 fn recovery_rediscovers_workspace_after_git_clean_removes_pointer() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();

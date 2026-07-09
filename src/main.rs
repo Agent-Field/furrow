@@ -146,21 +146,18 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Status => {
             let repository = AgitRepository::open(&cli.repo)?;
-            let timeline = repository.timeline(1)?;
-            let value = serde_json::json!({
-                "workspace": repository.root(),
-                "store": repository.store_root(),
-                "head": timeline.first().map(|item| item.id.as_str()),
-                "protected": !timeline.is_empty(),
-            });
+            let status = repository.status()?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
-                println!("Workspace: {}", repository.root().display());
-                println!("Store:     {}", repository.store_root().display());
-                if let Some(head) = timeline.first() {
-                    println!("Head:      {}", head.id);
+                println!("Workspace: {}", status.workspace.display());
+                println!("Store:     {}", status.store.display());
+                if let Some(head) = status.head {
+                    println!("Head:      {head}");
                 }
+                println!("Snapshots: {}", status.snapshots);
+                println!("Objects:   {}", status.objects);
+                println!("Pack data: {} bytes", status.physical_bytes);
             }
         }
         Command::Forget { purge } => {

@@ -1,4 +1,4 @@
-use crate::catalog::{Catalog, TimelineRow};
+use crate::catalog::{CachedFile, Catalog, TimelineRow};
 use crate::model::{ObjectId, ObjectKind, SnapshotTrigger};
 use crate::refs::{RefLog, RefRecord};
 use anyhow::Context;
@@ -18,6 +18,12 @@ const MAX_OBJECT_LEN: u64 = 256 * 1024 * 1024;
 pub struct ObjectStore {
     root: PathBuf,
     catalog: Catalog,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct StoreStats {
+    pub objects: u64,
+    pub physical_bytes: u64,
 }
 
 impl ObjectStore {
@@ -67,7 +73,6 @@ impl ObjectStore {
             let payload_offset = record_start + HEADER_LEN;
             pack.write_all(bytes)?;
             pack.write_all(OBJECT_END)?;
-            pack.sync_data()?;
             self.catalog
                 .insert_object(&id, kind, PACK_NAME, payload_offset, bytes.len() as u64)?;
         }
@@ -168,6 +173,23 @@ impl ObjectStore {
             .collect())
     }
 
+    pub fn cached_file(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+    ) -> anyhow::Result<Option<CachedFile>> {
+        self.catalog.cached_file(workspace_id, path)
+    }
+
+    pub fn cache_file(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+        file: &CachedFile,
+    ) -> anyhow::Result<()> {
+        self.catalog.cache_file(workspace_id, path, file)
+    }
+
     pub fn publish_snapshot(
         &mut self,
         workspace_id: &str,
@@ -178,6 +200,7 @@ impl ObjectStore {
     ) -> anyhow::Result<()> {
         // The append is the visibility boundary. Every referenced object was
         // sync'd before this call; SQLite is an advisory index rebuilt from it.
+        self.sync_active_pack()?;
         let record = RefLog::open(&self.root, workspace_id)?.append(
             snapshot_id,
             sealed_at,
@@ -191,6 +214,20 @@ impl ObjectStore {
         &self.root
     }
 
+    pub fn stats(&self) -> anyhow::Result<StoreStats> {
+        let mut physical_bytes = 0_u64;
+        for entry in fs::read_dir(self.root.join("packs"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                physical_bytes += entry.metadata()?.len();
+            }
+        }
+        Ok(StoreStats {
+            objects: self.catalog.object_count()?,
+            physical_bytes,
+        })
+    }
+
     fn index_ref_record(&mut self, workspace_id: &str, record: &RefRecord) -> anyhow::Result<()> {
         self.catalog.commit_snapshot(
             workspace_id,
@@ -199,6 +236,14 @@ impl ObjectStore {
             record.label.as_deref(),
             trigger_name(&record.trigger),
         )
+    }
+
+    fn sync_active_pack(&self) -> anyhow::Result<()> {
+        let path = self.root.join("packs").join(PACK_NAME);
+        if path.exists() {
+            File::open(path)?.sync_data()?;
+        }
+        Ok(())
     }
 
     fn recover_pack(&self) -> anyhow::Result<()> {
@@ -213,7 +258,7 @@ impl ObjectStore {
             let record_start = offset;
             let mut magic = [0_u8; 4];
             if pack.read_exact(&mut magic).is_err() {
-                pack.set_len(record_start)?;
+                self.truncate_pack_tail(&pack, record_start)?;
                 break;
             }
             anyhow::ensure!(
@@ -222,14 +267,14 @@ impl ObjectStore {
             );
             let mut meta = [0_u8; 2];
             if pack.read_exact(&mut meta).is_err() {
-                pack.set_len(record_start)?;
+                self.truncate_pack_tail(&pack, record_start)?;
                 break;
             }
             anyhow::ensure!(meta[0] == OBJECT_VERSION, "unsupported object pack version");
             let kind = ObjectKind::from_u8(meta[1]).context("invalid object kind in pack")?;
             let mut len_bytes = [0_u8; 8];
             if pack.read_exact(&mut len_bytes).is_err() {
-                pack.set_len(record_start)?;
+                self.truncate_pack_tail(&pack, record_start)?;
                 break;
             }
             let len = u64::from_le_bytes(len_bytes);
@@ -240,12 +285,12 @@ impl ObjectStore {
             let mut id = [0_u8; 32];
             let mut checksum = [0_u8; 32];
             if pack.read_exact(&mut id).is_err() || pack.read_exact(&mut checksum).is_err() {
-                pack.set_len(record_start)?;
+                self.truncate_pack_tail(&pack, record_start)?;
                 break;
             }
             let payload_offset = record_start + HEADER_LEN;
             if file_len.saturating_sub(payload_offset) < len + OBJECT_END.len() as u64 {
-                pack.set_len(record_start)?;
+                self.truncate_pack_tail(&pack, record_start)?;
                 break;
             }
             let mut remaining = len;
@@ -276,6 +321,13 @@ impl ObjectStore {
             offset = pack.stream_position()?;
         }
         pack.sync_data()?;
+        Ok(())
+    }
+
+    fn truncate_pack_tail(&self, pack: &File, record_start: u64) -> anyhow::Result<()> {
+        pack.set_len(record_start)?;
+        self.catalog
+            .delete_pack_objects_from(PACK_NAME, record_start.saturating_add(HEADER_LEN))?;
         Ok(())
     }
 }

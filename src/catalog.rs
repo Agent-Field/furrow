@@ -45,9 +45,111 @@ impl Catalog {
             );
             CREATE INDEX IF NOT EXISTS timeline_workspace_sequence
                 ON timeline(workspace_id, sequence DESC);
+            CREATE TABLE IF NOT EXISTS file_cache (
+                workspace_id TEXT NOT NULL,
+                path BLOB NOT NULL,
+                device INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_secs INTEGER NOT NULL,
+                mtime_nanos INTEGER NOT NULL,
+                ctime_secs INTEGER NOT NULL,
+                ctime_nanos INTEGER NOT NULL,
+                mode INTEGER NOT NULL,
+                blob_id BLOB NOT NULL,
+                PRIMARY KEY(workspace_id, path)
+            ) WITHOUT ROWID;
             ",
         )?;
         Ok(Self { conn })
+    }
+
+    pub fn cached_file(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+    ) -> anyhow::Result<Option<CachedFile>> {
+        self.conn
+            .query_row(
+                "SELECT device, inode, size, mtime_secs, mtime_nanos,
+                        ctime_secs, ctime_nanos, mode, blob_id
+                 FROM file_cache WHERE workspace_id = ?1 AND path = ?2",
+                params![workspace_id, path],
+                |row| {
+                    let id: Vec<u8> = row.get(8)?;
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)? as u32,
+                        id,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(
+                    device,
+                    inode,
+                    size,
+                    mtime_secs,
+                    mtime_nanos,
+                    ctime_secs,
+                    ctime_nanos,
+                    mode,
+                    id,
+                )| {
+                    Ok(CachedFile {
+                        device,
+                        inode,
+                        size,
+                        mtime_secs,
+                        mtime_nanos,
+                        ctime_secs,
+                        ctime_nanos,
+                        mode,
+                        blob_id: vec_to_id(id)?,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn cache_file(
+        &self,
+        workspace_id: &str,
+        path: &[u8],
+        file: &CachedFile,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_cache(
+                workspace_id, path, device, inode, size, mtime_secs, mtime_nanos,
+                ctime_secs, ctime_nanos, mode, blob_id
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(workspace_id, path) DO UPDATE SET
+                device=excluded.device, inode=excluded.inode, size=excluded.size,
+                mtime_secs=excluded.mtime_secs, mtime_nanos=excluded.mtime_nanos,
+                ctime_secs=excluded.ctime_secs, ctime_nanos=excluded.ctime_nanos,
+                mode=excluded.mode, blob_id=excluded.blob_id",
+            params![
+                workspace_id,
+                path,
+                file.device as i64,
+                file.inode as i64,
+                file.size as i64,
+                file.mtime_secs,
+                file.mtime_nanos,
+                file.ctime_secs,
+                file.ctime_nanos,
+                file.mode,
+                file.blob_id.as_slice(),
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn object(&self, id: &ObjectId) -> anyhow::Result<Option<ObjectLocation>> {
@@ -76,6 +178,14 @@ impl Catalog {
             .map_err(Into::into)
     }
 
+    pub fn object_count(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| {
+                row.get::<_, i64>(0)
+            })? as u64)
+    }
+
     pub fn insert_object(
         &self,
         id: &ObjectId,
@@ -87,6 +197,14 @@ impl Catalog {
         self.conn.execute(
             "INSERT OR IGNORE INTO objects(id, kind, pack, offset, len) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![id.as_slice(), kind as u8, pack, offset as i64, len as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pack_objects_from(&self, pack: &str, payload_offset: u64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM objects WHERE pack = ?1 AND offset >= ?2",
+            params![pack, payload_offset as i64],
         )?;
         Ok(())
     }
@@ -168,6 +286,19 @@ pub struct TimelineRow {
     pub sealed_at: i64,
     pub label: Option<String>,
     pub trigger: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedFile {
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mtime_secs: i64,
+    pub mtime_nanos: i64,
+    pub ctime_secs: i64,
+    pub ctime_nanos: i64,
+    pub mode: u32,
+    pub blob_id: ObjectId,
 }
 
 fn vec_to_id(bytes: Vec<u8>) -> anyhow::Result<ObjectId> {

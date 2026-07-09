@@ -6,4 +6,4 @@ pub mod repository;
 pub mod sqlite_adapter;
 pub mod store;
 
-pub use repository::{AgitRepository, RewindPlan, SnapshotSummary};
+pub use repository::{AgitRepository, RepositoryStatus, RewindPlan, SnapshotSummary};

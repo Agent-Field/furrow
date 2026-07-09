@@ -1,3 +1,4 @@
+use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::model::{
     id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
@@ -46,6 +47,16 @@ pub struct RewindChange {
 pub struct RewindPlan {
     pub target: String,
     pub changes: Vec<RewindChange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepositoryStatus {
+    pub workspace: PathBuf,
+    pub store: PathBuf,
+    pub head: Option<String>,
+    pub snapshots: usize,
+    pub objects: u64,
+    pub physical_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -135,7 +146,7 @@ impl AgitRepository {
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<ObjectId> {
         let parent = self.store.workspace_head(&self.workspace_id)?;
-        let root_tree = self.capture_directory(&self.root)?;
+        let root_tree = self.capture_root_retry()?;
         let sqlite_backups = self.capture_sqlite_backups()?;
         let (secs, nanos) = now();
         let snapshot = Snapshot {
@@ -169,6 +180,19 @@ impl AgitRepository {
             .collect()
     }
 
+    pub fn status(&self) -> anyhow::Result<RepositoryStatus> {
+        let timeline = self.timeline(100_000)?;
+        let stats = self.store.stats()?;
+        Ok(RepositoryStatus {
+            workspace: self.root.clone(),
+            store: self.store.root().to_owned(),
+            head: timeline.first().map(|item| item.id.clone()),
+            snapshots: timeline.len(),
+            objects: stats.objects,
+            physical_bytes: stats.physical_bytes,
+        })
+    }
+
     pub fn resolve_snapshot(&self, value: &str) -> anyhow::Result<ObjectId> {
         if value.len() == 64 {
             let id = parse_id(value)?;
@@ -196,7 +220,7 @@ impl AgitRepository {
     pub fn plan_rewind(&self, target: &ObjectId, paths: &[PathBuf]) -> anyhow::Result<RewindPlan> {
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
         let target_entries = self.flatten_tree(&target_snapshot.root_tree)?;
-        let current_tree = self.capture_directory_readonly(&self.root)?;
+        let current_tree = self.capture_root_retry()?;
         let current_entries = self.flatten_tree(&current_tree)?;
         let mut all_paths = BTreeSet::new();
         all_paths.extend(target_entries.keys().cloned());
@@ -279,13 +303,25 @@ impl AgitRepository {
         self.capture_directory_impl(path, true)
     }
 
-    fn capture_directory_readonly(&self, path: &Path) -> anyhow::Result<ObjectId> {
-        self.capture_directory_impl(path, false)
+    fn capture_root_retry(&self) -> anyhow::Result<ObjectId> {
+        let mut last_error = None;
+        for _ in 0..3 {
+            match self.capture_directory(&self.root) {
+                Ok(id) => return Ok(id),
+                Err(error) if is_not_found(&error) => last_error = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error
+            .context("capture retry failed without an error")?
+            .context("workspace kept changing while it was captured"))
     }
 
     fn capture_directory_impl(&self, path: &Path, _publication: bool) -> anyhow::Result<ObjectId> {
         let mut entries = Vec::new();
-        let mut children: Vec<_> = fs::read_dir(path)?.collect::<Result<_, _>>()?;
+        let mut children: Vec<_> = fs::read_dir(path)
+            .with_context(|| format!("read directory {}", path.display()))?
+            .collect::<Result<_, _>>()?;
         children.sort_by(|a, b| a.file_name().as_bytes().cmp(b.file_name().as_bytes()));
 
         for child in children {
@@ -293,19 +329,23 @@ impl AgitRepository {
             if child_path.starts_with(self.store.root()) {
                 continue;
             }
-            let metadata = fs::symlink_metadata(&child_path)?;
+            let metadata = fs::symlink_metadata(&child_path)
+                .with_context(|| format!("stat {}", child_path.display()))?;
             let file_type = metadata.file_type();
             let (secs, nanos) = metadata_time(&metadata);
             let name = child.file_name().as_bytes().to_vec();
             let mode = metadata.permissions().mode();
             let xattrs = if file_type.is_file() || file_type.is_dir() {
-                self.capture_xattrs(&child_path)?
+                self.capture_xattrs(&child_path)
+                    .with_context(|| format!("capture xattrs for {}", child_path.display()))?
             } else {
                 None
             };
 
             let entry = if file_type.is_dir() {
-                let target = self.capture_directory_impl(&child_path, _publication)?;
+                let target = self
+                    .capture_directory_impl(&child_path, _publication)
+                    .with_context(|| format!("capture directory {}", child_path.display()))?;
                 TreeEntry {
                     name,
                     kind: EntryKind::Directory,
@@ -318,7 +358,10 @@ impl AgitRepository {
                     xattrs,
                 }
             } else if file_type.is_file() {
-                let target = self.capture_file(&child_path)?;
+                let relative = child_path.strip_prefix(&self.root)?.as_os_str().as_bytes();
+                let target = self
+                    .capture_file(&child_path, Some(relative))
+                    .with_context(|| format!("capture file {}", child_path.display()))?;
                 TreeEntry {
                     name,
                     kind: EntryKind::File,
@@ -359,10 +402,19 @@ impl AgitRepository {
         self.store.put_struct(ObjectKind::Tree, &tree)
     }
 
-    fn capture_file(&self, path: &Path) -> anyhow::Result<ObjectId> {
+    fn capture_file(&self, path: &Path, cache_key: Option<&[u8]>) -> anyhow::Result<ObjectId> {
         for _ in 0..3 {
-            let file = File::open(path)?;
-            let before = file.metadata()?;
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let before = file
+                .metadata()
+                .with_context(|| format!("stat open file {}", path.display()))?;
+            if let Some(key) = cache_key {
+                if let Some(cached) = self.store.cached_file(&self.workspace_id, key)? {
+                    if cached_matches(&cached, &before) {
+                        return Ok(cached.blob_id);
+                    }
+                }
+            }
             let mut stream = ChunkStream::new(file);
             let mut chunks = Vec::new();
             let mut total_len = 0_u64;
@@ -374,11 +426,19 @@ impl AgitRepository {
                     len: chunk.len() as u32,
                 });
             }
-            let after = fs::metadata(path)?;
+            let after = fs::metadata(path).with_context(|| format!("restat {}", path.display()))?;
             if stable_metadata(&before, &after) {
-                return self
+                let blob_id = self
                     .store
-                    .put_struct(ObjectKind::Blob, &Blob { chunks, total_len });
+                    .put_struct(ObjectKind::Blob, &Blob { chunks, total_len })?;
+                if let Some(key) = cache_key {
+                    self.store.cache_file(
+                        &self.workspace_id,
+                        key,
+                        &cached_from_metadata(&after, blob_id),
+                    )?;
+                }
+                return Ok(blob_id);
             }
         }
         bail!(
@@ -392,7 +452,9 @@ impl AgitRepository {
         match xattr::list(path) {
             Ok(names) => {
                 for name in names {
-                    if let Some(value) = xattr::get(path, &name)? {
+                    if let Some(value) = xattr::get(path, &name)
+                        .with_context(|| format!("read xattr {:?} on {}", name, path.display()))?
+                    {
                         entries.push(XattrEntry {
                             name: name.as_os_str().as_bytes().to_vec(),
                             value,
@@ -422,7 +484,7 @@ impl AgitRepository {
         for path in candidates {
             match sqlite_adapter::consistent_backup(&path, &temp_dir) {
                 Ok(backup) => {
-                    let blob = self.capture_file(backup.file.path())?;
+                    let blob = self.capture_file(backup.file.path(), None)?;
                     let relative = path
                         .strip_prefix(&self.root)?
                         .as_os_str()
@@ -698,7 +760,34 @@ fn stable_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
         && before.len() == after.len()
         && before.mtime() == after.mtime()
         && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
         && before.mode() == after.mode()
+}
+
+fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
+    cached.device == metadata.dev()
+        && cached.inode == metadata.ino()
+        && cached.size == metadata.len()
+        && cached.mtime_secs == metadata.mtime()
+        && cached.mtime_nanos == metadata.mtime_nsec()
+        && cached.ctime_secs == metadata.ctime()
+        && cached.ctime_nanos == metadata.ctime_nsec()
+        && cached.mode == metadata.mode()
+}
+
+fn cached_from_metadata(metadata: &fs::Metadata, blob_id: ObjectId) -> CachedFile {
+    CachedFile {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        mtime_secs: metadata.mtime(),
+        mtime_nanos: metadata.mtime_nsec(),
+        ctime_secs: metadata.ctime(),
+        ctime_nanos: metadata.ctime_nsec(),
+        mode: metadata.mode(),
+        blob_id,
+    }
 }
 
 fn special_entry(name: Vec<u8>, kind: EntryKind, mode: u32, secs: i64, nanos: u32) -> TreeEntry {
@@ -811,4 +900,12 @@ fn collect_sqlite_candidates(root: &Path, output: &mut Vec<PathBuf>) -> anyhow::
         }
     }
     Ok(())
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
