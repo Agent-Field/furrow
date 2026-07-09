@@ -231,6 +231,73 @@ fn incomplete_pack_tail_is_truncated_without_losing_visible_snapshots() {
 }
 
 #[test]
+fn sqlite_consistent_rewind_restores_a_logical_database_snapshot() {
+    let fixture = Fixture::new();
+    let database = fixture.repo.join("dev.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO items(value) VALUES('safe');",
+            )
+            .unwrap();
+    }
+    let snapshot = fixture.watch();
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("DROP TABLE items; CREATE TABLE damage(value TEXT);")
+            .unwrap();
+    }
+
+    fixture
+        .agit()
+        .args([
+            "rewind",
+            &snapshot,
+            "--paths",
+            "dev.sqlite",
+            "--sqlite-consistent",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let value: String = connection
+        .query_row("SELECT value FROM items WHERE id = 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "safe");
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+}
+
+#[test]
+fn path_rewind_refuses_to_follow_a_symlink_parent_outside_workspace() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.repo.join("nested")).unwrap();
+    fs::write(fixture.repo.join("nested/value.txt"), b"inside\n").unwrap();
+    let snapshot = fixture.watch();
+    let outside = fixture._temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("value.txt"), b"outside\n").unwrap();
+    fs::remove_dir_all(fixture.repo.join("nested")).unwrap();
+    symlink(&outside, fixture.repo.join("nested")).unwrap();
+
+    fixture
+        .agit()
+        .args(["rewind", &snapshot, "--paths", "nested/value.txt", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("symlink parent"));
+    assert_eq!(fs::read(outside.join("value.txt")).unwrap(), b"outside\n");
+}
+
+#[test]
 fn watch_refuses_non_git_directories() {
     let temp = tempfile::tempdir().unwrap();
     Command::cargo_bin("agit")

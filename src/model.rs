@@ -98,6 +98,16 @@ pub struct Snapshot {
     pub quality: SealQuality,
     pub trigger: SnapshotTrigger,
     pub label: Option<String>,
+    #[serde(default)]
+    pub sqlite_backups: Vec<SqliteBackup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqliteBackup {
+    #[serde(with = "serde_bytes")]
+    pub path: Vec<u8>,
+    pub blob: ObjectId,
+    pub integrity_ok: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

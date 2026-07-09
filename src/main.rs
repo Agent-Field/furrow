@@ -39,6 +39,9 @@ enum Command {
         dry_run: bool,
         #[arg(long)]
         yes: bool,
+        /// Restore SQLite databases from their logically consistent backup image.
+        #[arg(long)]
+        sqlite_consistent: bool,
     },
     /// Show workspace protection and store status.
     Status,
@@ -100,6 +103,7 @@ fn main() -> anyhow::Result<()> {
             paths,
             dry_run,
             yes,
+            sqlite_consistent,
         } => {
             let mut repository = AgitRepository::open(&cli.repo)?;
             let target = repository.resolve_snapshot(&snapshot)?;
@@ -124,7 +128,7 @@ fn main() -> anyhow::Result<()> {
                 anyhow::ensure!(answer.trim().eq_ignore_ascii_case("y"), "rewind cancelled");
             }
             let (pre, applied) = repository
-                .rewind(&target, &paths)
+                .rewind(&target, &paths, sqlite_consistent)
                 .context("rewind failed")?;
             if cli.json {
                 println!(

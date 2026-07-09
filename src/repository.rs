@@ -1,8 +1,9 @@
 use crate::chunker::ChunkStream;
 use crate::model::{
     id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
-    SnapshotTrigger, Tree, TreeEntry, XattrEntry, Xattrs,
+    SnapshotTrigger, SqliteBackup, Tree, TreeEntry, XattrEntry, Xattrs,
 };
+use crate::sqlite_adapter;
 use crate::store::ObjectStore;
 use anyhow::{bail, Context};
 use directories::ProjectDirs;
@@ -37,6 +38,8 @@ pub struct SnapshotSummary {
 pub struct RewindChange {
     pub path: String,
     pub action: &'static str,
+    #[serde(skip)]
+    raw_path: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +129,7 @@ impl AgitRepository {
     ) -> anyhow::Result<ObjectId> {
         let parent = self.store.workspace_head(&self.workspace_id)?;
         let root_tree = self.capture_directory(&self.root)?;
+        let sqlite_backups = self.capture_sqlite_backups()?;
         let (secs, nanos) = now();
         let snapshot = Snapshot {
             root_tree,
@@ -135,6 +139,7 @@ impl AgitRepository {
             quality: SealQuality::Quiescent,
             trigger: trigger.clone(),
             label: label.clone(),
+            sqlite_backups,
         };
         let id = self.store.put_struct(ObjectKind::Snapshot, &snapshot)?;
         self.store
@@ -209,6 +214,7 @@ impl AgitRepository {
             changes.push(RewindChange {
                 path: display_relative(&path),
                 action,
+                raw_path: path,
             });
         }
         Ok(RewindPlan {
@@ -221,6 +227,7 @@ impl AgitRepository {
         &mut self,
         target: &ObjectId,
         paths: &[PathBuf],
+        sqlite_consistent: bool,
     ) -> anyhow::Result<(ObjectId, RewindPlan)> {
         let plan = self.plan_rewind(target, paths)?;
         let pre = self.snapshot(
@@ -230,7 +237,14 @@ impl AgitRepository {
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
         let target_entries = self.flatten_tree(&target_snapshot.root_tree)?;
 
-        let result = self.apply_rewind(&target_entries, &plan, paths);
+        let result = self
+            .apply_rewind(&target_entries, &plan, paths)
+            .and_then(|_| {
+                if sqlite_consistent {
+                    self.restore_sqlite_backups(&target_snapshot.sqlite_backups, paths)?;
+                }
+                Ok(())
+            });
         if let Err(error) = result {
             let pre_snapshot: Snapshot = self.store.read_struct(&pre, ObjectKind::Snapshot)?;
             let pre_entries = self.flatten_tree(&pre_snapshot.root_tree)?;
@@ -393,6 +407,81 @@ impl AgitRepository {
         }
     }
 
+    fn capture_sqlite_backups(&self) -> anyhow::Result<Vec<SqliteBackup>> {
+        let mut candidates = Vec::new();
+        collect_sqlite_candidates(&self.root, &mut candidates)?;
+        let mut backups = Vec::new();
+        let temp_dir = self.store.root().join("tmp");
+        for path in candidates {
+            match sqlite_adapter::consistent_backup(&path, &temp_dir) {
+                Ok(backup) => {
+                    let blob = self.capture_file(backup.file.path())?;
+                    let relative = path
+                        .strip_prefix(&self.root)?
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec();
+                    backups.push(SqliteBackup {
+                        path: relative,
+                        blob,
+                        integrity_ok: backup.integrity_ok,
+                    });
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: SQLite consistent backup unavailable for {}: {error:#}; raw bytes remain protected",
+                        path.display()
+                    );
+                }
+            }
+        }
+        backups.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(backups)
+    }
+
+    fn restore_sqlite_backups(
+        &self,
+        backups: &[SqliteBackup],
+        selected_paths: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        for backup in backups {
+            if !selected(&backup.path, selected_paths) {
+                continue;
+            }
+            anyhow::ensure!(
+                backup.integrity_ok,
+                "refusing a SQLite backup that failed integrity_check"
+            );
+            let destination = safe_join(&self.root, &backup.path)?;
+            let entry = TreeEntry {
+                name: destination
+                    .file_name()
+                    .context("SQLite path has no filename")?
+                    .as_bytes()
+                    .to_vec(),
+                kind: EntryKind::File,
+                target: Some(backup.blob),
+                link_target: Vec::new(),
+                mode: 0o100600,
+                size: 0,
+                mtime_secs: now().0,
+                mtime_nanos: 0,
+                xattrs: None,
+            };
+            self.restore_file(&destination, &entry)?;
+            let path_bytes = destination.as_os_str().as_bytes();
+            for suffix in [b"-wal".as_slice(), b"-shm".as_slice()] {
+                let mut sidecar = path_bytes.to_vec();
+                sidecar.extend_from_slice(suffix);
+                let sidecar = PathBuf::from(OsString::from_vec(sidecar));
+                if sidecar.exists() {
+                    fs::remove_file(sidecar)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn flatten_tree(&self, root: &ObjectId) -> anyhow::Result<BTreeMap<Vec<u8>, FlatEntry>> {
         let mut result = BTreeMap::new();
         self.flatten_into(root, Vec::new(), &mut result)?;
@@ -439,7 +528,7 @@ impl AgitRepository {
         let changed: BTreeSet<Vec<u8>> = plan
             .changes
             .iter()
-            .map(|change| change.path.as_bytes().to_vec())
+            .map(|change| change.raw_path.clone())
             .collect();
 
         // Directories must exist before files are written.
@@ -451,8 +540,11 @@ impl AgitRepository {
                 continue;
             }
             let destination = safe_join(&self.root, path)?;
-            if destination.symlink_metadata().is_ok() && !destination.is_dir() {
-                remove_path(&destination)?;
+            ensure_safe_parent(&self.root, &destination)?;
+            if let Ok(metadata) = destination.symlink_metadata() {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    remove_path(&destination)?;
+                }
             }
             fs::create_dir_all(&destination)?;
             fs::set_permissions(&destination, fs::Permissions::from_mode(flat.entry.mode))?;
@@ -466,10 +558,19 @@ impl AgitRepository {
                 continue;
             }
             let destination = safe_join(&self.root, path)?;
+            ensure_safe_parent(&self.root, &destination)?;
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
-            if destination.symlink_metadata().is_ok() {
+            let must_remove = destination
+                .symlink_metadata()
+                .map(|metadata| {
+                    metadata.is_dir()
+                        || flat.entry.kind != EntryKind::File
+                        || metadata.file_type().is_symlink()
+                })
+                .unwrap_or(false);
+            if must_remove {
                 remove_path(&destination)?;
             }
             match flat.entry.kind {
@@ -498,12 +599,13 @@ impl AgitRepository {
             .changes
             .iter()
             .filter(|change| change.action == "remove")
-            .map(|change| change.path.as_bytes().to_vec())
+            .map(|change| change.raw_path.clone())
             .collect();
         removals.sort_by_key(|path| std::cmp::Reverse(path.len()));
         for path in removals {
             if selected(&path, selected_paths) {
                 let destination = safe_join(&self.root, &path)?;
+                ensure_safe_parent(&self.root, &destination)?;
                 if destination.symlink_metadata().is_ok() {
                     remove_path(&destination)?;
                 }
@@ -640,6 +742,29 @@ fn safe_join(root: &Path, relative: &[u8]) -> anyhow::Result<PathBuf> {
     Ok(root.join(path))
 }
 
+fn ensure_safe_parent(root: &Path, destination: &Path) -> anyhow::Result<()> {
+    let relative = destination
+        .strip_prefix(root)
+        .context("rewind path escaped workspace")?;
+    let mut current = root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                bail!("unsafe rewind path")
+            };
+            current.push(name);
+            if let Ok(metadata) = fs::symlink_metadata(&current) {
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "refusing to traverse symlink parent during rewind: {}",
+                    current.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn selected(path: &[u8], selections: &[PathBuf]) -> bool {
     if selections.is_empty() {
         return true;
@@ -660,6 +785,23 @@ fn remove_path(path: &Path) -> anyhow::Result<()> {
         fs::remove_dir_all(path)?;
     } else {
         fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn collect_sqlite_candidates(root: &Path, output: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for child in fs::read_dir(root)? {
+        let child = child?;
+        let path = child.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_sqlite_candidates(&path, output)?;
+        } else if metadata.is_file() && sqlite_adapter::is_sqlite(&path) {
+            output.push(path);
+        }
     }
     Ok(())
 }
