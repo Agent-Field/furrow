@@ -382,35 +382,15 @@ impl AgitRepository {
 
     pub fn plan_rewind(&self, target: &ObjectId, paths: &[PathBuf]) -> anyhow::Result<RewindPlan> {
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
-        let target_entries = self.flatten_tree(&target_snapshot.root_tree)?;
         let current_tree = self.capture_root_retry(None)?;
-        let current_entries = self.flatten_tree(&current_tree)?;
-        let mut all_paths = BTreeSet::new();
-        all_paths.extend(target_entries.keys().cloned());
-        all_paths.extend(current_entries.keys().cloned());
-
         let mut changes = Vec::new();
-        for path in all_paths {
-            if !selected(&path, paths) {
-                continue;
-            }
-            let before = current_entries.get(&path).map(|entry| &entry.entry);
-            let after = target_entries.get(&path).map(|entry| &entry.entry);
-            if before == after {
-                continue;
-            }
-            let action = match (before, after) {
-                (None, Some(_)) => "restore",
-                (Some(_), None) => "remove",
-                (Some(_), Some(_)) => "replace",
-                (None, None) => unreachable!(),
-            };
-            changes.push(RewindChange {
-                path: display_relative(&path),
-                action,
-                raw_path: path,
-            });
-        }
+        self.diff_directory(
+            Some(current_tree),
+            Some(target_snapshot.root_tree),
+            Vec::new(),
+            paths,
+            &mut changes,
+        )?;
         Ok(RewindPlan {
             target: id_hex(target),
             changes,
@@ -430,7 +410,7 @@ impl AgitRepository {
             SnapshotTrigger::PreRewind,
         )?;
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
-        let target_entries = self.flatten_tree(&target_snapshot.root_tree)?;
+        let target_entries = self.entries_for_plan(&target_snapshot.root_tree, &plan)?;
         self.write_restore_intent(&RestoreIntent {
             pre_snapshot: pre,
             target_snapshot: *target,
@@ -450,8 +430,8 @@ impl AgitRepository {
             });
         if let Err(error) = result {
             let pre_snapshot: Snapshot = self.store.read_struct(&pre, ObjectKind::Snapshot)?;
-            let pre_entries = self.flatten_tree(&pre_snapshot.root_tree)?;
             let rollback_plan = self.plan_rewind(&pre, paths)?;
+            let pre_entries = self.entries_for_plan(&pre_snapshot.root_tree, &rollback_plan)?;
             self.apply_rewind(&pre_entries, &rollback_plan, paths)
                 .context("rewind failed and rollback also failed")?;
             self.clear_restore_intent()?;
@@ -798,6 +778,118 @@ impl AgitRepository {
         Ok(result)
     }
 
+    fn diff_directory(
+        &self,
+        before: Option<ObjectId>,
+        after: Option<ObjectId>,
+        prefix: Vec<u8>,
+        selections: &[PathBuf],
+        changes: &mut Vec<RewindChange>,
+    ) -> anyhow::Result<()> {
+        match (before, after) {
+            (Some(before), Some(after)) => {
+                tree::diff_entries(&self.store, &before, &after, &mut |before, after| {
+                    self.record_tree_difference(before, after, &prefix, selections, changes)
+                })
+            }
+            (Some(before), None) => tree::for_each_entry(&self.store, &before, |entry| {
+                self.record_tree_difference(Some(entry), None, &prefix, selections, changes)
+            }),
+            (None, Some(after)) => tree::for_each_entry(&self.store, &after, |entry| {
+                self.record_tree_difference(None, Some(entry), &prefix, selections, changes)
+            }),
+            (None, None) => Ok(()),
+        }
+    }
+
+    fn record_tree_difference(
+        &self,
+        before: Option<TreeEntry>,
+        after: Option<TreeEntry>,
+        prefix: &[u8],
+        selections: &[PathBuf],
+        changes: &mut Vec<RewindChange>,
+    ) -> anyhow::Result<()> {
+        let name = before
+            .as_ref()
+            .or(after.as_ref())
+            .context("tree difference has no entry")?
+            .name
+            .clone();
+        validate_name(&name)?;
+        let mut path = prefix.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&name);
+
+        if selected(&path, selections) {
+            changes.push(RewindChange {
+                path: display_relative(&path),
+                action: match (&before, &after) {
+                    (None, Some(_)) => "restore",
+                    (Some(_), None) => "remove",
+                    (Some(_), Some(_)) => "replace",
+                    (None, None) => unreachable!(),
+                },
+                raw_path: path.clone(),
+            });
+        }
+
+        if subtree_intersects(&path, selections) {
+            let before_tree = before
+                .as_ref()
+                .filter(|entry| entry.kind == EntryKind::Directory)
+                .and_then(|entry| entry.target);
+            let after_tree = after
+                .as_ref()
+                .filter(|entry| entry.kind == EntryKind::Directory)
+                .and_then(|entry| entry.target);
+            if before_tree.is_some() || after_tree.is_some() {
+                self.diff_directory(before_tree, after_tree, path, selections, changes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn entries_for_plan(
+        &self,
+        root: &ObjectId,
+        plan: &RewindPlan,
+    ) -> anyhow::Result<BTreeMap<Vec<u8>, FlatEntry>> {
+        let mut entries = BTreeMap::new();
+        for change in &plan.changes {
+            if change.action == "remove" {
+                continue;
+            }
+            let entry = self
+                .lookup_tree_path(root, &change.raw_path)?
+                .with_context(|| format!("target snapshot is missing {}", change.path))?;
+            entries.insert(change.raw_path.clone(), FlatEntry { entry });
+        }
+        Ok(entries)
+    }
+
+    fn lookup_tree_path(&self, root: &ObjectId, path: &[u8]) -> anyhow::Result<Option<TreeEntry>> {
+        let mut tree_id = *root;
+        let mut components = path.split(|byte| *byte == b'/').peekable();
+        while let Some(name) = components.next() {
+            validate_name(name)?;
+            let Some(entry) = tree::find_entry(&self.store, &tree_id, name)? else {
+                return Ok(None);
+            };
+            if components.peek().is_none() {
+                return Ok(Some(entry));
+            }
+            anyhow::ensure!(
+                entry.kind == EntryKind::Directory,
+                "snapshot path traverses a non-directory"
+            );
+            tree_id = entry.target.context("directory missing tree ID")?;
+        }
+        Ok(None)
+    }
+
     fn flatten_into(
         &self,
         tree_id: &ObjectId,
@@ -1022,13 +1114,13 @@ impl AgitRepository {
         let snapshot: Snapshot = self
             .store
             .read_struct(&intent.pre_snapshot, ObjectKind::Snapshot)?;
-        let entries = self.flatten_tree(&snapshot.root_tree)?;
         let paths: Vec<PathBuf> = intent
             .paths
             .into_iter()
             .map(|path| PathBuf::from(OsString::from_vec(path)))
             .collect();
         let plan = self.plan_rewind(&intent.pre_snapshot, &paths)?;
+        let entries = self.entries_for_plan(&snapshot.root_tree, &plan)?;
         self.apply_rewind(&entries, &plan, &paths)?;
         self.clear_restore_intent()?;
         FileExt::unlock(&lock)?;
@@ -1228,6 +1320,16 @@ fn selected(path: &[u8], selections: &[PathBuf]) -> bool {
     selections
         .iter()
         .any(|selection| candidate == selection || candidate.starts_with(selection))
+}
+
+fn subtree_intersects(path: &[u8], selections: &[PathBuf]) -> bool {
+    if selections.is_empty() {
+        return true;
+    }
+    let candidate = Path::new(OsStr::from_bytes(path));
+    selections
+        .iter()
+        .any(|selection| candidate.starts_with(selection) || selection.starts_with(candidate))
 }
 
 fn display_relative(path: &[u8]) -> String {

@@ -98,24 +98,163 @@ pub fn for_each_entry<F>(store: &ObjectStore, root: &ObjectId, mut visitor: F) -
 where
     F: FnMut(TreeEntry) -> anyhow::Result<()>,
 {
-    let mut stack = vec![*root];
-    while let Some(id) = stack.pop() {
-        let tree: Tree = store.read_struct(&id, ObjectKind::Tree)?;
-        anyhow::ensure!(
-            tree.entries.is_empty() || tree.pages.is_empty(),
-            "tree node mixes leaf entries and branch pages"
-        );
+    let mut entries = Entries::new(store, root);
+    while let Some(entry) = entries.next_entry()? {
+        visitor(entry)?;
+    }
+    Ok(())
+}
+
+pub fn find_entry(
+    store: &ObjectStore,
+    root: &ObjectId,
+    name: &[u8],
+) -> anyhow::Result<Option<TreeEntry>> {
+    let mut current = *root;
+    loop {
+        let tree = read_node(store, &current)?;
         if tree.pages.is_empty() {
-            for entry in tree.entries {
-                visitor(entry)?;
+            return Ok(tree
+                .entries
+                .binary_search_by(|entry| entry.name.as_slice().cmp(name))
+                .ok()
+                .map(|index| tree.entries[index].clone()));
+        }
+        let Some(page) = tree
+            .pages
+            .iter()
+            .find(|page| page.first_name.as_slice() <= name && name <= page.last_name.as_slice())
+        else {
+            return Ok(None);
+        };
+        current = page.target;
+    }
+}
+
+pub fn diff_entries<F>(
+    store: &ObjectStore,
+    left: &ObjectId,
+    right: &ObjectId,
+    visitor: &mut F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(Option<TreeEntry>, Option<TreeEntry>) -> anyhow::Result<()>,
+{
+    if left == right {
+        return Ok(());
+    }
+    let left_node = read_node(store, left)?;
+    let right_node = read_node(store, right)?;
+    let aligned_branches = !left_node.pages.is_empty()
+        && left_node.pages.len() == right_node.pages.len()
+        && left_node
+            .pages
+            .iter()
+            .zip(&right_node.pages)
+            .all(|(left, right)| {
+                left.first_name == right.first_name && left.last_name == right.last_name
+            });
+    if aligned_branches {
+        for (left, right) in left_node.pages.iter().zip(&right_node.pages) {
+            diff_entries(store, &left.target, &right.target, visitor)?;
+        }
+        return Ok(());
+    }
+
+    let mut left_entries = Entries::new(store, left);
+    let mut right_entries = Entries::new(store, right);
+    let mut left_entry = left_entries.next_entry()?;
+    let mut right_entry = right_entries.next_entry()?;
+    while left_entry.is_some() || right_entry.is_some() {
+        match (&left_entry, &right_entry) {
+            (Some(left), Some(right)) if left.name == right.name => {
+                if left != right {
+                    visitor(left_entry.take(), right_entry.take())?;
+                } else {
+                    left_entry.take();
+                    right_entry.take();
+                }
+                left_entry = left_entries.next_entry()?;
+                right_entry = right_entries.next_entry()?;
             }
-        } else {
-            for page in tree.pages.into_iter().rev() {
-                stack.push(page.target);
+            (Some(left), Some(right)) if left.name < right.name => {
+                visitor(left_entry.take(), None)?;
+                left_entry = left_entries.next_entry()?;
             }
+            (Some(_), Some(_)) => {
+                visitor(None, right_entry.take())?;
+                right_entry = right_entries.next_entry()?;
+            }
+            (Some(_), None) => {
+                visitor(left_entry.take(), None)?;
+                left_entry = left_entries.next_entry()?;
+            }
+            (None, Some(_)) => {
+                visitor(None, right_entry.take())?;
+                right_entry = right_entries.next_entry()?;
+            }
+            (None, None) => break,
         }
     }
     Ok(())
+}
+
+struct Entries<'a> {
+    store: &'a ObjectStore,
+    stack: Vec<EntryFrame>,
+}
+
+enum EntryFrame {
+    Node(ObjectId),
+    Leaf(std::vec::IntoIter<TreeEntry>),
+}
+
+impl<'a> Entries<'a> {
+    fn new(store: &'a ObjectStore, root: &ObjectId) -> Self {
+        Self {
+            store,
+            stack: vec![EntryFrame::Node(*root)],
+        }
+    }
+
+    fn next_entry(&mut self) -> anyhow::Result<Option<TreeEntry>> {
+        loop {
+            let Some(frame) = self.stack.pop() else {
+                return Ok(None);
+            };
+            match frame {
+                EntryFrame::Node(id) => {
+                    let tree = read_node(self.store, &id)?;
+                    if tree.pages.is_empty() {
+                        self.stack.push(EntryFrame::Leaf(tree.entries.into_iter()));
+                    } else {
+                        self.stack.extend(
+                            tree.pages
+                                .into_iter()
+                                .rev()
+                                .map(|page| EntryFrame::Node(page.target)),
+                        );
+                    }
+                }
+                EntryFrame::Leaf(mut entries) => {
+                    let next = entries.next();
+                    if next.is_some() {
+                        self.stack.push(EntryFrame::Leaf(entries));
+                        return Ok(next);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn read_node(store: &ObjectStore, id: &ObjectId) -> anyhow::Result<Tree> {
+    let tree: Tree = store.read_struct(id, ObjectKind::Tree)?;
+    anyhow::ensure!(
+        tree.entries.is_empty() || tree.pages.is_empty(),
+        "tree node mixes leaf entries and branch pages"
+    );
+    Ok(tree)
 }
 
 fn write_branch_level(store: &ObjectStore, pages: Vec<TreePage>) -> anyhow::Result<Vec<TreePage>> {
@@ -229,5 +368,50 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 20_000);
+    }
+
+    #[test]
+    fn paged_diff_and_lookup_find_only_the_changed_entry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(temporary.path().join("store")).unwrap();
+        let make_entries = |changed: bool| {
+            (0..10_000)
+                .map(|index| TreeEntry {
+                    name: format!("file-{index:08}.txt").into_bytes(),
+                    kind: EntryKind::File,
+                    target: Some(if changed && index == 5_432 {
+                        [255; 32]
+                    } else {
+                        [index as u8; 32]
+                    }),
+                    link_target: Vec::new(),
+                    mode: 0o100644,
+                    size: index,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                    xattrs: None,
+                })
+                .collect()
+        };
+        let before = write(&store, make_entries(false)).unwrap();
+        let after = write(&store, make_entries(true)).unwrap();
+
+        let mut changes = Vec::new();
+        diff_entries(&store, &before, &after, &mut |left, right| {
+            changes.push((left.unwrap(), right.unwrap()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0.name, b"file-00005432.txt");
+        assert_eq!(changes[0].1.target, Some([255; 32]));
+        assert_eq!(
+            find_entry(&store, &after, b"file-00005432.txt")
+                .unwrap()
+                .unwrap()
+                .target,
+            Some([255; 32])
+        );
+        assert!(find_entry(&store, &after, b"missing").unwrap().is_none());
     }
 }
