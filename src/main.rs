@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -126,6 +127,11 @@ enum Command {
         #[command(subcommand)]
         command: CoordCommand,
     },
+    /// Install or execute vendor-neutral agent turn-boundary hooks.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
     /// Run any agent or command inside a new isolated full-state fork.
     Run {
         name: String,
@@ -235,6 +241,35 @@ enum CoordCommand {
         path: PathBuf,
         #[arg(long)]
         owner: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCommand {
+    /// Install executable pre-turn, post-tool, and turn-end adapters.
+    Install,
+    /// Seal immediately before an agent turn begins.
+    PreTurn {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        turn: Option<String>,
+    },
+    /// Seal after an agent tool invocation completes.
+    PostTool {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        turn: Option<String>,
+        #[arg(long)]
+        tool: Option<String>,
+    },
+    /// Seal when an agent turn ends.
+    TurnEnd {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        turn: Option<String>,
     },
 }
 
@@ -687,6 +722,36 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Command::Hook { command } => match command {
+            HookCommand::Install => {
+                let hooks = install_hook_adapters(&cli.repo)?;
+                let (_, snapshot) = AgitRepository::attach_and_snapshot(
+                    &cli.repo,
+                    Some("installed agent hooks".to_owned()),
+                    SnapshotTrigger::AgentRun,
+                )?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"hooks": hooks, "snapshot": id_hex(&snapshot)})
+                    );
+                } else {
+                    for hook in hooks {
+                        println!("Installed {}", hook.display());
+                    }
+                    println!("Snapshot {}", id_hex(&snapshot));
+                }
+            }
+            HookCommand::PreTurn { agent, turn } => {
+                run_hook(&cli.repo, cli.json, "pre-turn", agent, turn, None)?;
+            }
+            HookCommand::PostTool { agent, turn, tool } => {
+                run_hook(&cli.repo, cli.json, "post-tool", agent, turn, tool)?;
+            }
+            HookCommand::TurnEnd { agent, turn } => {
+                run_hook(&cli.repo, cli.json, "turn-end", agent, turn, None)?;
+            }
+        },
         Command::Run {
             name,
             destination,
@@ -1082,6 +1147,81 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+fn install_hook_adapters(root: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let root = root.canonicalize()?;
+    anyhow::ensure!(
+        root.join(".git").exists(),
+        "agit currently requires a Git repository"
+    );
+    let directory = root.join(".agit/hooks");
+    fs::create_dir_all(&directory)?;
+    let mut installed = Vec::new();
+    for event in ["pre-turn", "post-tool", "turn-end"] {
+        let destination = directory.join(event);
+        let script = format!(
+            "#!/bin/sh\nset -eu\nrepo=$(CDPATH= cd \"$(dirname \"$0\")/../..\" && pwd)\nexec \"${{AGIT_BIN:-agit}}\" --repo \"$repo\" hook {event} \"$@\"\n"
+        );
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        temporary.write_all(script.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o755))?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)?;
+        installed.push(destination);
+    }
+    std::fs::File::open(&directory)?.sync_all()?;
+    Ok(installed)
+}
+
+fn run_hook(
+    root: &std::path::Path,
+    json: bool,
+    event: &str,
+    agent: Option<String>,
+    turn: Option<String>,
+    tool: Option<String>,
+) -> anyhow::Result<()> {
+    let agent = hook_value(agent, "AGIT_AGENT_ID")?.unwrap_or_else(|| "agent".to_owned());
+    let turn = hook_value(turn, "AGIT_TURN_ID")?;
+    let tool = hook_value(tool, "AGIT_TOOL_NAME")?;
+    let mut label = format!("hook {event} agent={agent}");
+    if let Some(turn) = turn {
+        label.push_str(" turn=");
+        label.push_str(&turn);
+    }
+    if let Some(tool) = tool {
+        label.push_str(" tool=");
+        label.push_str(&tool);
+    }
+    let (_, snapshot) =
+        AgitRepository::attach_and_snapshot(root, Some(label.clone()), SnapshotTrigger::AgentRun)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"event": event, "label": label, "snapshot": id_hex(&snapshot)})
+        );
+    } else {
+        println!("Sealed {} {}", &id_hex(&snapshot)[..12], label);
+    }
+    Ok(())
+}
+
+fn hook_value(explicit: Option<String>, environment: &str) -> anyhow::Result<Option<String>> {
+    let value = explicit.or_else(|| {
+        std::env::var_os(environment).map(|value| value.to_string_lossy().into_owned())
+    });
+    if let Some(value) = &value {
+        anyhow::ensure!(!value.is_empty(), "hook metadata cannot be empty");
+        anyhow::ensure!(value.len() <= 128, "hook metadata is limited to 128 bytes");
+        anyhow::ensure!(
+            !value.chars().any(char::is_control),
+            "hook metadata cannot contain control characters"
+        );
+    }
+    Ok(value)
 }
 
 fn exit_with_status(status: std::process::ExitStatus) -> ! {

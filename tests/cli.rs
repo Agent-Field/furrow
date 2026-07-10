@@ -261,6 +261,73 @@ fn estimate_is_read_only_policy_aware_and_accounts_for_existing_cas_chunks() {
 }
 
 #[test]
+fn installed_turn_hooks_seal_attributed_boundaries_from_any_working_directory() {
+    let fixture = Fixture::new();
+    let installed = fixture
+        .agit()
+        .args(["--json", "hook", "install"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let installed: Value = serde_json::from_slice(&installed).unwrap();
+    assert_eq!(installed["hooks"].as_array().unwrap().len(), 3);
+    let pre_turn = fixture.repo.join(".agit/hooks/pre-turn");
+    assert!(fs::metadata(&pre_turn).unwrap().permissions().mode() & 0o111 != 0);
+
+    let outside = fixture._temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let output = std::process::Command::new(&pre_turn)
+        .current_dir(&outside)
+        .env("AGIT_DATA_DIR", &fixture.data)
+        .env("AGIT_NO_DAEMON", "1")
+        .env("AGIT_BIN", env!("CARGO_BIN_EXE_agit"))
+        .env("AGIT_AGENT_ID", "alpha")
+        .env("AGIT_TURN_ID", "7")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+        .agit()
+        .args([
+            "hook",
+            "post-tool",
+            "--agent",
+            "alpha",
+            "--turn",
+            "7",
+            "--tool",
+            "write",
+        ])
+        .assert()
+        .success();
+
+    let timeline = fixture
+        .agit()
+        .args(["--json", "timeline", "--limit", "5"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let timeline: Value = serde_json::from_slice(&timeline).unwrap();
+    assert_eq!(
+        timeline[0]["label"],
+        "hook post-tool agent=alpha turn=7 tool=write"
+    );
+    assert_eq!(timeline[0]["trigger"], "agent_run");
+    assert!(timeline.as_array().unwrap().iter().any(|snapshot| {
+        snapshot["label"] == "hook pre-turn agent=alpha turn=7"
+            && snapshot["trigger"] == "agent_run"
+    }));
+}
+
+#[test]
 fn try_auto_protects_an_unwatched_workspace_and_preserves_the_command_exit_code() {
     let fixture = Fixture::new();
     let output = fixture

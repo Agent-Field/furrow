@@ -148,6 +148,19 @@ Policy changes force a full Merkle/index reconciliation. Excluded paths are also
 
 ## Agent Integration
 
+For agents that support shell lifecycle hooks, install vendor-neutral executable adapters in the repository:
+
+```bash
+agit hook install
+
+# Generated paths:
+# .agit/hooks/pre-turn
+# .agit/hooks/post-tool
+# .agit/hooks/turn-end
+```
+
+The adapters locate the repository from their own path, so the agent may invoke them from any working directory. Set `AGIT_AGENT_ID`, `AGIT_TURN_ID`, and optionally `AGIT_TOOL_NAME`; each boundary becomes an attributed `agent_run` snapshot. The underlying commands can also be called directly, for example `agit hook post-tool --agent alpha --turn 7 --tool edit`. Wrap the agent with `agit run alpha -- <agent-command>` when every session should start in an isolated full-state fork; the installed hooks then record that fork's independent timeline.
+
 `agit mcp` is a local stdio MCP server. Bind it to one watched repository in any MCP-compatible coding agent:
 
 ```json
@@ -207,6 +220,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Durable sibling preservation when machines edit concurrently or offline
 - MCP 2025-11-25 stdio server with bounded framing and negotiated lifecycle
 - Agent-safe snapshot, timeline, diff, fork, claims, merge-plan, and confirmed rewind tools
+- Vendor-neutral executable pre-turn/post-tool/turn-end hooks with bounded attribution metadata
 
 The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, exact reachability GC, MCP, and follow-only multi-machine sync over directories or persistent SSH. S3/WebDAV adapters, richer class-directed merge strategies, and provenance-accelerated teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
 
