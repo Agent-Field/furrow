@@ -190,6 +190,66 @@ fn try_auto_protects_an_unwatched_workspace_and_preserves_the_command_exit_code(
 }
 
 #[test]
+fn shrink_previews_without_mutation_then_deletes_and_restores_dependency_caches() {
+    let fixture = Fixture::new();
+    let dependency = fixture.repo.join("node_modules/pkg/archive.bin");
+    fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    fs::write(&dependency, vec![0x5a; 512 * 1024]).unwrap();
+
+    let preview = fixture
+        .agit()
+        .args(["--json", "shrink"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let preview: Value = serde_json::from_slice(&preview).unwrap();
+    assert_eq!(preview["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["candidates"][0]["path"], "node_modules");
+    assert!(preview["total_logical_bytes"].as_u64().unwrap() >= 512 * 1024);
+    assert!(dependency.exists());
+    assert!(!fixture.repo.join(".agit").exists());
+
+    let applied = fixture
+        .agit()
+        .args(["--json", "shrink", "--yes"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let applied: Value = serde_json::from_slice(&applied).unwrap();
+    let before = applied["before_snapshot"].as_str().unwrap();
+    assert_eq!(before.len(), 64);
+    assert_eq!(applied["changed"], true);
+    assert!(
+        applied["estimated_workspace_bytes_removed"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(applied["protected_store_bytes_added"].as_u64().is_some());
+    assert!(applied["estimated_net_bytes_reclaimed"].as_u64().is_some());
+    assert!(!fixture.repo.join("node_modules").exists());
+    assert!(fixture.repo.join("cache/dependency.bin").exists());
+
+    fixture
+        .agit()
+        .args(["rewind", before, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(dependency).unwrap(), vec![0x5a; 512 * 1024]);
+
+    fixture
+        .agit()
+        .args(["shrink", "--path", ".git", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("refusing to shrink"));
+}
+
+#[test]
 fn full_rewind_restores_git_ignored_untracked_metadata_and_is_reversible() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();

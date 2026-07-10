@@ -289,6 +289,10 @@ impl AgitRepository {
         self.store.root()
     }
 
+    pub fn store_physical_bytes(&self) -> anyhow::Result<u64> {
+        Ok(self.store.stats()?.physical_bytes)
+    }
+
     pub fn workspace_data_dir(&self) -> PathBuf {
         self.store.workspace_data_dir(&self.workspace_id)
     }
@@ -387,6 +391,12 @@ impl AgitRepository {
     pub fn gc_global(dry_run: bool) -> anyhow::Result<GcReport> {
         let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
         gc::collect(&mut store, dry_run)
+    }
+
+    pub fn global_store_physical_bytes() -> anyhow::Result<u64> {
+        Ok(ObjectStore::open(data_root()?.join("store-v1"))?
+            .stats()?
+            .physical_bytes)
     }
 
     pub fn claims(&self) -> anyhow::Result<Vec<ClaimRecord>> {

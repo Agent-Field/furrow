@@ -13,6 +13,7 @@ pub mod refs;
 pub mod remote;
 pub mod remote_crypto;
 pub mod repository;
+pub mod shrink;
 pub mod sorted_dir;
 pub mod sqlite_adapter;
 pub mod store;

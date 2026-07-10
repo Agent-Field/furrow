@@ -137,6 +137,15 @@ enum Command {
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
+    /// Find and reversibly remove dependency and build caches.
+    Shrink {
+        /// Remove the reported candidates after sealing a complete restore point.
+        #[arg(long)]
+        yes: bool,
+        /// Include an additional repository-relative path.
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+    },
     /// Three-way merge a fork after verifying the result in a scratch workspace.
     Merge {
         fork: String,
@@ -690,6 +699,78 @@ fn main() -> anyhow::Result<()> {
                 exit_with_status(status);
             }
         }
+        Command::Shrink { yes, paths } => {
+            let plan = agit::shrink::discover(&cli.repo, &paths)?;
+            if !yes {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    print_shrink_plan(&plan);
+                    if !plan.candidates.is_empty() {
+                        println!("Preview only. Re-run this command with `--yes` to reclaim them.");
+                    }
+                }
+                return Ok(());
+            }
+            if plan.candidates.is_empty() {
+                if cli.json {
+                    println!("{}", serde_json::json!({"plan": plan, "changed": false}));
+                } else {
+                    println!("No recognized dependency or build caches found");
+                }
+                return Ok(());
+            }
+
+            let store_before = AgitRepository::global_store_physical_bytes()?;
+            let (mut repository, before) = AgitRepository::attach_and_snapshot(
+                &cli.repo,
+                Some("before shrink".to_owned()),
+                SnapshotTrigger::Manual,
+            )?;
+            eprintln!("Protected {}", id_hex(&before));
+            let removal = agit::shrink::apply(repository.root(), &plan);
+            let after =
+                repository.snapshot(Some("after shrink".to_owned()), SnapshotTrigger::Manual)?;
+            let store_after = repository.store_physical_bytes()?;
+            let store_added = store_after.saturating_sub(store_before);
+            let net_reclaimed = plan.total_physical_bytes.saturating_sub(store_added);
+            let net_added = store_added.saturating_sub(plan.total_physical_bytes);
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "plan": plan,
+                        "changed": true,
+                        "before_snapshot": id_hex(&before),
+                        "after_snapshot": id_hex(&after),
+                        "estimated_workspace_bytes_removed": plan.total_physical_bytes,
+                        "protected_store_bytes_added": store_added,
+                        "estimated_net_bytes_reclaimed": net_reclaimed,
+                        "estimated_net_bytes_added": net_added,
+                    })
+                );
+            } else {
+                print_shrink_plan(&plan);
+                println!(
+                    "Removed about {} from the workspace; protected store added {}",
+                    human_bytes(plan.total_physical_bytes),
+                    human_bytes(store_added)
+                );
+                if net_added == 0 {
+                    println!(
+                        "Estimated net disk reclaimed: {}",
+                        human_bytes(net_reclaimed)
+                    );
+                } else {
+                    println!(
+                        "Estimated net disk increase: {} to keep this cleanup reversible",
+                        human_bytes(net_added)
+                    );
+                }
+                println!("Undo with: agit rewind {}", id_hex(&before));
+            }
+            removal?;
+        }
         Command::Merge {
             fork,
             check,
@@ -854,6 +935,43 @@ fn print_plan(plan: &agit::RewindPlan) {
     println!("Rewind to {}", &plan.target[..12]);
     for change in &plan.changes {
         println!("  {:<8} {}", change.action, change.path);
+    }
+}
+
+fn print_shrink_plan(plan: &agit::shrink::ShrinkPlan) {
+    if plan.candidates.is_empty() {
+        println!("No recognized dependency or build caches found");
+        return;
+    }
+    for candidate in &plan.candidates {
+        println!(
+            "  {:>9}  {:<24} {}",
+            human_bytes(candidate.physical_bytes),
+            candidate.class,
+            candidate.path
+        );
+    }
+    println!(
+        "{} paths, {} entries, {} physical ({} logical)",
+        plan.candidates.len(),
+        plan.total_entries,
+        human_bytes(plan.total_physical_bytes),
+        human_bytes(plan.total_logical_bytes)
+    );
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

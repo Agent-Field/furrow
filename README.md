@@ -11,6 +11,7 @@ Git protects commits. Agent checkpoints usually protect edits made through one a
 ```bash
 ./demo/agent-disaster.sh
 ./demo/risky-command.sh
+./demo/shrink-cache.sh
 ./demo/parallel-agent-forks.sh
 ./demo/two-machine-sync.sh
 ```
@@ -46,6 +47,10 @@ agit snap -m "before dependency upgrade"
 
 # Run any command with automatic before/after restore points; no prior setup required.
 agit try -m "dependency upgrade" -- npm install framework@latest
+
+# Preview and reversibly remove recognized dependency/build caches.
+agit shrink
+agit shrink --yes
 
 # Browse protected states.
 agit timeline
@@ -116,6 +121,8 @@ agit sync --pull --bootstrap
 
 SSH sync keeps one `BatchMode` connection open, batches up to 1,024 opaque object have-checks, and holds the remote writer lock until the authenticated HEAD is durable. The receiving machine can pull the stored state later after the sender disconnects.
 
+`agit shrink` recognizes common JavaScript, Python, frontend, and Rust dependency/build caches. Preview is read-only; `--yes` first seals a complete restore point. Its result separates workspace bytes removed from protected-store bytes added and reports the net, because a never-before-captured cache cannot be both locally recoverable and immediately free its full physical size. Use repeated `--path <relative-path>` options for project-specific regenerable directories; Git and agit internals are always refused.
+
 ## Agent Integration
 
 `agit mcp` is a local stdio MCP server. Bind it to one watched repository in any MCP-compatible coding agent:
@@ -159,6 +166,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Transactional advisory path claims shared across sibling forks
 - Claim/release snapshots with owner, TTL, and conflict attribution in the DAG
 - Eager `.agit/coord/` blackboard propagation with offline reconciliation and deletion tombstones
+- Streaming cache discovery with honest logical/physical/net `shrink` accounting and exact undo
 - Three-way full-state merge with explicit conflicts and scratch-fork verification
 - Crash-safe exact reachability GC with shared-chunk preservation
 - 64 KiB paged Merkle directories and disk-backed delta path indexing
