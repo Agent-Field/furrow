@@ -109,6 +109,7 @@ pub enum SnapshotTrigger {
     SyncLocal,
     SyncPush,
     SyncPull,
+    Inspection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

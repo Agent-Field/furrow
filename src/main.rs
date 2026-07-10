@@ -45,6 +45,11 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
+    /// Inspect path-level changes in a fork or since a snapshot.
+    Diff {
+        /// Fork name, full snapshot ID, or snapshot prefix.
+        target: String,
+    },
     /// Preview or restore a previous workspace snapshot.
     Rewind {
         snapshot: String,
@@ -73,6 +78,14 @@ enum Command {
     },
     /// List full-state workspace forks created from this repository.
     Forks,
+    /// Remove a completed fork and detach its timeline.
+    #[command(name = "fork-rm")]
+    ForkRemove {
+        name: String,
+        /// Forget the fork record but leave its directory and timeline intact.
+        #[arg(long)]
+        keep_files: bool,
+    },
     /// Run any agent or command inside a new isolated full-state fork.
     Run {
         name: String,
@@ -189,6 +202,27 @@ fn main() -> anyhow::Result<()> {
                         snapshot.trigger,
                         snapshot.label.unwrap_or_default()
                     );
+                }
+            }
+        }
+        Command::Diff { target } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let diff = repository.diff(&target)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else {
+                println!(
+                    "Diff {} ({} -> {})",
+                    diff.target,
+                    &diff.base_snapshot[..12],
+                    &diff.target_snapshot[..12]
+                );
+                if diff.changes.is_empty() {
+                    println!("No changes");
+                } else {
+                    for change in diff.changes {
+                        println!("  {:<7} {}", change.action, change.path);
+                    }
                 }
             }
         }
@@ -320,6 +354,25 @@ fn main() -> anyhow::Result<()> {
                         fork.destination.display()
                     );
                 }
+            }
+        }
+        Command::ForkRemove { name, keep_files } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let removal = repository.remove_fork(&name, keep_files)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&removal)?);
+            } else if removal.files_removed {
+                println!(
+                    "Removed fork {} and {}",
+                    removal.name,
+                    removal.destination.display()
+                );
+            } else {
+                println!(
+                    "Forgot fork {}; files remain at {}",
+                    removal.name,
+                    removal.destination.display()
+                );
             }
         }
         Command::Run {

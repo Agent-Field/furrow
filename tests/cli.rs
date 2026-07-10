@@ -403,10 +403,32 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
     );
 
     fs::write(destination.join("app.txt"), b"fork-only change\n").unwrap();
+    fs::write(destination.join("fork-result.txt"), b"new result\n").unwrap();
+    fs::remove_file(destination.join("notes.txt")).unwrap();
     assert_eq!(
         fs::read(fixture.repo.join("app.txt")).unwrap(),
         b"tracked original\n"
     );
+
+    let diff_output = fixture
+        .agit()
+        .args(["--json", "diff", "agent-one"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let diff: Value = serde_json::from_slice(&diff_output).unwrap();
+    let changes = diff["changes"].as_array().unwrap();
+    assert!(changes
+        .iter()
+        .any(|change| change["path"] == "app.txt" && change["action"] == "modify"));
+    assert!(changes
+        .iter()
+        .any(|change| change["path"] == "fork-result.txt" && change["action"] == "add"));
+    assert!(changes
+        .iter()
+        .any(|change| change["path"] == "notes.txt" && change["action"] == "delete"));
 
     let listed = fixture
         .agit()
@@ -436,6 +458,24 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
         b"isolated"
     );
     assert!(!fixture.repo.join("command-result.txt").exists());
+
+    fixture
+        .agit()
+        .args(["fork-rm", "agent-one"])
+        .assert()
+        .success();
+    assert!(!destination.exists());
+    let remaining = fixture
+        .agit()
+        .args(["--json", "forks"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let remaining: Value = serde_json::from_slice(&remaining).unwrap();
+    assert_eq!(remaining.as_array().unwrap().len(), 1);
+    assert_eq!(remaining[0]["name"], "agent-command");
 }
 
 #[test]

@@ -60,6 +60,20 @@ pub struct RewindPlan {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DiffChange {
+    pub path: String,
+    pub action: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffSummary {
+    pub target: String,
+    pub base_snapshot: String,
+    pub target_snapshot: String,
+    pub changes: Vec<DiffChange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RepositoryStatus {
     pub workspace: PathBuf,
     pub store: PathBuf,
@@ -88,6 +102,13 @@ pub struct ForkSummary {
     pub hardlinked_files: u64,
     pub elapsed_ms: u64,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkRemoval {
+    pub name: String,
+    pub destination: PathBuf,
+    pub files_removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -471,6 +492,71 @@ impl AgitRepository {
         Ok(forks)
     }
 
+    pub fn diff(&mut self, target: &str) -> anyhow::Result<DiffSummary> {
+        if let Some(mut fork) = self.forks()?.into_iter().find(|fork| fork.name == target) {
+            anyhow::ensure!(
+                fork.destination.exists(),
+                "fork directory no longer exists: {}",
+                fork.destination.display()
+            );
+            let mut fork_repository = AgitRepository::open(&fork.destination)?;
+            let head = fork_repository.snapshot(
+                Some(format!("inspection boundary for {}", fork.name)),
+                SnapshotTrigger::Inspection,
+            )?;
+            fork.head_snapshot = id_hex(&head);
+            atomic_write(
+                &self.forks_dir().join(format!("{}.json", fork.name)),
+                &serde_json::to_vec_pretty(&fork)?,
+            )?;
+            let base = parse_id(&fork.base_snapshot)?;
+            return self.diff_snapshot_pair(fork.name, base, head);
+        }
+
+        let base = self.resolve_snapshot(target)?;
+        let head = self.snapshot(
+            Some(format!("inspection since {}", &id_hex(&base)[..12])),
+            SnapshotTrigger::Inspection,
+        )?;
+        self.diff_snapshot_pair(target.to_owned(), base, head)
+    }
+
+    pub fn remove_fork(&mut self, name: &str, keep_files: bool) -> anyhow::Result<ForkRemoval> {
+        validate_fork_name(name)?;
+        let record_path = self.forks_dir().join(format!("{name}.json"));
+        let fork: ForkSummary = serde_json::from_slice(
+            &fs::read(&record_path).with_context(|| format!("fork `{name}` was not found"))?,
+        )?;
+        if !keep_files && fork.destination.exists() {
+            let metadata = fs::symlink_metadata(&fork.destination)?;
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "refusing to remove a fork path that is not a real directory"
+            );
+            let destination = fork.destination.canonicalize()?;
+            anyhow::ensure!(
+                destination != self.root
+                    && !destination.starts_with(&self.root)
+                    && !self.root.starts_with(&destination),
+                "refusing to remove an unsafe fork destination"
+            );
+            let fork_repository = AgitRepository::open(&destination)
+                .context("fork identity is missing or no longer matches its recorded directory")?;
+            fork_repository.forget(true)?;
+            fs::remove_dir_all(&destination)?;
+            if let Some(parent) = destination.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+        }
+        fs::remove_file(&record_path)?;
+        File::open(self.forks_dir())?.sync_all()?;
+        Ok(ForkRemoval {
+            name: name.to_owned(),
+            destination: fork.destination,
+            files_removed: !keep_files,
+        })
+    }
+
     pub fn merge(
         &mut self,
         fork_name: &str,
@@ -595,6 +681,47 @@ impl AgitRepository {
 
     fn sync_config_path(&self) -> PathBuf {
         self.workspace_data_dir().join("sync/config.json")
+    }
+
+    fn diff_snapshot_pair(
+        &self,
+        target: String,
+        base: ObjectId,
+        head: ObjectId,
+    ) -> anyhow::Result<DiffSummary> {
+        let base_snapshot: Snapshot = self.store.read_struct(&base, ObjectKind::Snapshot)?;
+        let head_snapshot: Snapshot = self.store.read_struct(&head, ObjectKind::Snapshot)?;
+        let mut raw = Vec::new();
+        self.diff_directory(
+            Some(base_snapshot.root_tree),
+            Some(head_snapshot.root_tree),
+            Vec::new(),
+            &[],
+            &mut raw,
+        )?;
+        let mut changes = Vec::with_capacity(raw.len());
+        for change in raw {
+            let before = self.lookup_tree_path(&base_snapshot.root_tree, &change.raw_path)?;
+            let after = self.lookup_tree_path(&head_snapshot.root_tree, &change.raw_path)?;
+            if directory_target_only_difference(before.as_ref(), after.as_ref()) {
+                continue;
+            }
+            changes.push(DiffChange {
+                path: change.path,
+                action: match change.action {
+                    "restore" => "add",
+                    "remove" => "delete",
+                    "replace" => "modify",
+                    _ => unreachable!(),
+                },
+            });
+        }
+        Ok(DiffSummary {
+            target,
+            base_snapshot: id_hex(&base),
+            target_snapshot: id_hex(&head),
+            changes,
+        })
     }
 
     fn sync_incoming_path(&self) -> PathBuf {
@@ -1689,6 +1816,20 @@ fn stable_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
         && before.ctime() == after.ctime()
         && before.ctime_nsec() == after.ctime_nsec()
         && before.mode() == after.mode()
+}
+
+fn directory_target_only_difference(before: Option<&TreeEntry>, after: Option<&TreeEntry>) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    if before.kind != EntryKind::Directory || after.kind != EntryKind::Directory {
+        return false;
+    }
+    let mut before = before.clone();
+    let mut after = after.clone();
+    before.target = None;
+    after.target = None;
+    before == after
 }
 
 fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {

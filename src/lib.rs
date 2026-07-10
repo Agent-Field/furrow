@@ -18,6 +18,6 @@ pub mod watcher;
 
 pub use gc::GcReport;
 pub use repository::{
-    AgitRepository, ForkSummary, MergeOutcome, RepositoryStatus, RewindPlan, SnapshotSummary,
-    SyncDisposition, SyncPullOutcome,
+    AgitRepository, DiffChange, DiffSummary, ForkRemoval, ForkSummary, MergeOutcome,
+    RepositoryStatus, RewindPlan, SnapshotSummary, SyncDisposition, SyncPullOutcome,
 };

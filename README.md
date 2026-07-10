@@ -62,8 +62,14 @@ agit run auth-refactor -- claude
 # Inspect active parallel workspaces and their actual clone/copy cost.
 agit forks
 
+# Review exactly what a fork added, modified, or deleted.
+agit diff auth-refactor
+
 # Converge only after the result passes the project's real verification command.
 agit merge auth-refactor --check "cargo test --all"
+
+# Remove the completed workspace and detach its independent timeline.
+agit fork-rm auth-refactor
 
 # Reclaim bytes no retained workspace can reach.
 agit gc --dry-run
@@ -102,6 +108,8 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Native APFS clonefile and Linux FICLONE warm workspace forks
 - Streaming-copy fallback with disclosed physical copy cost
 - Independent fork timelines, full-state consistency verification, and command launch
+- Exact base-to-head fork inspection with path-level add/modify/delete reporting
+- Explicit fork cleanup with safe timeline detachment
 - Three-way full-state merge with explicit conflicts and scratch-fork verification
 - Crash-safe exact reachability GC with shared-chunk preservation
 - 64 KiB paged Merkle directories and disk-backed delta path indexing
