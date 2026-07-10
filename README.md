@@ -219,6 +219,8 @@ On a local APFS benchmark with one flat directory containing 50,000 files, a one
 - Writes are materialized through same-directory temporary files.
 - Unsafe `..`, embedded separators, NULs, and symlink-parent traversal are rejected.
 - A failed rewind attempts to restore the automatically captured pre-rewind snapshot.
+- Every planned path is hash/metadata-checked against the pre-rewind seal immediately before mutation.
+- Post-apply interference is sealed as a rescue snapshot before automatic rollback; precondition interference is left untouched.
 - Noninteractive rewind requires an explicit snapshot ID and `--yes`.
 
 ## Data Location

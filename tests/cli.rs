@@ -1200,6 +1200,113 @@ fn interrupted_rewind_rolls_back_to_pre_rewind_state_on_next_command() {
 }
 
 #[test]
+fn live_writer_interference_is_rescued_and_rewind_rolls_back() {
+    let fixture = Fixture::new();
+    let target = fixture.watch();
+    fs::write(fixture.repo.join("app.txt"), b"pre-rewind damage\n").unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agit"))
+        .env("AGIT_DATA_DIR", &fixture.data)
+        .env("AGIT_NO_DAEMON", "1")
+        .env("AGIT_TEST_REWIND_PAUSE_AFTER_APPLY_MS", "750")
+        .arg("--repo")
+        .arg(&fixture.repo)
+        .args(["rewind", &target, "--yes"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "rewind never reached its target state"
+        );
+        if fs::read(fixture.repo.join("app.txt")).unwrap_or_default() == b"tracked original\n" {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "rewind exited before interference"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(fixture.repo.join("app.txt"), b"live writer bytes\n").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let marker = "interference was preserved as snapshot ";
+    let rescue = stderr
+        .split_once(marker)
+        .map(|(_, value)| &value[..64])
+        .expect("rewind did not report its interference rescue snapshot");
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"pre-rewind damage\n"
+    );
+
+    fixture
+        .agit()
+        .args(["rewind", rescue, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"live writer bytes\n"
+    );
+}
+
+#[test]
+fn precondition_interference_cancels_rewind_without_touching_writer_bytes() {
+    let fixture = Fixture::new();
+    let target = fixture.watch();
+    fs::write(fixture.repo.join("app.txt"), b"pre-rewind damage\n").unwrap();
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_agit"))
+        .env("AGIT_DATA_DIR", &fixture.data)
+        .env("AGIT_NO_DAEMON", "1")
+        .env("AGIT_TEST_REWIND_PAUSE_BEFORE_PRECONDITION_MS", "750")
+        .arg("--repo")
+        .arg(&fixture.repo)
+        .args(["rewind", &target, "--yes"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "pre-rewind seal was not published"
+        );
+        let timeline = fixture
+            .agit()
+            .args(["--json", "timeline", "--limit", "1"])
+            .output()
+            .unwrap();
+        if timeline.status.success() {
+            let timeline: Value = serde_json::from_slice(&timeline.stdout).unwrap();
+            if timeline[0]["trigger"] == "pre_rewind" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(fixture.repo.join("app.txt"), b"writer before mutation\n").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("cancelled before mutation"));
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"writer before mutation\n"
+    );
+}
+
+#[test]
 fn foreground_watcher_seals_after_write_quiescence() {
     let fixture = Fixture::new();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agit"))

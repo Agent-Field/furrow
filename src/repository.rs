@@ -1518,8 +1518,16 @@ impl AgitRepository {
             Some(format!("before rewind to {}", &id_hex(target)[..12])),
             SnapshotTrigger::PreRewind,
         )?;
+        let pre_snapshot: Snapshot = self.store.read_struct(&pre, ObjectKind::Snapshot)?;
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
+        let pre_entries = self.entries_for_changed_paths(&pre_snapshot.root_tree, &plan)?;
         let target_entries = self.entries_for_plan(&target_snapshot.root_tree, &plan)?;
+        test_pause("AGIT_TEST_REWIND_PAUSE_BEFORE_PRECONDITION_MS");
+        if let Err(error) = self.verify_plan_state(&self.root, &pre_entries, &plan, paths) {
+            FileExt::unlock(&lock)?;
+            return Err(error
+                .context("rewind cancelled before mutation; concurrent changes remain untouched"));
+        }
         self.write_restore_intent(&RestoreIntent {
             pre_snapshot: pre,
             target_snapshot: *target,
@@ -1532,21 +1540,39 @@ impl AgitRepository {
         let result = self
             .apply_plan_at(&self.root, &target_entries, &plan, paths)
             .and_then(|_| {
+                test_pause("AGIT_TEST_REWIND_PAUSE_AFTER_APPLY_MS");
+                self.verify_plan_state(&self.root, &target_entries, &plan, paths)?;
                 if sqlite_consistent {
                     self.restore_sqlite_backups(&target_snapshot.sqlite_backups, paths)?;
                 }
                 Ok(())
             });
         if let Err(error) = result {
-            let pre_snapshot: Snapshot = self.store.read_struct(&pre, ObjectKind::Snapshot)?;
+            let rescue = self
+                .snapshot(
+                    Some("rewind interference rescue".to_owned()),
+                    SnapshotTrigger::Inspection,
+                )
+                .ok();
             let rollback_plan = self.plan_rewind(&pre, paths)?;
             let pre_entries = self.entries_for_plan(&pre_snapshot.root_tree, &rollback_plan)?;
             self.apply_plan_at(&self.root, &pre_entries, &rollback_plan, paths)
                 .context("rewind failed and rollback also failed")?;
+            self.verify_plan_state(&self.root, &pre_entries, &rollback_plan, paths)
+                .context("rewind rollback did not converge to the pre-rewind state")?;
             self.invalidate_path_index()?;
             self.clear_restore_intent()?;
             FileExt::unlock(&lock)?;
-            return Err(error.context("rewind aborted; the pre-rewind state was restored"));
+            let detail = rescue.map_or_else(
+                || "rewind aborted; the pre-rewind state was restored".to_owned(),
+                |snapshot| {
+                    format!(
+                        "rewind aborted; interference was preserved as snapshot {}; the pre-rewind state was restored",
+                        id_hex(&snapshot)
+                    )
+                },
+            );
+            return Err(error.context(detail));
         }
         self.invalidate_path_index()?;
         self.clear_restore_intent()?;
@@ -2205,6 +2231,93 @@ impl AgitRepository {
         Ok(entries)
     }
 
+    fn entries_for_changed_paths(
+        &self,
+        root: &ObjectId,
+        plan: &RewindPlan,
+    ) -> anyhow::Result<BTreeMap<Vec<u8>, FlatEntry>> {
+        let mut entries = BTreeMap::new();
+        for change in &plan.changes {
+            if let Some(entry) = self.lookup_tree_path(root, &change.raw_path)? {
+                entries.insert(change.raw_path.clone(), FlatEntry { entry });
+            }
+        }
+        Ok(entries)
+    }
+
+    fn verify_plan_state(
+        &self,
+        root: &Path,
+        expected: &BTreeMap<Vec<u8>, FlatEntry>,
+        plan: &RewindPlan,
+        selected_paths: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        for change in &plan.changes {
+            if !selected(&change.raw_path, selected_paths) {
+                continue;
+            }
+            let path = safe_join(root, &change.raw_path)?;
+            ensure_safe_parent(root, &path)?;
+            let matches = match expected.get(&change.raw_path) {
+                Some(flat) => self.path_matches_entry(&path, &flat.entry)?,
+                None => fs::symlink_metadata(&path).is_err_and(|error| {
+                    error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ENOTDIR)
+                }),
+            };
+            anyhow::ensure!(
+                matches,
+                "workspace path changed during rewind: {}",
+                change.path
+            );
+        }
+        Ok(())
+    }
+
+    fn path_matches_entry(&self, path: &Path, entry: &TreeEntry) -> anyhow::Result<bool> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let file_type = metadata.file_type();
+        let kind_matches = match entry.kind {
+            EntryKind::File => file_type.is_file(),
+            EntryKind::Directory => file_type.is_dir() && !file_type.is_symlink(),
+            EntryKind::Symlink => file_type.is_symlink(),
+            EntryKind::Fifo => file_type.is_fifo(),
+            EntryKind::SocketMarker => return Ok(true),
+        };
+        if !kind_matches {
+            return Ok(false);
+        }
+        if entry.kind == EntryKind::Symlink {
+            return Ok(fs::read_link(path)?.as_os_str().as_bytes() == entry.link_target);
+        }
+        if metadata.permissions().mode() != entry.mode
+            || metadata.mtime() != entry.mtime_secs
+            || metadata.mtime_nsec().max(0) as u32 != entry.mtime_nanos
+        {
+            return Ok(false);
+        }
+        if entry.kind == EntryKind::File {
+            if metadata.len() != entry.size {
+                return Ok(false);
+            }
+            let blob = self.capture_file(path, None)?;
+            if Some(blob) != entry.target {
+                return Ok(false);
+            }
+        }
+        if matches!(entry.kind, EntryKind::File | EntryKind::Directory) {
+            let xattrs = self.capture_xattrs(path)?;
+            if xattrs != entry.xattrs {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn lookup_tree_path(&self, root: &ObjectId, path: &[u8]) -> anyhow::Result<Option<TreeEntry>> {
         let mut tree_id = *root;
         let mut components = path.split(|byte| *byte == b'/').peekable();
@@ -2216,10 +2329,9 @@ impl AgitRepository {
             if components.peek().is_none() {
                 return Ok(Some(entry));
             }
-            anyhow::ensure!(
-                entry.kind == EntryKind::Directory,
-                "snapshot path traverses a non-directory"
-            );
+            if entry.kind != EntryKind::Directory {
+                return Ok(None);
+            }
             tree_id = entry.target.context("directory missing tree ID")?;
         }
         Ok(None)
@@ -2810,6 +2922,15 @@ fn changed_path_matches(root: &Path, path: &Path, expected: &[u8]) -> bool {
         .strip_prefix(root)
         .ok()
         .is_some_and(|relative| relative.as_os_str().as_bytes() == expected)
+}
+
+fn test_pause(variable: &str) {
+    let Some(milliseconds) = std::env::var_os(variable)
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+    else {
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(milliseconds.min(5_000)));
 }
 
 fn subtree_intersects(path: &[u8], selections: &[PathBuf]) -> bool {
