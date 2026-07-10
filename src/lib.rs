@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod catalog;
 pub mod chunker;
 pub mod fork;
@@ -11,10 +12,12 @@ pub mod repository;
 pub mod sorted_dir;
 pub mod sqlite_adapter;
 pub mod store;
+pub mod sync;
 pub mod tree;
 pub mod watcher;
 
 pub use gc::GcReport;
 pub use repository::{
     AgitRepository, ForkSummary, MergeOutcome, RepositoryStatus, RewindPlan, SnapshotSummary,
+    SyncDisposition, SyncPullOutcome,
 };

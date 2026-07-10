@@ -228,6 +228,11 @@ impl ObjectStore {
         Ok(serde_json::from_slice(&self.read_bytes(id, expected)?)?)
     }
 
+    pub(crate) fn contains_object(&self, id: &ObjectId) -> anyhow::Result<bool> {
+        let _maintenance = self.acquire_maintenance_shared()?;
+        Ok(self.catalog.object(id)?.is_some())
+    }
+
     pub fn ensure_workspace(&mut self, id: &str, root: &[u8]) -> anyhow::Result<()> {
         let workspace_dir = self.root.join("workspaces").join(id);
         fs::create_dir_all(&workspace_dir)?;
@@ -700,6 +705,9 @@ fn trigger_name(trigger: &SnapshotTrigger) -> &'static str {
         SnapshotTrigger::MergeSource => "merge_source",
         SnapshotTrigger::PreMerge => "pre_merge",
         SnapshotTrigger::Merge => "merge",
+        SnapshotTrigger::SyncLocal => "sync_local",
+        SnapshotTrigger::SyncPush => "sync_push",
+        SnapshotTrigger::SyncPull => "sync_pull",
     }
 }
 

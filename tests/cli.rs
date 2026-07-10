@@ -65,6 +65,27 @@ impl Fixture {
     }
 }
 
+fn agit_at(repo: &Path, data: &Path) -> Command {
+    let mut command = Command::cargo_bin("agit").unwrap();
+    command
+        .env("AGIT_DATA_DIR", data)
+        .env("AGIT_NO_DAEMON", "1")
+        .arg("--repo")
+        .arg(repo);
+    command
+}
+
+fn collect_files(root: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            collect_files(&entry.path(), files);
+        } else {
+            files.push(entry.path());
+        }
+    }
+}
+
 #[test]
 fn path_rewind_restores_ignored_secret_without_touching_new_work() {
     let fixture = Fixture::new();
@@ -808,6 +829,135 @@ fn purge_then_gc_reclaims_only_unshared_history() {
         fs::read(second.join("app.txt")).unwrap(),
         b"tracked original\n"
     );
+}
+
+#[test]
+fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
+    let fixture = Fixture::new();
+    let peer = fixture.repo.parent().unwrap().join("peer");
+    let peer_data = fixture.repo.parent().unwrap().join("peer-data");
+    let remote = fixture.repo.parent().unwrap().join("remote");
+    git(
+        fixture.repo.parent().unwrap(),
+        &["clone", fixture.repo.to_str().unwrap(), "peer"],
+    );
+    fixture.watch();
+    agit_at(&peer, &peer_data)
+        .args(["watch", "--no-daemon"])
+        .assert()
+        .success();
+
+    let pair_output = fixture
+        .agit()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pair: Value = serde_json::from_slice(&pair_output).unwrap();
+    let key = pair["key_hex"].as_str().unwrap();
+    agit_at(&peer, &peer_data)
+        .args([
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+            "--key",
+            key,
+        ])
+        .assert()
+        .success();
+
+    fixture.agit().args(["sync", "--push"]).assert().success();
+    let bootstrap_output = agit_at(&peer, &peer_data)
+        .args(["--json", "sync", "--pull", "--bootstrap"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let bootstrap: Value = serde_json::from_slice(&bootstrap_output).unwrap();
+    assert_eq!(bootstrap["disposition"], "bootstrapped");
+    assert_eq!(fs::read(peer.join(".env")).unwrap(), b"TOKEN=original\n");
+    assert_eq!(
+        fs::read(peer.join("cache/dependency.bin")).unwrap(),
+        vec![7_u8; 180_000]
+    );
+
+    fs::write(fixture.repo.join("app.txt"), b"remote delta\n").unwrap();
+    let second_push = fixture
+        .agit()
+        .args(["--json", "sync", "--push"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_push: Value = serde_json::from_slice(&second_push).unwrap();
+    assert!(second_push["reused_objects"].as_u64().unwrap() > 0);
+    assert!(second_push["uploaded_objects"].as_u64().unwrap() < 10);
+    let pull_output = agit_at(&peer, &peer_data)
+        .args(["--json", "sync", "--pull"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pull: Value = serde_json::from_slice(&pull_output).unwrap();
+    assert_eq!(pull["disposition"], "fast_forwarded");
+    assert_eq!(fs::read(peer.join("app.txt")).unwrap(), b"remote delta\n");
+
+    fs::write(peer.join("notes.txt"), b"offline peer work\n").unwrap();
+    fs::write(fixture.repo.join("app.txt"), b"new remote work\n").unwrap();
+    fixture.agit().args(["sync", "--push"]).assert().success();
+    let divergence_output = agit_at(&peer, &peer_data)
+        .args(["--json", "sync", "--pull"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let divergence: Value = serde_json::from_slice(&divergence_output).unwrap();
+    assert_eq!(divergence["disposition"], "diverged");
+    assert_eq!(
+        fs::read(peer.join("notes.txt")).unwrap(),
+        b"offline peer work\n"
+    );
+
+    // The incoming sibling remains an exact GC root and can still be
+    // materialized by its full authenticated snapshot ID after compaction.
+    agit_at(&peer, &peer_data).arg("gc").assert().success();
+    agit_at(&peer, &peer_data)
+        .args([
+            "rewind",
+            divergence["remote_snapshot"].as_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+    agit_at(&peer, &peer_data)
+        .args(["sync", "--push", "--takeover"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "remote workspace changed since this machine last synchronized",
+        ));
+
+    let mut remote_files = Vec::new();
+    collect_files(&remote, &mut remote_files);
+    for path in remote_files {
+        let bytes = fs::read(path).unwrap();
+        assert!(!bytes
+            .windows(b"TOKEN=original".len())
+            .any(|window| window == b"TOKEN=original"));
+    }
 }
 
 fn git(repo: &Path, args: &[&str]) {

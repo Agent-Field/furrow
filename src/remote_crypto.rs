@@ -10,6 +10,7 @@ use zeroize::{Zeroize, Zeroizing};
 const OBJECT_MAGIC: &[u8; 5] = b"AGEO\x01";
 const HEAD_MAGIC: &[u8; 5] = b"AGEH\x01";
 const NONCE_LEN: usize = 24;
+const MAX_METADATA_LEN: usize = 1024 * 1024;
 
 pub struct RemoteCrypto {
     key: [u8; 32],
@@ -112,6 +113,14 @@ impl RemoteCrypto {
     }
 
     pub fn encrypt_head(&self, snapshot: &ObjectId, context: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.encrypt_metadata(snapshot, context)
+    }
+
+    pub fn encrypt_metadata(&self, plaintext: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            plaintext.len() <= MAX_METADATA_LEN,
+            "sync metadata exceeds the 1 MiB limit"
+        );
         let mut nonce = [0; NONCE_LEN];
         getrandom::getrandom(&mut nonce)
             .map_err(|error| anyhow::anyhow!("generate sync-head nonce: {error}"))?;
@@ -120,7 +129,7 @@ impl RemoteCrypto {
             .encrypt(
                 XNonce::from_slice(&nonce),
                 Payload {
-                    msg: snapshot,
+                    msg: plaintext,
                     aad: context,
                 },
             )
@@ -133,6 +142,14 @@ impl RemoteCrypto {
     }
 
     pub fn decrypt_head(&self, framed: &[u8], context: &[u8]) -> anyhow::Result<ObjectId> {
+        let plaintext = self.decrypt_metadata(framed, context)?;
+        anyhow::ensure!(plaintext.len() == 32, "invalid sync-head snapshot ID");
+        let mut snapshot = [0; 32];
+        snapshot.copy_from_slice(&plaintext);
+        Ok(snapshot)
+    }
+
+    pub fn decrypt_metadata(&self, framed: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
             framed.len() >= HEAD_MAGIC.len() + NONCE_LEN + 16,
             "encrypted sync head is truncated"
@@ -142,6 +159,10 @@ impl RemoteCrypto {
             "invalid encrypted sync-head header"
         );
         let nonce = &framed[HEAD_MAGIC.len()..HEAD_MAGIC.len() + NONCE_LEN];
+        anyhow::ensure!(
+            framed.len() <= HEAD_MAGIC.len() + NONCE_LEN + 16 + MAX_METADATA_LEN,
+            "encrypted sync metadata exceeds the 1 MiB limit"
+        );
         let plaintext = Zeroizing::new(
             self.cipher()
                 .decrypt(
@@ -153,10 +174,7 @@ impl RemoteCrypto {
                 )
                 .map_err(|_| anyhow::anyhow!("sync-head authentication failed"))?,
         );
-        anyhow::ensure!(plaintext.len() == 32, "invalid sync-head snapshot ID");
-        let mut snapshot = [0; 32];
-        snapshot.copy_from_slice(&plaintext);
-        Ok(snapshot)
+        Ok(plaintext.to_vec())
     }
 
     fn cipher(&self) -> XChaCha20Poly1305 {

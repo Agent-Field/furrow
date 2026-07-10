@@ -11,6 +11,7 @@ use crate::path_index::{PathIndex, CHILD_BATCH};
 use crate::sorted_dir::SortedDirectory;
 use crate::sqlite_adapter;
 use crate::store::ObjectStore;
+use crate::sync;
 use crate::tree;
 use anyhow::{bail, Context};
 use directories::ProjectDirs;
@@ -102,6 +103,26 @@ pub struct MergeOutcome {
     pub check_output: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncDisposition {
+    UpToDate,
+    FastForwarded,
+    Bootstrapped,
+    Diverged,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncPullOutcome {
+    pub disposition: SyncDisposition,
+    pub local_snapshot: String,
+    pub remote_snapshot: String,
+    pub remote_base_root: Option<String>,
+    pub fetched_objects: u64,
+    pub reused_objects: u64,
+    pub fetched_bytes: u64,
+}
+
 #[derive(Clone)]
 struct FlatEntry {
     entry: TreeEntry,
@@ -112,6 +133,11 @@ struct RestoreIntent {
     pre_snapshot: ObjectId,
     target_snapshot: ObjectId,
     paths: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, SerdeSerialize, Deserialize)]
+struct SyncState {
+    remote_root: ObjectId,
 }
 
 impl AgitRepository {
@@ -289,6 +315,98 @@ impl AgitRepository {
     pub fn gc_global(dry_run: bool) -> anyhow::Result<GcReport> {
         let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
         gc::collect(&mut store, dry_run)
+    }
+
+    pub fn pair(
+        &self,
+        remote: &Path,
+        namespace: &str,
+        key: Option<&str>,
+    ) -> anyhow::Result<sync::PairSummary> {
+        let summary = sync::pair(&self.sync_config_path(), remote, namespace, key)?;
+        let state = self.sync_state_path();
+        if state.exists() {
+            fs::remove_file(state)?;
+        }
+        Ok(summary)
+    }
+
+    pub fn sync_push(&mut self, takeover: bool) -> anyhow::Result<sync::PushReport> {
+        let snapshot = self.snapshot(
+            Some("sync push boundary".to_owned()),
+            SnapshotTrigger::SyncPush,
+        )?;
+        let config = sync::load(&self.sync_config_path())?;
+        let expected = self.read_sync_state()?.map(|state| state.remote_root);
+        let report = sync::push(&self.store, snapshot, &config, expected, takeover)?;
+        self.write_sync_state(parse_id(&report.root)?)?;
+        Ok(report)
+    }
+
+    pub fn sync_pull(&mut self, bootstrap: bool) -> anyhow::Result<SyncPullOutcome> {
+        let local = self.snapshot(
+            Some("sync pull boundary".to_owned()),
+            SnapshotTrigger::SyncLocal,
+        )?;
+        let local_snapshot: Snapshot = self.store.read_struct(&local, ObjectKind::Snapshot)?;
+        let config = sync::load(&self.sync_config_path())?;
+        let pulled = {
+            // Imported objects are not reachable until incoming.json is
+            // durable. Holding this guard closes the assembly/publication GC
+            // race while keeping memory bounded by the disk-backed queue.
+            let _maintenance = self.store.acquire_maintenance_shared()?;
+            let pulled = sync::pull(&self.store, &config)?;
+            let incoming = serde_json::json!({"snapshot": pulled.snapshot});
+            let path = self.sync_incoming_path();
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&path, &serde_json::to_vec(&incoming)?)?;
+            pulled
+        };
+        let remote_snapshot: Snapshot = self
+            .store
+            .read_struct(&pulled.snapshot, ObjectKind::Snapshot)?;
+        let disposition = if local_snapshot.root_tree == remote_snapshot.root_tree {
+            self.write_sync_state(pulled.root)?;
+            self.clear_sync_incoming()?;
+            SyncDisposition::UpToDate
+        } else if pulled.base_root == Some(local_snapshot.root_tree) || bootstrap {
+            self.rewind(&pulled.snapshot, &[], false)?;
+            let synced = self.snapshot(
+                Some(format!(
+                    "fast-forwarded from remote {}",
+                    &id_hex(&pulled.snapshot)[..12]
+                )),
+                SnapshotTrigger::SyncPull,
+            )?;
+            self.write_sync_state(pulled.root)?;
+            self.clear_sync_incoming()?;
+            return Ok(SyncPullOutcome {
+                disposition: if bootstrap {
+                    SyncDisposition::Bootstrapped
+                } else {
+                    SyncDisposition::FastForwarded
+                },
+                local_snapshot: id_hex(&synced),
+                remote_snapshot: id_hex(&pulled.snapshot),
+                remote_base_root: pulled.base_root.map(|id| id_hex(&id)),
+                fetched_objects: pulled.report.fetched_objects,
+                reused_objects: pulled.report.reused_objects,
+                fetched_bytes: pulled.report.fetched_bytes,
+            });
+        } else {
+            SyncDisposition::Diverged
+        };
+        Ok(SyncPullOutcome {
+            disposition,
+            local_snapshot: id_hex(&local),
+            remote_snapshot: id_hex(&pulled.snapshot),
+            remote_base_root: pulled.base_root.map(|id| id_hex(&id)),
+            fetched_objects: pulled.report.fetched_objects,
+            reused_objects: pulled.report.reused_objects,
+            fetched_bytes: pulled.report.fetched_bytes,
+        })
     }
 
     pub fn fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkSummary> {
@@ -473,6 +591,43 @@ impl AgitRepository {
 
     fn forks_dir(&self) -> PathBuf {
         self.workspace_data_dir().join("forks")
+    }
+
+    fn sync_config_path(&self) -> PathBuf {
+        self.workspace_data_dir().join("sync/config.json")
+    }
+
+    fn sync_incoming_path(&self) -> PathBuf {
+        self.workspace_data_dir().join("sync/incoming.json")
+    }
+
+    fn sync_state_path(&self) -> PathBuf {
+        self.workspace_data_dir().join("sync/state.json")
+    }
+
+    fn read_sync_state(&self) -> anyhow::Result<Option<SyncState>> {
+        let path = self.sync_state_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    }
+
+    fn write_sync_state(&self, remote_root: ObjectId) -> anyhow::Result<()> {
+        let path = self.sync_state_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&path, &serde_json::to_vec(&SyncState { remote_root })?)
+    }
+
+    fn clear_sync_incoming(&self) -> anyhow::Result<()> {
+        let path = self.sync_incoming_path();
+        if path.exists() {
+            fs::remove_file(&path)?;
+            File::open(path.parent().context("sync root has no parent")?)?.sync_all()?;
+        }
+        Ok(())
     }
 
     fn snapshot_entry_map(
@@ -1345,6 +1500,9 @@ impl AgitRepository {
                         OsString::from_vec(flat.entry.link_target.clone()),
                         &destination,
                     )?;
+                    let mtime =
+                        FileTime::from_unix_time(flat.entry.mtime_secs, flat.entry.mtime_nanos);
+                    filetime::set_symlink_file_times(&destination, mtime, mtime)?;
                 }
                 EntryKind::Fifo => {
                     let cpath = std::ffi::CString::new(destination.as_os_str().as_bytes())?;

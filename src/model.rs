@@ -106,6 +106,9 @@ pub enum SnapshotTrigger {
     MergeSource,
     PreMerge,
     Merge,
+    SyncLocal,
+    SyncPush,
+    SyncPull,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

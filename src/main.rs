@@ -1,5 +1,5 @@
 use agit::model::{id_hex, SnapshotTrigger};
-use agit::AgitRepository;
+use agit::{AgitRepository, SyncDisposition};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
@@ -101,6 +101,29 @@ enum Command {
         /// Report what would be reclaimed without changing the store.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Pair this workspace with a developer-owned encrypted directory remote.
+    Pair {
+        remote: PathBuf,
+        /// Shared remote workspace name. Use the same value on every machine.
+        #[arg(long)]
+        name: Option<String>,
+        /// Existing 64-character pairing key from another machine.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Transfer complete encrypted working-state snapshots through the paired remote.
+    Sync {
+        #[arg(long, conflicts_with = "pull")]
+        push: bool,
+        #[arg(long, conflicts_with = "push")]
+        pull: bool,
+        /// Explicitly take the single-writer lease from another machine.
+        #[arg(long, requires = "push")]
+        takeover: bool,
+        /// Replace this machine's initial state with the remote state, reversibly.
+        #[arg(long, requires = "pull")]
+        bootstrap: bool,
     },
 }
 
@@ -401,6 +424,67 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::Pair { remote, name, key } => {
+            let repository = AgitRepository::open(&cli.repo)?;
+            let namespace = name.unwrap_or_else(|| default_sync_name(&repository));
+            let summary = repository.pair(&remote, &namespace, key.as_deref())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("Paired {}", summary.namespace);
+                println!("Remote {}", summary.remote.display());
+                println!("Machine {}", summary.machine_id);
+                println!("Pairing key {}", summary.key_hex);
+                println!("Keep the pairing key private; use it once on each additional machine.");
+            }
+        }
+        Command::Sync {
+            push,
+            pull,
+            takeover,
+            bootstrap,
+        } => {
+            anyhow::ensure!(push || pull, "choose exactly one of --push or --pull");
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            if push {
+                let report = repository.sync_push(takeover)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("Published snapshot {}", &report.snapshot[..12]);
+                    println!(
+                        "{} objects uploaded ({} bytes); {} reused",
+                        report.uploaded_objects, report.uploaded_bytes, report.reused_objects
+                    );
+                }
+            } else {
+                let outcome = repository.sync_pull(bootstrap)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!("Remote snapshot {}", &outcome.remote_snapshot[..12]);
+                    println!(
+                        "{} objects fetched ({} bytes); {} reused",
+                        outcome.fetched_objects, outcome.fetched_bytes, outcome.reused_objects
+                    );
+                    match outcome.disposition {
+                        SyncDisposition::FastForwarded => println!("Workspace fast-forwarded"),
+                        SyncDisposition::Bootstrapped => {
+                            println!("Workspace initialized from the remote")
+                        }
+                        SyncDisposition::UpToDate => println!("Workspace already up to date"),
+                        SyncDisposition::Diverged => println!(
+                            "Divergence preserved; inspect or materialize the full remote snapshot {}",
+                            outcome.remote_snapshot
+                        ),
+                    }
+                }
+                anyhow::ensure!(
+                    outcome.disposition != SyncDisposition::Diverged,
+                    "local and remote working states diverged; neither side was overwritten"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -422,6 +506,16 @@ fn default_fork_destination(repository: &AgitRepository, name: &str) -> PathBuf 
     let mut forks_name = repository_name.to_os_string();
     forks_name.push(".agit-forks");
     parent.join(forks_name).join(name)
+}
+
+fn default_sync_name(repository: &AgitRepository) -> String {
+    repository
+        .root()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace")
+        .to_owned()
 }
 
 fn print_plan(plan: &agit::RewindPlan) {

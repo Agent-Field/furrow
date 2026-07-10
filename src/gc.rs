@@ -38,6 +38,11 @@ struct RestoreRoots {
     target_snapshot: ObjectId,
 }
 
+#[derive(Debug, Deserialize)]
+struct SyncRoot {
+    snapshot: ObjectId,
+}
+
 struct MarkDatabase {
     path: PathBuf,
     connection: Connection,
@@ -192,6 +197,15 @@ fn enqueue_roots(store_root: &Path, marks: &MarkDatabase) -> anyhow::Result<u64>
                 if marks.enqueue(&id, ObjectKind::Snapshot)? {
                     roots += 1;
                 }
+            }
+        }
+
+        let incoming_path = entry.path().join("sync/incoming.json");
+        if incoming_path.exists() {
+            let incoming: SyncRoot = serde_json::from_slice(&fs::read(&incoming_path)?)
+                .with_context(|| format!("read incoming sync root {}", incoming_path.display()))?;
+            if marks.enqueue(&incoming.snapshot, ObjectKind::Snapshot)? {
+                roots += 1;
             }
         }
     }

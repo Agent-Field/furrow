@@ -11,6 +11,7 @@ Git protects commits. Agent checkpoints usually protect edits made through one a
 ```bash
 ./demo/agent-disaster.sh
 ./demo/parallel-agent-forks.sh
+./demo/two-machine-sync.sh
 ```
 
 The demo creates a real Git repository containing:
@@ -67,6 +68,17 @@ agit merge auth-refactor --check "cargo test --all"
 # Reclaim bytes no retained workspace can reach.
 agit gc --dry-run
 agit gc
+
+# Pair two machines through an encrypted directory remote you control.
+agit pair /mnt/private/agit-sync --name my-project
+agit sync --push
+
+# On the second machine, use the printed pairing key once.
+agit pair /mnt/private/agit-sync --name my-project --key <pairing-key>
+agit sync --pull --bootstrap
+
+# Later transfers are encrypted, deduplicated deltas.
+agit sync --pull
 ```
 
 Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding is therefore itself rewindable.
@@ -94,8 +106,13 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Crash-safe exact reachability GC with shared-chunk preservation
 - 64 KiB paged Merkle directories and disk-backed delta path indexing
 - Checkpointed pack startup and O(1) reference-log head/append
+- Authenticated XChaCha20-Poly1305 sync with opaque remote object names
+- Delta-only directory-remote push/pull across independent local stores
+- Reversible first-machine bootstrap and proven fast-forward materialization
+- Mandatory single-writer leases with stale-head and rollback rejection
+- Durable sibling preservation when machines edit concurrently or offline
 
-The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, and exact reachability GC. Agent hooks, richer class-directed merge strategies, multi-machine sync, and teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
+The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, exact reachability GC, and the first follow-only multi-machine sync backend. SSH/S3/WebDAV adapters, agent hooks, richer class-directed merge strategies, and teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
 
 On a local APFS benchmark with one flat directory containing 50,000 files, a one-file watcher delta sealed in 0.165-0.170 seconds. The path index is disk-backed; the process does not retain a repository-sized in-memory file map.
 
