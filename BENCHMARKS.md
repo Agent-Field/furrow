@@ -26,7 +26,10 @@ Hardware: Apple arm64 `Mac15,10`, APFS, macOS 26.5.1. Rust release profile uses 
 | Cold seal | 5k files | 967.1 ms | 1.065 s | 778.1 ms | 12.8 MiB | 4,693 files/s |
 | Delta seal | 100 of 5k files | 15.3 ms | 16.1 ms | 2.1 ms | 13.1 MiB | 6,202 files/s |
 | Full-state fork | 5k files + 32 MiB warm cache | 727.7 ms | 751.4 ms | 621.7 ms | 18.3 MiB | 6,693 entries/s |
+| Five warm universes | 5 × (5k files + shared 32 MiB cache) | 1.180 s | 1.209 s | 736.8 ms | 18.1 MiB | 4.13 universes/s |
 | Retention + exact GC | 721 snapshots / six months | 78.0 ms | 87.8 ms | 60.2 ms | 9.1 MiB | 8,216 snapshots/s |
+
+The universe row covers five verified CoW materializations plus five concurrent process launches through the macOS sibling-directory driver. It measures startup cost, not page-cache sharing.
 
 The fork's p95 inner atomic hierarchy clone was 133 ms. The remaining time is bounded metadata/cache proof, path-index backup, and durable publication.
 
@@ -50,5 +53,6 @@ Still unproven and therefore not claimed as achieved:
 - The full 1M-file reference profile on both declared reference machines.
 - Idle watcher `<1% CPU / <=150 MiB RSS` across 10 repos and 2M entries.
 - The complete Btrfs/ZFS/overlayfs/APFS/XFS platform matrix.
+- Ten-universe physical-memory/page-cache sharing. The harness measures startup wall time, CPU, and process RSS, but the `~1.0x` shared-page-cache goal remains unclaimed until resident pages are measured on Linux CoW filesystems.
 - Generic flat-directory Merkle diff is proportional to root page count; agent delta sealing avoids that path through the disk-backed changed-path index.
 - Fork verification remains O(entries) without a true immutable filesystem snapshot, even when hierarchy creation is atomic.
