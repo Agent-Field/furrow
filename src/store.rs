@@ -709,6 +709,9 @@ fn trigger_name(trigger: &SnapshotTrigger) -> &'static str {
         SnapshotTrigger::SyncPush => "sync_push",
         SnapshotTrigger::SyncPull => "sync_pull",
         SnapshotTrigger::Inspection => "inspection",
+        SnapshotTrigger::Claim => "claim",
+        SnapshotTrigger::Release => "release",
+        SnapshotTrigger::Coord => "coord",
     }
 }
 

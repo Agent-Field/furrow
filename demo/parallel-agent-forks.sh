@@ -43,6 +43,14 @@ step "Fork two full workspaces with warm dependencies"
 "$BIN" --repo "$REPO" fork alpha --destination "$ALPHA"
 "$BIN" --repo "$REPO" fork beta --destination "$BETA"
 
+step "Make overlapping agent intent visible before writes"
+"$BIN" --repo "$ALPHA" claim app.js --owner alpha-agent >/dev/null
+if "$BIN" --repo "$BETA" claim app.js --owner beta-agent; then
+  fail "beta should not receive alpha's active path claim"
+else
+  ok "beta saw alpha's advisory app.js claim before editing"
+fi
+
 step "Run two simulated agents concurrently"
 (
   printf 'export const result = "alpha implementation";\n' > "$ALPHA/app.js"

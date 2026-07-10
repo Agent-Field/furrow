@@ -522,6 +522,78 @@ fn verified_merge_converges_independent_source_and_fork_changes() {
 }
 
 #[test]
+fn advisory_claims_coordinate_sibling_forks_and_are_timeline_recorded() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let alpha = fixture._temp.path().join("claim-alpha");
+    let beta = fixture._temp.path().join("claim-beta");
+    fixture
+        .agit()
+        .args(["fork", "claim-alpha", "--destination"])
+        .arg(&alpha)
+        .assert()
+        .success();
+    fixture
+        .agit()
+        .args(["fork", "claim-beta", "--destination"])
+        .arg(&beta)
+        .assert()
+        .success();
+
+    let alpha_claim = agit_at(&alpha, &fixture.data)
+        .args(["--json", "claim", "src/auth/**", "--owner", "alpha-agent"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let alpha_claim: Value = serde_json::from_slice(&alpha_claim).unwrap();
+    agit_at(&beta, &fixture.data)
+        .args(["claim", "src/auth/login.rs", "--owner", "beta-agent"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("held by alpha-agent"));
+    agit_at(&beta, &fixture.data)
+        .args(["claim", "src/payments/**", "--owner", "beta-agent"])
+        .assert()
+        .success();
+
+    let active = fixture
+        .agit()
+        .args(["--json", "claims"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let active: Value = serde_json::from_slice(&active).unwrap();
+    assert_eq!(active.as_array().unwrap().len(), 2);
+    let timeline = agit_at(&alpha, &fixture.data)
+        .args(["--json", "timeline"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let timeline: Value = serde_json::from_slice(&timeline).unwrap();
+    assert_eq!(timeline[0]["trigger"], "claim");
+
+    agit_at(&alpha, &fixture.data)
+        .args([
+            "release",
+            alpha_claim["claim"]["id"].as_str().unwrap(),
+            "--owner",
+            "alpha-agent",
+        ])
+        .assert()
+        .success();
+    agit_at(&beta, &fixture.data)
+        .args(["claim", "src/auth/login.rs", "--owner", "beta-agent"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn merge_conflict_or_failed_check_never_mutates_source() {
     let fixture = Fixture::new();
     fixture.watch();
@@ -1178,6 +1250,7 @@ fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
     let tools = responses[2]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "agit.rewind_plan"));
     assert!(tools.iter().any(|tool| tool["name"] == "agit.fork"));
+    assert!(tools.iter().any(|tool| tool["name"] == "agit.claim"));
     assert_eq!(responses[3]["id"], "status");
     assert_eq!(responses[3]["result"]["isError"], false);
     assert_eq!(responses[4]["result"]["isError"], false);

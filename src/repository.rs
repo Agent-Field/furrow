@@ -1,11 +1,12 @@
 use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
+use crate::claims;
 use crate::fork::{fork_workspace, ForkReport, ForkTier};
 use crate::gc::{self, GcReport};
 use crate::merge::{self, MergeAction, MergeConflict};
 use crate::model::{
-    id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
-    SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
+    id_hex, parse_id, Blob, ChunkRef, ClaimRecord, EntryKind, ObjectId, ObjectKind, SealQuality,
+    Snapshot, SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
 };
 use crate::path_index::{PathIndex, CHILD_BATCH};
 use crate::sorted_dir::SortedDirectory;
@@ -30,10 +31,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const WORKSPACE_FILE: &str = ".agit/workspace-id";
 const WORKSPACE_FILE_BYTES: &[u8] = b".agit/workspace-id";
+const FAMILY_FILE: &str = ".agit/family-id";
 
 pub struct AgitRepository {
     root: PathBuf,
     workspace_id: String,
+    family_id: String,
     store: ObjectStore,
 }
 
@@ -112,6 +115,18 @@ pub struct ForkRemoval {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ClaimOutcome {
+    pub claim: ClaimRecord,
+    pub snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseOutcome {
+    pub released: Vec<ClaimRecord>,
+    pub snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MergeOutcome {
     pub fork: String,
     pub base_snapshot: String,
@@ -187,9 +202,11 @@ impl AgitRepository {
         );
         let mut store = ObjectStore::open(store_root)?;
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
+        let family_id = ensure_family_id(&root, &store, &workspace_id)?;
         let mut repository = Self {
             root,
             workspace_id,
+            family_id,
             store,
         };
         repository.recover_interrupted_rewind()?;
@@ -223,9 +240,11 @@ impl AgitRepository {
             id
         };
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
+        let family_id = ensure_family_id(&root, &store, &workspace_id)?;
         let repository = Self {
             root,
             workspace_id,
+            family_id,
             store,
         };
         repository.recover_interrupted_rewind()?;
@@ -283,6 +302,7 @@ impl AgitRepository {
             self.capture_sqlite_backups()?
         };
         let (secs, nanos) = now();
+        let claims = self.active_claims()?;
         let snapshot = Snapshot {
             root_tree,
             parent,
@@ -293,6 +313,7 @@ impl AgitRepository {
             trigger: trigger.clone(),
             label: label.clone(),
             sqlite_backups,
+            claims,
         };
         let id = self.store.put_struct(ObjectKind::Snapshot, &snapshot)?;
         self.store
@@ -338,6 +359,53 @@ impl AgitRepository {
         gc::collect(&mut store, dry_run)
     }
 
+    pub fn claims(&self) -> anyhow::Result<Vec<ClaimRecord>> {
+        self.active_claims()
+    }
+
+    pub fn claim(
+        &mut self,
+        pattern: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> anyhow::Result<ClaimOutcome> {
+        let mut registry = claims::Registry::open(self.store.root(), &self.family_id)?;
+        let claim = registry.claim(pattern, owner, &self.workspace_id, ttl_seconds)?;
+        let snapshot = self.snapshot(
+            Some(format!("{} claimed {}", claim.owner, claim.pattern)),
+            SnapshotTrigger::Claim,
+        )?;
+        Ok(ClaimOutcome {
+            claim,
+            snapshot: id_hex(&snapshot),
+        })
+    }
+
+    pub fn release_claim(&mut self, selector: &str, owner: &str) -> anyhow::Result<ReleaseOutcome> {
+        let mut registry = claims::Registry::open(self.store.root(), &self.family_id)?;
+        let released = registry.release(selector, owner, &self.workspace_id)?;
+        let snapshot = match self.snapshot(
+            Some(format!("{owner} released {selector}")),
+            SnapshotTrigger::Release,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                registry.restore(&released)?;
+                return Err(error.context("release snapshot failed; claims were restored"));
+            }
+        };
+        Ok(ReleaseOutcome {
+            released,
+            snapshot: id_hex(&snapshot),
+        })
+    }
+
+    pub fn default_claim_owner(&self) -> String {
+        std::env::var("AGIT_AGENT_ID")
+            .or_else(|_| std::env::var("AGIT_FORK_NAME"))
+            .unwrap_or_else(|_| format!("workspace-{}", &self.workspace_id[..12]))
+    }
+
     pub fn pair(
         &self,
         remote: &Path,
@@ -345,6 +413,14 @@ impl AgitRepository {
         key: Option<&str>,
     ) -> anyhow::Result<sync::PairSummary> {
         let summary = sync::pair(&self.sync_config_path(), remote, namespace, key)?;
+        let key_bytes = hex::decode(&summary.key_hex)?;
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&key_bytes);
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(b"agit:paired-family:v1\0");
+        hasher.update(namespace.as_bytes());
+        let family_id = hex::encode(&hasher.finalize().as_bytes()[..16]);
+        write_family_id(&self.root, &self.store, &self.workspace_id, &family_id)?;
         let state = self.sync_state_path();
         if state.exists() {
             fs::remove_file(state)?;
@@ -388,6 +464,10 @@ impl AgitRepository {
         let remote_snapshot: Snapshot = self
             .store
             .read_struct(&pulled.snapshot, ObjectKind::Snapshot)?;
+        if !remote_snapshot.claims.is_empty() {
+            claims::Registry::open(self.store.root(), &self.family_id)?
+                .restore(&remote_snapshot.claims)?;
+        }
         let disposition = if local_snapshot.root_tree == remote_snapshot.root_tree {
             self.write_sync_state(pulled.root)?;
             self.clear_sync_incoming()?;
@@ -683,6 +763,13 @@ impl AgitRepository {
         self.workspace_data_dir().join("sync/config.json")
     }
 
+    fn active_claims(&self) -> anyhow::Result<Vec<ClaimRecord>> {
+        if !claims::registry_path(self.store.root(), &self.family_id).exists() {
+            return Ok(Vec::new());
+        }
+        claims::Registry::open(self.store.root(), &self.family_id)?.active()
+    }
+
     fn diff_snapshot_pair(
         &self,
         target: String,
@@ -898,6 +985,10 @@ impl AgitRepository {
 
     pub fn forget(mut self, purge: bool) -> anyhow::Result<()> {
         self.stop_watcher()?;
+        if claims::registry_path(self.store.root(), &self.family_id).exists() {
+            claims::Registry::open(self.store.root(), &self.family_id)?
+                .release_workspace(&self.workspace_id)?;
+        }
         let _maintenance = self.store.acquire_maintenance_exclusive()?;
         self.store.detach_workspace(&self.workspace_id)?;
         let workspace_file = self.root.join(WORKSPACE_FILE);
@@ -1784,6 +1875,56 @@ fn data_root() -> anyhow::Result<PathBuf> {
     let dirs = ProjectDirs::from("dev", "agit", "agit")
         .context("cannot determine application data directory")?;
     Ok(dirs.data_dir().to_owned())
+}
+
+fn ensure_family_id(
+    root: &Path,
+    store: &ObjectStore,
+    workspace_id: &str,
+) -> anyhow::Result<String> {
+    let repository_path = root.join(FAMILY_FILE);
+    let external_path = store.workspace_data_dir(workspace_id).join("family.id");
+    let family_id = if external_path.exists() {
+        fs::read_to_string(&external_path)?.trim().to_owned()
+    } else if repository_path.exists() {
+        fs::read_to_string(&repository_path)?.trim().to_owned()
+    } else {
+        let mut random = [0_u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| anyhow::anyhow!("generate workspace family ID: {error}"))?;
+        hex::encode(random)
+    };
+    write_family_id(root, store, workspace_id, &family_id)?;
+    Ok(family_id)
+}
+
+fn write_family_id(
+    root: &Path,
+    store: &ObjectStore,
+    workspace_id: &str,
+    family_id: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        family_id.len() == 32
+            && family_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "invalid workspace family ID"
+    );
+    let repository_path = root.join(FAMILY_FILE);
+    let external_path = store.workspace_data_dir(workspace_id).join("family.id");
+    if !external_path.exists() || fs::read_to_string(&external_path)?.trim() != family_id {
+        atomic_write(&external_path, format!("{family_id}\n").as_bytes())?;
+    }
+    if !repository_path.exists() || fs::read_to_string(&repository_path)?.trim() != family_id {
+        fs::create_dir_all(
+            repository_path
+                .parent()
+                .context("family file has no parent")?,
+        )?;
+        atomic_write(&repository_path, format!("{family_id}\n").as_bytes())?;
+    }
+    Ok(())
 }
 
 fn new_workspace_id(root: &Path) -> String {

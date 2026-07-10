@@ -88,6 +88,22 @@ enum Command {
         #[arg(long)]
         keep_files: bool,
     },
+    /// Claim a path glob advisory lease for an agent or workspace.
+    Claim {
+        pattern: String,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, default_value_t = 3600)]
+        ttl_seconds: u64,
+    },
+    /// List active advisory path claims in this workspace family.
+    Claims,
+    /// Release a claim by ID or exact pattern.
+    Release {
+        claim: String,
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Run any agent or command inside a new isolated full-state fork.
     Run {
         name: String,
@@ -380,6 +396,55 @@ fn main() -> anyhow::Result<()> {
                     removal.name,
                     removal.destination.display()
                 );
+            }
+        }
+        Command::Claim {
+            pattern,
+            owner,
+            ttl_seconds,
+        } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
+            let outcome = repository.claim(&pattern, &owner, ttl_seconds)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!(
+                    "Claimed {} as {} until {}",
+                    outcome.claim.pattern, outcome.claim.owner, outcome.claim.expires_at
+                );
+                println!("Claim {}", outcome.claim.id);
+                println!("Snapshot {}", &outcome.snapshot[..12]);
+            }
+        }
+        Command::Claims => {
+            let repository = AgitRepository::open(&cli.repo)?;
+            let claims = repository.claims()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&claims)?);
+            } else if claims.is_empty() {
+                println!("No active claims");
+            } else {
+                for claim in claims {
+                    println!(
+                        "{}  {:<20} {:<32} expires {}",
+                        &claim.id[..12],
+                        claim.owner,
+                        claim.pattern,
+                        claim.expires_at
+                    );
+                }
+            }
+        }
+        Command::Release { claim, owner } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
+            let outcome = repository.release_claim(&claim, &owner)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("Released {} claim(s)", outcome.released.len());
+                println!("Snapshot {}", &outcome.snapshot[..12]);
             }
         }
         Command::Run {

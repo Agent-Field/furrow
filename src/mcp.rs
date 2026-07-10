@@ -201,6 +201,23 @@ fn call_tool(
         "agit.merge_plan" => {
             serialize(repository.merge(required_string(arguments, "fork")?, None, true)?)
         }
+        "agit.claims" => serialize(repository.claims()?),
+        "agit.claim" => {
+            let owner = optional_string(arguments, "owner")?
+                .map(str::to_owned)
+                .unwrap_or_else(|| repository.default_claim_owner());
+            serialize(repository.claim(
+                required_string(arguments, "pattern")?,
+                &owner,
+                optional_u64(arguments, "ttl_seconds")?.unwrap_or(3600),
+            )?)
+        }
+        "agit.release" => {
+            let owner = optional_string(arguments, "owner")?
+                .map(str::to_owned)
+                .unwrap_or_else(|| repository.default_claim_owner());
+            serialize(repository.release_claim(required_string(arguments, "claim")?, &owner)?)
+        }
         "agit.rewind_plan" => {
             let requested = required_string(arguments, "snapshot")?;
             anyhow::ensure!(
@@ -247,6 +264,9 @@ fn tool_names() -> &'static [&'static str] {
         "agit.diff",
         "agit.fork",
         "agit.merge_plan",
+        "agit.claims",
+        "agit.claim",
+        "agit.release",
         "agit.rewind_plan",
         "agit.rewind_apply",
     ]
@@ -260,6 +280,9 @@ fn validate_argument_keys(name: &str, arguments: &Map<String, Value>) -> anyhow:
         "agit.diff" => &["target"],
         "agit.fork" => &["name"],
         "agit.merge_plan" => &["fork"],
+        "agit.claims" => &[],
+        "agit.claim" => &["pattern", "owner", "ttl_seconds"],
+        "agit.release" => &["claim", "owner"],
         "agit.rewind_plan" => &["snapshot", "paths"],
         "agit.rewind_apply" => &["snapshot", "paths", "confirm_snapshot", "sqlite_consistent"],
         _ => unreachable!("tool name was validated before dispatch"),
@@ -334,6 +357,44 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {"fork": {"type": "string"}},
                 "required": ["fork"],
+                "additionalProperties": false
+            }),
+            false,
+            false,
+        ),
+        tool(
+            "agit.claims",
+            "List active advisory path claims shared by sibling forks.",
+            json!({"type": "object", "additionalProperties": false}),
+            true,
+            false,
+        ),
+        tool(
+            "agit.claim",
+            "Claim a path glob with a TTL; overlapping claims from another agent are refused.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "maxLength": 1024},
+                    "owner": {"type": "string", "maxLength": 256},
+                    "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+            false,
+            false,
+        ),
+        tool(
+            "agit.release",
+            "Release this agent's claim by ID or exact pattern.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "owner": {"type": "string", "maxLength": 256}
+                },
+                "required": ["claim"],
                 "additionalProperties": false
             }),
             false,

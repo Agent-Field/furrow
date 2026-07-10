@@ -65,11 +65,18 @@ agit forks
 # Review exactly what a fork added, modified, or deleted.
 agit diff auth-refactor
 
+# Make overlapping agent intent visible without blocking filesystem writes.
+AGIT_AGENT_ID=auth-agent agit claim 'src/auth/**' --ttl-seconds 3600
+agit claims
+
 # Converge only after the result passes the project's real verification command.
 agit merge auth-refactor --check "cargo test --all"
 
 # Remove the completed workspace and detach its independent timeline.
 agit fork-rm auth-refactor
+
+# Claims also expire automatically with their TTL or fork lifecycle.
+AGIT_AGENT_ID=auth-agent agit release 'src/auth/**'
 
 # Reclaim bytes no retained workspace can reach.
 agit gc --dry-run
@@ -141,6 +148,8 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Independent fork timelines, full-state consistency verification, and command launch
 - Exact base-to-head fork inspection with path-level add/modify/delete reporting
 - Explicit fork cleanup with safe timeline detachment
+- Transactional advisory path claims shared across sibling forks
+- Claim/release snapshots with owner, TTL, and conflict attribution in the DAG
 - Three-way full-state merge with explicit conflicts and scratch-fork verification
 - Crash-safe exact reachability GC with shared-chunk preservation
 - 64 KiB paged Merkle directories and disk-backed delta path indexing
@@ -152,7 +161,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Mandatory single-writer leases with stale-head and rollback rejection
 - Durable sibling preservation when machines edit concurrently or offline
 - MCP 2025-11-25 stdio server with bounded framing and negotiated lifecycle
-- Agent-safe snapshot, timeline, diff, fork, merge-plan, and confirmed rewind tools
+- Agent-safe snapshot, timeline, diff, fork, claims, merge-plan, and confirmed rewind tools
 
 The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, exact reachability GC, MCP, and follow-only multi-machine sync over directories or persistent SSH. S3/WebDAV adapters, richer class-directed merge strategies, and provenance-accelerated teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
 

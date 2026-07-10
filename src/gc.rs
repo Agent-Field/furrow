@@ -450,6 +450,7 @@ mod tests {
             trigger: SnapshotTrigger::Manual,
             label: None,
             sqlite_backups: Vec::new(),
+            claims: Vec::new(),
         }
     }
 

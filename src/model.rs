@@ -110,6 +110,19 @@ pub enum SnapshotTrigger {
     SyncPush,
     SyncPull,
     Inspection,
+    Claim,
+    Release,
+    Coord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimRecord {
+    pub id: String,
+    pub pattern: String,
+    pub owner: String,
+    pub workspace_id: String,
+    pub created_at: i64,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +138,8 @@ pub struct Snapshot {
     pub label: Option<String>,
     #[serde(default)]
     pub sqlite_backups: Vec<SqliteBackup>,
+    #[serde(default)]
+    pub claims: Vec<ClaimRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
