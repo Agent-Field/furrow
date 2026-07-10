@@ -26,10 +26,13 @@ Hardware: Apple arm64 `Mac15,10`, APFS, macOS 26.5.1. Rust release profile uses 
 | Cold seal | 5k files | 967.1 ms | 1.065 s | 778.1 ms | 12.8 MiB | 4,693 files/s |
 | Delta seal | 100 of 5k files | 15.3 ms | 16.1 ms | 2.1 ms | 13.1 MiB | 6,202 files/s |
 | Full-state fork | 5k files + 32 MiB warm cache | 727.7 ms | 751.4 ms | 621.7 ms | 18.3 MiB | 6,693 entries/s |
-| Five warm universes | 5 × (5k files + shared 32 MiB cache) | 1.180 s | 1.209 s | 736.8 ms | 18.1 MiB | 4.13 universes/s |
+| Five warm universes | 5 × (5k files + shared 32 MiB cache) | 1.242 s | 1.270 s | 837.9 ms | 18.6 MiB | 3.94 universes/s |
+| Conflict radar | 5 forks × 100 overlapping paths | 543.6 ms | 548.1 ms | 524.1 ms | 18.0 MiB | 912 dirty memberships/s |
 | Retention + exact GC | 721 snapshots / six months | 78.0 ms | 87.8 ms | 60.2 ms | 9.1 MiB | 8,216 snapshots/s |
 
 The universe row covers five verified CoW materializations plus five concurrent process launches through the macOS sibling-directory driver. It measures startup cost, not page-cache sharing.
+
+The radar row is a cold family-index reconciliation from five independently sealed heads. Its p95 no-change refresh was 52.5 ms. Dirty scopes and conflict membership stay in SQLite; the process never constructs a repository-sized cross-fork map.
 
 The fork's p95 inner atomic hierarchy clone was 133 ms. The remaining time is bounded metadata/cache proof, path-index backup, and durable publication.
 
@@ -46,7 +49,7 @@ This is a 3.8x wall-time improvement and a 45% peak-RSS reduction. The fast path
 
 ## Gates And Gaps
 
-`AGIT_BENCH_ENFORCE=1` currently requires at least 50 MiB/s chunk throughput, a 2 s delta seal ceiling, at most 100 ms per paged-tree diff, at most 5 ms per indexed ref read, a tier-aware fork ceiling, a 10 s GC ceiling, and at most 512 MiB peak RSS per isolated scenario.
+`AGIT_BENCH_ENFORCE=1` currently requires at least 50 MiB/s chunk throughput, a 2 s delta seal ceiling, at most 100 ms per paged-tree diff, at most 5 ms per indexed ref read, tier-aware fork and multi-universe ceilings, a 10 s conflict-radar ceiling, a 10 s GC ceiling, and at most 512 MiB peak RSS per isolated scenario.
 
 Still unproven and therefore not claimed as achieved:
 
