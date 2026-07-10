@@ -176,7 +176,7 @@ fn call_tool(
         "agit.status" => {
             let status = repository.status()?;
             if optional_bool(arguments, "fidelity")?.unwrap_or(false) {
-                Ok(json!({"status": status, "fidelity": repository.fidelity()}))
+                Ok(json!({"status": status, "fidelity": repository.fidelity()?}))
             } else {
                 serialize(status)
             }

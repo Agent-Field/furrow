@@ -2,6 +2,7 @@ use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::claims;
 use crate::coord;
+use crate::estimate::{self, CaptureEstimate};
 use crate::fork::{fork_workspace_excluding, ForkReport, ForkTier};
 use crate::gc::{self, GcReport};
 use crate::merge::{self, MergeAction, MergeConflict};
@@ -10,6 +11,7 @@ use crate::model::{
     Snapshot, SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
 };
 use crate::path_index::{PathIndex, CHILD_BATCH};
+use crate::policy::{CapturePolicy, POLICY_FILE_BYTES};
 use crate::sorted_dir::SortedDirectory;
 use crate::sqlite_adapter;
 use crate::store::ObjectStore;
@@ -119,6 +121,7 @@ pub struct FidelityAspect {
 pub struct FidelityReport {
     pub platform: &'static str,
     pub grade: &'static str,
+    pub excluded_subtrees: Vec<String>,
     pub aspects: Vec<FidelityAspect>,
 }
 
@@ -335,6 +338,20 @@ impl AgitRepository {
         &self.root
     }
 
+    pub(crate) fn filter_capture_paths(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let policy = CapturePolicy::load(&self.root)?;
+        Ok(paths
+            .into_iter()
+            .filter(|path| {
+                !policy.excludes_path(&self.root, path)
+                    && !changed_path_matches(&self.root, path, WORKSPACE_FILE_BYTES)
+            })
+            .collect())
+    }
+
     pub fn store_root(&self) -> &Path {
         self.store.root()
     }
@@ -373,9 +390,17 @@ impl AgitRepository {
     ) -> anyhow::Result<ObjectId> {
         let _maintenance = self.store.acquire_maintenance_shared()?;
         let parent = self.store.workspace_head(&self.workspace_id)?;
+        let policy = CapturePolicy::load(&self.root)?;
         let root_tree = match changed_paths {
-            Some(paths) if !paths.is_empty() => self.capture_changed_paths_retry(paths)?,
-            _ => self.capture_root_retry()?,
+            Some(paths)
+                if !paths.is_empty()
+                    && !paths
+                        .iter()
+                        .any(|path| changed_path_matches(&self.root, path, POLICY_FILE_BYTES)) =>
+            {
+                self.capture_changed_paths_retry_with_policy(paths, &policy)?
+            }
+            _ => self.capture_root_retry_with_policy(&policy)?,
         };
         // Continuous watcher seals keep raw database/WAL/SHM bytes (L0) and
         // avoid a second whole-tree database discovery pass. Forced boundaries
@@ -383,7 +408,7 @@ impl AgitRepository {
         let sqlite_backups = if trigger == SnapshotTrigger::Watcher {
             Vec::new()
         } else {
-            self.capture_sqlite_backups()?
+            self.capture_sqlite_backups(&policy)?
         };
         let (secs, nanos) = now();
         let claims = self.active_claims()?;
@@ -398,6 +423,7 @@ impl AgitRepository {
             label: label.clone(),
             sqlite_backups,
             claims,
+            excluded_paths: policy.rule_strings(),
         };
         let id = self.store.put_struct(ObjectKind::Snapshot, &snapshot)?;
         self.store
@@ -434,10 +460,12 @@ impl AgitRepository {
         })
     }
 
-    pub fn fidelity(&self) -> FidelityReport {
-        FidelityReport {
+    pub fn fidelity(&self) -> anyhow::Result<FidelityReport> {
+        let policy = CapturePolicy::load(&self.root)?;
+        Ok(FidelityReport {
             platform: std::env::consts::OS,
             grade: "partial",
+            excluded_subtrees: policy.rule_strings(),
             aspects: vec![
                 FidelityAspect {
                     aspect: "regular_file_bytes",
@@ -505,7 +533,7 @@ impl AgitRepository {
                     detail: "Git object stores referenced outside the watched root are not captured",
                 },
             ],
-        }
+        })
     }
 
     pub fn gc(&mut self, dry_run: bool) -> anyhow::Result<GcReport> {
@@ -521,6 +549,16 @@ impl AgitRepository {
         Ok(ObjectStore::open(data_root()?.join("store-v1"))?
             .stats()?
             .physical_bytes)
+    }
+
+    pub fn estimate(root: &Path) -> anyhow::Result<CaptureEstimate> {
+        let root = root.canonicalize()?;
+        anyhow::ensure!(
+            root.join(".git").exists(),
+            "agit currently requires a Git repository"
+        );
+        let store = ObjectStore::open(data_root()?.join("store-v1"))?;
+        estimate::calculate(&root, &store)
     }
 
     pub fn claims(&self) -> anyhow::Result<Vec<ClaimRecord>> {
@@ -1048,7 +1086,14 @@ impl AgitRepository {
         let base_entries = self.snapshot_entry_map(&base)?;
         let ours_entries = self.snapshot_entry_map(&ours)?;
         let theirs_entries = self.snapshot_entry_map(&theirs)?;
-        let merge_plan = merge::plan(&base_entries, &ours_entries, &theirs_entries);
+        let mut merge_plan = merge::plan(&base_entries, &ours_entries, &theirs_entries);
+        let policy = CapturePolicy::load(&self.root)?;
+        merge_plan
+            .changes
+            .retain(|change| !policy.excludes_bytes(&change.path));
+        merge_plan
+            .conflicts
+            .retain(|conflict| !policy.excludes_bytes(&conflict.path));
         let mut outcome = MergeOutcome {
             fork: fork_name.to_owned(),
             base_snapshot: id_hex(&base),
@@ -1280,6 +1325,10 @@ impl AgitRepository {
             &[],
             &mut changes,
         )?;
+        let current_policy = CapturePolicy::from_rules(&current.excluded_paths)?;
+        let target_policy = CapturePolicy::from_rules(&target_snapshot.excluded_paths)?;
+        let protected = current_policy.union(&target_policy);
+        changes.retain(|change| !protected.excludes_bytes(&change.raw_path));
         let plan = RewindPlan {
             target: id_hex(target),
             changes,
@@ -1438,7 +1487,10 @@ impl AgitRepository {
     pub fn plan_rewind(&self, target: &ObjectId, paths: &[PathBuf]) -> anyhow::Result<RewindPlan> {
         let _maintenance = self.store.acquire_maintenance_shared()?;
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
-        let current_tree = self.capture_root_retry()?;
+        let current_policy = CapturePolicy::load(&self.root)?;
+        let target_policy = CapturePolicy::from_rules(&target_snapshot.excluded_paths)?;
+        let protected = current_policy.union(&target_policy);
+        let current_tree = self.capture_root_retry_with_policy(&current_policy)?;
         let mut changes = Vec::new();
         self.diff_directory(
             Some(current_tree),
@@ -1447,6 +1499,7 @@ impl AgitRepository {
             paths,
             &mut changes,
         )?;
+        changes.retain(|change| !protected.excludes_bytes(&change.raw_path));
         Ok(RewindPlan {
             target: id_hex(target),
             changes,
@@ -1563,12 +1616,17 @@ impl AgitRepository {
     }
 
     fn capture_root_retry(&self) -> anyhow::Result<ObjectId> {
+        let policy = CapturePolicy::load(&self.root)?;
+        self.capture_root_retry_with_policy(&policy)
+    }
+
+    fn capture_root_retry_with_policy(&self, policy: &CapturePolicy) -> anyhow::Result<ObjectId> {
         let mut index = self.open_path_index()?;
         let mut last_error = None;
         for _ in 0..3 {
             index.begin()?;
             index.reset()?;
-            match self.capture_directory_impl(&self.root, &index) {
+            match self.capture_directory_impl(&self.root, &index, policy) {
                 Ok(id) => {
                     index.set_root(&id, &self.store_generation()?)?;
                     index.commit()?;
@@ -1589,17 +1647,21 @@ impl AgitRepository {
             .context("workspace kept changing while it was captured"))
     }
 
-    fn capture_changed_paths_retry(&self, changed_paths: &[PathBuf]) -> anyhow::Result<ObjectId> {
+    fn capture_changed_paths_retry_with_policy(
+        &self,
+        changed_paths: &[PathBuf],
+        policy: &CapturePolicy,
+    ) -> anyhow::Result<ObjectId> {
         let mut index = self.open_path_index()?;
         let generation = self.store_generation()?;
         if index.root(&generation)?.is_none() {
-            return self.capture_root_retry();
+            return self.capture_root_retry_with_policy(policy);
         }
 
         let mut last_error = None;
         for _ in 0..3 {
             index.begin()?;
-            match self.capture_changed_paths_impl(&index, changed_paths) {
+            match self.capture_changed_paths_impl(&index, changed_paths, policy) {
                 Ok(id) => {
                     index.set_root(&id, &generation)?;
                     index.commit()?;
@@ -1624,6 +1686,7 @@ impl AgitRepository {
         &self,
         index: &PathIndex,
         changed_paths: &[PathBuf],
+        policy: &CapturePolicy,
     ) -> anyhow::Result<ObjectId> {
         let mut paths = BTreeSet::new();
         for changed in changed_paths {
@@ -1638,7 +1701,7 @@ impl AgitRepository {
             let relative = relative.as_os_str().as_bytes().to_vec();
             if relative.is_empty() {
                 index.reset()?;
-                return self.capture_directory_impl(&self.root, index);
+                return self.capture_directory_impl(&self.root, index, policy);
             }
             if relative == WORKSPACE_FILE_BYTES {
                 continue;
@@ -1658,8 +1721,8 @@ impl AgitRepository {
         for relative in paths {
             index.remove_subtree(&relative)?;
             let absolute = safe_join(&self.root, &relative)?;
-            if fs::symlink_metadata(&absolute).is_ok() {
-                if let Some(entry) = self.capture_path_entry(&absolute, index)? {
+            if !policy.excludes_bytes(&relative) && fs::symlink_metadata(&absolute).is_ok() {
+                if let Some(entry) = self.capture_path_entry(&absolute, index, policy)? {
                     let parent = relative_parent(&relative);
                     index.upsert(&relative, &parent, &entry)?;
                 }
@@ -1682,6 +1745,10 @@ impl AgitRepository {
         });
         let mut root_tree = existing_root;
         for relative in dirty_directories {
+            if policy.excludes_bytes(&relative) {
+                index.remove_subtree(&relative)?;
+                continue;
+            }
             let absolute = safe_join(&self.root, &relative)?;
             let metadata = match fs::symlink_metadata(&absolute) {
                 Ok(metadata) => metadata,
@@ -1711,7 +1778,12 @@ impl AgitRepository {
         Ok(root_tree)
     }
 
-    fn capture_directory_impl(&self, path: &Path, index: &PathIndex) -> anyhow::Result<ObjectId> {
+    fn capture_directory_impl(
+        &self,
+        path: &Path,
+        index: &PathIndex,
+        policy: &CapturePolicy,
+    ) -> anyhow::Result<ObjectId> {
         let relative = path.strip_prefix(&self.root)?.as_os_str().as_bytes();
         let children = SortedDirectory::open(path)
             .with_context(|| format!("read directory {}", path.display()))?;
@@ -1726,14 +1798,17 @@ impl AgitRepository {
             if child_path == self.root.join(WORKSPACE_FILE) {
                 continue;
             }
-            let Some(entry) = self.capture_path_entry(&child_path, index)? else {
-                continue;
-            };
             let child_relative = child_path
                 .strip_prefix(&self.root)?
                 .as_os_str()
                 .as_bytes()
                 .to_vec();
+            if policy.excludes_bytes(&child_relative) {
+                continue;
+            }
+            let Some(entry) = self.capture_path_entry(&child_path, index, policy)? else {
+                continue;
+            };
             index.upsert(&child_relative, relative, &entry)?;
             tree.push(entry)?;
         }
@@ -1747,6 +1822,7 @@ impl AgitRepository {
         &self,
         path: &Path,
         index: &PathIndex,
+        policy: &CapturePolicy,
     ) -> anyhow::Result<Option<TreeEntry>> {
         let metadata =
             fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -1767,7 +1843,7 @@ impl AgitRepository {
 
         let entry = if file_type.is_dir() {
             let target = self
-                .capture_directory_impl(path, index)
+                .capture_directory_impl(path, index, policy)
                 .with_context(|| format!("capture directory {}", path.display()))?;
             TreeEntry {
                 name,
@@ -1956,9 +2032,9 @@ impl AgitRepository {
         }
     }
 
-    fn capture_sqlite_backups(&self) -> anyhow::Result<Vec<SqliteBackup>> {
+    fn capture_sqlite_backups(&self, policy: &CapturePolicy) -> anyhow::Result<Vec<SqliteBackup>> {
         let mut candidates = Vec::new();
-        collect_sqlite_candidates(&self.root, &mut candidates)?;
+        collect_sqlite_candidates(&self.root, &self.root, policy, &mut candidates)?;
         let mut backups = Vec::new();
         let temp_dir = self.store.root().join("tmp");
         for path in candidates {
@@ -2724,6 +2800,18 @@ fn selected(path: &[u8], selections: &[PathBuf]) -> bool {
         .any(|selection| candidate == selection || candidate.starts_with(selection))
 }
 
+fn changed_path_matches(root: &Path, path: &Path, expected: &[u8]) -> bool {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        root.join(path)
+    };
+    absolute
+        .strip_prefix(root)
+        .ok()
+        .is_some_and(|relative| relative.as_os_str().as_bytes() == expected)
+}
+
 fn subtree_intersects(path: &[u8], selections: &[PathBuf]) -> bool {
     if selections.is_empty() {
         return true;
@@ -2748,16 +2836,25 @@ fn remove_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn collect_sqlite_candidates(root: &Path, output: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    for child in fs::read_dir(root)? {
+fn collect_sqlite_candidates(
+    root: &Path,
+    directory: &Path,
+    policy: &CapturePolicy,
+    output: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    for child in fs::read_dir(directory)? {
         let child = child?;
         let path = child.path();
+        let relative = path.strip_prefix(root)?.as_os_str().as_bytes();
+        if policy.excludes_bytes(relative) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             continue;
         }
         if metadata.is_dir() {
-            collect_sqlite_candidates(&path, output)?;
+            collect_sqlite_candidates(root, &path, policy, output)?;
         } else if metadata.is_file() && sqlite_adapter::is_sqlite(&path) {
             output.push(path);
         }

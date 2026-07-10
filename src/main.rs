@@ -20,6 +20,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Project first-capture cost after policy and existing-store deduplication.
+    Estimate,
     /// Attach a repository and create its first complete snapshot.
     Watch {
         /// Keep running and seal after filesystem write quiescence.
@@ -239,6 +241,30 @@ enum CoordCommand {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Estimate => {
+            let estimate = AgitRepository::estimate(&cli.repo)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&estimate)?);
+            } else {
+                println!(
+                    "{} files, {} directories, {} logical, {} physical",
+                    estimate.files,
+                    estimate.directories,
+                    human_bytes(estimate.logical_bytes),
+                    human_bytes(estimate.physical_bytes)
+                );
+                println!(
+                    "{} unique chunks; {} already in the store; {} projected new chunk payload",
+                    estimate.unique_chunks,
+                    human_bytes(estimate.deduplicated_chunk_bytes),
+                    human_bytes(estimate.projected_new_chunk_bytes)
+                );
+                println!(
+                    "{} policy rule(s), {} excluded subtree root(s)",
+                    estimate.policy_rules, estimate.excluded_subtrees
+                );
+            }
+        }
         Command::Watch {
             foreground,
             no_daemon,
@@ -378,7 +404,7 @@ fn main() -> anyhow::Result<()> {
                 if fidelity {
                     println!(
                         "{}",
-                        serde_json::json!({"status": status, "fidelity": repository.fidelity()})
+                        serde_json::json!({"status": status, "fidelity": repository.fidelity()?})
                     );
                 } else {
                     println!("{}", serde_json::to_string_pretty(&status)?);
@@ -401,7 +427,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 );
                 if fidelity {
-                    let report = repository.fidelity();
+                    let report = repository.fidelity()?;
                     println!("Fidelity:  {} ({})", report.grade, report.platform);
                     for aspect in report.aspects {
                         println!(

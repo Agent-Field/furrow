@@ -41,6 +41,9 @@ cargo install --path .
 
 ```bash
 cd my-project
+
+# Read-only, policy-aware projection of new chunk bytes before attaching.
+agit estimate
 agit watch
 
 # Create a meaningful restore point before a risky agent task.
@@ -130,6 +133,16 @@ SSH sync keeps one `BatchMode` connection open, batches up to 1,024 opaque objec
 
 `agit shrink` recognizes common JavaScript, Python, frontend, and Rust dependency/build caches. Preview is read-only; `--yes` first seals a complete restore point. Its result separates workspace bytes removed from protected-store bytes added and reports the net, because a never-before-captured cache cannot be both locally recoverable and immediately free its full physical size. Use repeated `--path <relative-path>` options for project-specific regenerable directories; Git and agit internals are always refused.
 
+Capture includes ignored dependency and build trees by default. To leave a regenerable subtree live but outside snapshots, add literal repository-relative rules to `.agitpolicy`:
+
+```text
+# Each rule covers the named path and all descendants.
+exclude node_modules
+exclude packages/web/.next
+```
+
+Policy changes force a full Merkle/index reconciliation. Excluded paths are also ignored by the watcher and protected from rewind deletion using the union of current and target-snapshot rules. Git state, agit control state, and `.agitpolicy` itself cannot be excluded. `agit estimate` streams stable files through the real chunker and a disk-backed unique-chunk set; `projected_new_chunk_bytes` accounts for existing CAS content and within-workspace deduplication, but intentionally excludes small object framing/manifest overhead and optional logical SQLite backup overhead.
+
 `agit bisect -- <command>` treats exit zero as passing and searches the recent timeline from oldest passing state to newest failing state. Use `--good <snapshot> --bad <snapshot>` to choose explicit anchors and `--limit` to widen the retained window. The baseline moves by Merkle delta in one scratch workspace; each command runs in a disposable CoW child, so test/build side effects cannot alter the source or later probes. Check output is discarded rather than buffered; the result reports every tested snapshot, exit status, check time, and probe-fork time.
 
 ## Agent Integration
@@ -162,6 +175,8 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Recovery from truncated pack tails
 - Human and JSON timelines
 - Human, JSON, and MCP fidelity reporting with explicit partial-grade limitations
+- Read-only, disk-backed first-capture estimation with exact new-chunk payload projection
+- Snapshot-recorded literal subtree policy with rewind-safe exclusions and watcher churn suppression
 - Full and path-scoped dry-run/rewind
 - Automatic recovery when `git clean -fdx` removes `.agit/`
 - Symlink, executable mode, mtime, and extended-attribute restoration

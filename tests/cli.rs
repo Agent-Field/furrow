@@ -153,6 +153,114 @@ fn status_fidelity_reports_exact_and_known_partial_capture_contracts() {
 }
 
 #[test]
+fn policy_excluded_subtrees_survive_rewind_and_can_later_be_included() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join(".agitpolicy"), b"exclude cache\n").unwrap();
+    let excluded_snapshot = fixture.watch();
+
+    fs::write(
+        fixture.repo.join("cache/dependency.bin"),
+        b"new excluded cache state\n",
+    )
+    .unwrap();
+    fs::write(fixture.repo.join("app.txt"), b"damaged app\n").unwrap();
+    fs::remove_file(fixture.repo.join(".agitpolicy")).unwrap();
+    fixture
+        .agit()
+        .args(["rewind", &excluded_snapshot, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(fixture.repo.join("cache/dependency.bin")).unwrap(),
+        b"new excluded cache state\n"
+    );
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"tracked original\n"
+    );
+    assert_eq!(
+        fs::read(fixture.repo.join(".agitpolicy")).unwrap(),
+        b"exclude cache\n"
+    );
+    let fidelity = fixture
+        .agit()
+        .args(["--json", "status", "--fidelity"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let fidelity: Value = serde_json::from_slice(&fidelity).unwrap();
+    assert_eq!(fidelity["fidelity"]["excluded_subtrees"][0], "cache");
+
+    fs::write(
+        fixture.repo.join(".agitpolicy"),
+        b"# cache is protected again\n",
+    )
+    .unwrap();
+    let included = fixture
+        .agit()
+        .args(["--json", "snap", "-m", "include cache"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let included: Value = serde_json::from_slice(&included).unwrap();
+    let included = included["snapshot"].as_str().unwrap();
+    fs::write(
+        fixture.repo.join("cache/dependency.bin"),
+        b"later cache damage\n",
+    )
+    .unwrap();
+    fixture
+        .agit()
+        .args(["rewind", included, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(fixture.repo.join("cache/dependency.bin")).unwrap(),
+        b"new excluded cache state\n"
+    );
+}
+
+#[test]
+fn estimate_is_read_only_policy_aware_and_accounts_for_existing_cas_chunks() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join(".agitpolicy"), b"exclude cache\n").unwrap();
+    let before = fixture
+        .agit()
+        .args(["--json", "estimate"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let before: Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(before["policy_rules"], 1);
+    assert_eq!(before["excluded_subtrees"], 1);
+    assert!(before["projected_new_chunk_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(before["deduplicated_chunk_bytes"], 0);
+    assert!(!fixture.repo.join(".agit").exists());
+
+    fixture.watch();
+    let after = fixture
+        .agit()
+        .args(["--json", "estimate"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after: Value = serde_json::from_slice(&after).unwrap();
+    assert!(after["deduplicated_chunk_bytes"].as_u64().unwrap() > 0);
+    assert!(
+        after["projected_new_chunk_bytes"].as_u64().unwrap()
+            < before["projected_new_chunk_bytes"].as_u64().unwrap()
+    );
+}
+
+#[test]
 fn try_auto_protects_an_unwatched_workspace_and_preserves_the_command_exit_code() {
     let fixture = Fixture::new();
     let output = fixture
@@ -1178,6 +1286,67 @@ fn foreground_watcher_seals_after_write_quiescence() {
         fs::read(fixture.repo.join("watcher-dir/nested.txt")).unwrap(),
         b"nested watcher state\n"
     );
+}
+
+#[test]
+fn watcher_reloads_policy_and_ignores_excluded_subtree_churn() {
+    let fixture = Fixture::new();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agit"))
+        .env("AGIT_DATA_DIR", &fixture.data)
+        .arg("--repo")
+        .arg(&fixture.repo)
+        .args(["watch", "--foreground", "--debounce-ms", "75"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.repo.join(".agit/workspace-id").exists() {
+        assert!(Instant::now() < deadline, "watcher did not attach in time");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    let before = fixture
+        .agit()
+        .args(["--json", "timeline", "--limit", "1"])
+        .output()
+        .unwrap();
+    let before: Value = serde_json::from_slice(&before.stdout).unwrap();
+    let before = before[0]["id"].as_str().unwrap().to_owned();
+
+    fs::write(fixture.repo.join(".agitpolicy"), b"exclude cache\n").unwrap();
+    let policy_head = loop {
+        assert!(Instant::now() < deadline, "policy change was not sealed");
+        let output = fixture
+            .agit()
+            .args(["--json", "timeline", "--limit", "1"])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let head = value[0]["id"].as_str().unwrap();
+            if head != before && value[0]["trigger"] == "watcher" {
+                break head.to_owned();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(75));
+    };
+
+    fs::write(
+        fixture.repo.join("cache/dependency.bin"),
+        vec![3_u8; 180_000],
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let after = fixture
+        .agit()
+        .args(["--json", "timeline", "--limit", "1"])
+        .output()
+        .unwrap();
+    let after: Value = serde_json::from_slice(&after.stdout).unwrap();
+    child.kill().ok();
+    child.wait().ok();
+    assert_eq!(after[0]["id"], policy_head);
 }
 
 #[test]

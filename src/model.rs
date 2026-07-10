@@ -140,6 +140,8 @@ pub struct Snapshot {
     pub sqlite_backups: Vec<SqliteBackup>,
     #[serde(default)]
     pub claims: Vec<ClaimRecord>,
+    #[serde(default)]
+    pub excluded_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

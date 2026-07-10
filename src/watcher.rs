@@ -42,6 +42,16 @@ pub fn run(mut repository: AgitRepository, debounce: Duration) -> anyhow::Result
         }
 
         let overflowed = overflow.swap(false, Ordering::AcqRel);
+        let changed_paths = match repository.filter_capture_paths(changed_paths) {
+            Ok(paths) => paths,
+            Err(error) => {
+                eprintln!("agit: automatic snapshot deferred: {error:#}");
+                continue;
+            }
+        };
+        if !overflowed && changed_paths.is_empty() {
+            continue;
+        }
         let label = if overflowed {
             "automatic snapshot after watcher overflow/rescan"
         } else {
@@ -51,7 +61,6 @@ pub fn run(mut repository: AgitRepository, debounce: Duration) -> anyhow::Result
         let result = if overflowed || changed_paths.is_empty() {
             repository.snapshot(Some(label.to_owned()), SnapshotTrigger::Watcher)
         } else {
-            let changed_paths: Vec<_> = changed_paths.into_iter().collect();
             repository.snapshot_changed_paths(
                 Some(label.to_owned()),
                 SnapshotTrigger::Watcher,

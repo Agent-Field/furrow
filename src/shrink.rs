@@ -1,9 +1,11 @@
 //! Streaming discovery and removal of regenerable workspace caches.
 
+use crate::policy::CapturePolicy;
 use anyhow::Context;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::fs::{self, ReadDir};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -33,11 +35,17 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
     let root = root
         .canonicalize()
         .with_context(|| format!("open {}", root.display()))?;
+    let policy = CapturePolicy::load(&root)?;
     let mut candidates = Vec::new();
 
     for include in includes {
         let relative = validate_relative(include)?;
         refuse_internal_path(&relative)?;
+        anyhow::ensure!(
+            !policy.excludes_bytes(relative.as_os_str().as_bytes()),
+            "cannot shrink policy-excluded path {}; its undo bytes are not captured",
+            include.display()
+        );
         let path = root.join(&relative);
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("inspect shrink path {}", include.display()))?;
@@ -63,6 +71,9 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
         }
         let relative = entry.path().strip_prefix(&root)?.to_owned();
         if is_internal_root(&relative) {
+            continue;
+        }
+        if policy.excludes_bytes(relative.as_os_str().as_bytes()) {
             continue;
         }
         if let Some(class) = classify(&entry.path()) {
@@ -305,5 +316,11 @@ mod tests {
         assert_eq!(plan.candidates[0].path, "cache");
         assert!(discover(temporary.path(), &[PathBuf::from("../outside")]).is_err());
         assert!(discover(temporary.path(), &[PathBuf::from(".git")]).is_err());
+
+        fs::write(temporary.path().join(".agitpolicy"), b"exclude cache\n").unwrap();
+        assert!(discover(temporary.path(), &[PathBuf::from("cache")])
+            .unwrap_err()
+            .to_string()
+            .contains("undo bytes are not captured"));
     }
 }

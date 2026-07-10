@@ -312,6 +312,7 @@ mod tests {
                     label: None,
                     sqlite_backups: Vec::new(),
                     claims: Vec::new(),
+                    excluded_paths: Vec::new(),
                 },
             )
             .unwrap()

@@ -3,12 +3,14 @@ pub mod catalog;
 pub mod chunker;
 pub mod claims;
 pub mod coord;
+pub mod estimate;
 pub mod fork;
 pub mod gc;
 pub mod mcp;
 pub mod merge;
 pub mod model;
 pub mod path_index;
+pub mod policy;
 pub mod refs;
 pub mod remote;
 pub mod remote_crypto;
@@ -21,6 +23,7 @@ pub mod sync;
 pub mod tree;
 pub mod watcher;
 
+pub use estimate::CaptureEstimate;
 pub use gc::GcReport;
 pub use repository::{
     AgitRepository, BisectCheck, BisectOutcome, ClaimOutcome, CoordOutcome, DiffChange,
