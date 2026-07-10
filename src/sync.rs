@@ -1,26 +1,25 @@
-//! Encrypted, delta-only synchronization through a developer-owned directory.
+//! Encrypted, delta-only synchronization through a directory or direct SSH helper.
 
 use crate::bundle;
 use crate::model::{ObjectId, ObjectKind, Snapshot};
+use crate::remote::{self, RemoteSpec, Session};
 use crate::remote_crypto::RemoteCrypto;
 use crate::store::ObjectStore;
 use anyhow::Context;
-use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LEASE_SECONDS: u64 = 60 * 60;
-const MAX_REMOTE_OBJECT_BYTES: u64 = 256 * 1024 * 1024 + 1024;
-const MAX_REMOTE_METADATA_BYTES: u64 = 1024 * 1024 + 1024;
+const HAVE_BATCH: usize = 1024;
+const HAVE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairConfig {
-    pub remote: PathBuf,
+    pub remote: RemoteSpec,
     pub namespace: String,
     pub key: [u8; 32],
     pub machine_id: [u8; 16],
@@ -28,7 +27,7 @@ pub struct PairConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PairSummary {
-    pub remote: PathBuf,
+    pub remote: String,
     pub namespace: String,
     pub key_hex: String,
     pub machine_id: String,
@@ -75,16 +74,8 @@ pub fn pair(
     namespace: &str,
     key_hex: Option<&str>,
 ) -> anyhow::Result<PairSummary> {
-    validate_namespace(namespace)?;
-    let requested_remote = if remote.is_absolute() {
-        remote.to_owned()
-    } else {
-        std::env::current_dir()?.join(remote)
-    };
-    ensure_durable_directory(&requested_remote)?;
-    let remote = requested_remote
-        .canonicalize()
-        .with_context(|| format!("resolve sync remote {}", requested_remote.display()))?;
+    remote::validate_namespace(namespace)?;
+    let remote = RemoteSpec::from_input(remote)?;
     let key = match key_hex {
         Some(key) => parse_key(key)?,
         None => RemoteCrypto::generate_key()?,
@@ -99,12 +90,14 @@ pub fn pair(
         machine_id,
     };
     let parent = config_path.parent().context("sync config has no parent")?;
-    ensure_durable_directory(parent)?;
-    atomic_write(config_path, &serde_json::to_vec_pretty(&config)?)?;
+    fs::create_dir_all(parent)?;
+    local_atomic_write(config_path, &serde_json::to_vec_pretty(&config)?)?;
     fs::set_permissions(config_path, fs::Permissions::from_mode(0o600))?;
-    ensure_durable_directory(&remote_root(&config).join("objects"))?;
+    // Opening verifies SSH availability and creates the namespace through the
+    // same opaque helper protocol used by normal transfers.
+    drop(Session::open(&config.remote, namespace)?);
     Ok(PairSummary {
-        remote,
+        remote: remote.display(),
         namespace: namespace.to_owned(),
         key_hex: hex::encode(key),
         machine_id: hex::encode(machine_id),
@@ -112,13 +105,16 @@ pub fn pair(
 }
 
 pub fn load(config_path: &Path) -> anyhow::Result<PairConfig> {
-    serde_json::from_slice(&fs::read(config_path).with_context(|| {
+    let config: PairConfig = serde_json::from_slice(&fs::read(config_path).with_context(|| {
         format!(
             "repository is not paired; run `agit pair <directory>` first ({})",
             config_path.display()
         )
     })?)
-    .context("decode sync configuration")
+    .context("decode sync configuration")?;
+    remote::validate_namespace(&config.namespace)?;
+    config.remote.validate()?;
+    Ok(config)
 }
 
 pub fn push(
@@ -128,13 +124,13 @@ pub fn push(
     expected_remote_root: Option<ObjectId>,
     takeover: bool,
 ) -> anyhow::Result<PushReport> {
-    let root = remote_root(config);
-    ensure_durable_directory(&root.join("objects"))?;
-    let _lease = acquire_writer_lease(config, takeover)?;
+    let mut remote = Session::open(&config.remote, &config.namespace)?;
+    remote.begin_writer()?;
+    let new_lease = prepare_writer_lease(&mut remote, config, takeover)?;
     let crypto = RemoteCrypto::new(config.key);
     let snapshot_value: Snapshot = store.read_struct(&snapshot, ObjectKind::Snapshot)?;
-    let base_root = if root.join("HEAD").exists() {
-        let current = read_remote_head(&root, config, &crypto)?;
+    let base_root = if remote.exists("HEAD")? {
+        let current = read_remote_head(&mut remote, config, &crypto)?;
         anyhow::ensure!(
             current.snapshot == snapshot || Some(current.root) == expected_remote_root,
             "remote workspace changed since this machine last synchronized; pull before pushing"
@@ -147,21 +143,62 @@ pub fn push(
         );
         None
     };
+    // Publish ownership only after the locked expected-head check. A stale
+    // takeover attempt must not disrupt the current writer when no new HEAD
+    // can be committed.
+    remote.write("LEASE", &new_lease)?;
     let mut uploaded_objects = 0_u64;
     let mut reused_objects = 0_u64;
     let mut uploaded_bytes = 0_u64;
+    let mut pending = Vec::with_capacity(HAVE_BATCH);
+    let mut pending_bytes = 0_usize;
     let objects = bundle::for_each_reachable(store, snapshot, |id, kind, bytes| {
-        let path = remote_object_path(&root, &crypto.remote_id(id));
-        if path.exists() {
-            reused_objects += 1;
+        if bytes.len() >= HAVE_BATCH_BYTES {
+            flush_push_batch(
+                &crypto,
+                &mut remote,
+                &mut pending,
+                &mut uploaded_objects,
+                &mut reused_objects,
+                &mut uploaded_bytes,
+            )?;
+            pending_bytes = 0;
+            let remote_id = crypto.remote_id(id);
+            if remote.has_objects(&[remote_id])?[0] {
+                reused_objects += 1;
+            } else {
+                let encrypted = crypto.encrypt_object(id, kind, bytes)?;
+                remote.write(&remote::object_key(&remote_id), &encrypted)?;
+                uploaded_objects += 1;
+                uploaded_bytes += encrypted.len() as u64;
+            }
             return Ok(());
         }
-        let encrypted = crypto.encrypt_object(id, kind, bytes)?;
-        atomic_write(&path, &encrypted)?;
-        uploaded_objects += 1;
-        uploaded_bytes += encrypted.len() as u64;
+        if pending.len() == HAVE_BATCH
+            || pending_bytes.saturating_add(bytes.len()) > HAVE_BATCH_BYTES
+        {
+            flush_push_batch(
+                &crypto,
+                &mut remote,
+                &mut pending,
+                &mut uploaded_objects,
+                &mut reused_objects,
+                &mut uploaded_bytes,
+            )?;
+            pending_bytes = 0;
+        }
+        pending_bytes = pending_bytes.saturating_add(bytes.len());
+        pending.push((*id, kind, bytes.to_vec()));
         Ok(())
     })?;
+    flush_push_batch(
+        &crypto,
+        &mut remote,
+        &mut pending,
+        &mut uploaded_objects,
+        &mut reused_objects,
+        &mut uploaded_bytes,
+    )?;
     let head = RemoteHead {
         version: 1,
         snapshot,
@@ -173,7 +210,7 @@ pub fn push(
         &serde_json::to_vec(&head)?,
         head_context(&config.namespace).as_bytes(),
     )?;
-    atomic_write(&root.join("HEAD"), &encrypted_head)?;
+    remote.write("HEAD", &encrypted_head)?;
     Ok(PushReport {
         snapshot: hex::encode(snapshot),
         root: hex::encode(snapshot_value.root_tree),
@@ -184,10 +221,44 @@ pub fn push(
     })
 }
 
+fn flush_push_batch(
+    crypto: &RemoteCrypto,
+    remote: &mut Session,
+    pending: &mut Vec<(ObjectId, ObjectKind, Vec<u8>)>,
+    uploaded_objects: &mut u64,
+    reused_objects: &mut u64,
+    uploaded_bytes: &mut u64,
+) -> anyhow::Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let remote_ids: Vec<_> = pending
+        .iter()
+        .map(|(id, _, _)| crypto.remote_id(id))
+        .collect();
+    let existing = remote.has_objects(&remote_ids)?;
+    anyhow::ensure!(
+        existing.len() == pending.len(),
+        "invalid remote have response"
+    );
+    for (((id, kind, bytes), remote_id), exists) in pending.drain(..).zip(remote_ids).zip(existing)
+    {
+        if exists {
+            *reused_objects += 1;
+            continue;
+        }
+        let encrypted = crypto.encrypt_object(&id, kind, &bytes)?;
+        remote.write(&remote::object_key(&remote_id), &encrypted)?;
+        *uploaded_objects += 1;
+        *uploaded_bytes += encrypted.len() as u64;
+    }
+    Ok(())
+}
+
 pub fn pull(store: &ObjectStore, config: &PairConfig) -> anyhow::Result<PulledHead> {
-    let root = remote_root(config);
+    let mut remote = Session::open(&config.remote, &config.namespace)?;
     let crypto = RemoteCrypto::new(config.key);
-    let head = read_remote_head(&root, config, &crypto)?;
+    let head = read_remote_head(&mut remote, config, &crypto)?;
     let queue_file = tempfile::NamedTempFile::new()?;
     let queue = Connection::open(queue_file.path())?;
     queue.execute_batch(
@@ -210,11 +281,12 @@ pub fn pull(store: &ObjectStore, config: &PairConfig) -> anyhow::Result<PulledHe
             reused_objects += 1;
             store.read_bytes(&id, expected)?
         } else {
-            let encrypted = read_bounded(
-                &remote_object_path(&root, &crypto.remote_id(&id)),
-                MAX_REMOTE_OBJECT_BYTES,
-            )
-            .with_context(|| format!("remote is missing object {}", hex::encode(id)))?;
+            let encrypted = remote
+                .read(
+                    &remote::object_key(&crypto.remote_id(&id)),
+                    remote::MAX_OBJECT_BYTES,
+                )
+                .with_context(|| format!("remote is missing object {}", hex::encode(id)))?;
             let (kind, bytes) = crypto.decrypt_object(&id, &encrypted)?;
             anyhow::ensure!(kind == expected, "remote object kind mismatch");
             anyhow::ensure!(
@@ -255,17 +327,16 @@ pub fn pull(store: &ObjectStore, config: &PairConfig) -> anyhow::Result<PulledHe
     })
 }
 
-fn acquire_writer_lease(config: &PairConfig, takeover: bool) -> anyhow::Result<LeaseLock> {
-    let root = remote_root(config);
-    ensure_durable_directory(&root)?;
-    let lock_path = root.join("LEASE.lock");
-    let lock = LeaseLock::acquire(&lock_path)?;
+fn prepare_writer_lease(
+    remote: &mut Session,
+    config: &PairConfig,
+    takeover: bool,
+) -> anyhow::Result<Vec<u8>> {
     let crypto = RemoteCrypto::new(config.key);
-    let lease_path = root.join("LEASE");
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    if lease_path.exists() {
+    if remote.exists("LEASE")? {
         let lease = crypto.decrypt_head(
-            &read_bounded(&lease_path, MAX_REMOTE_METADATA_BYTES)?,
+            &remote.read("LEASE", remote::MAX_METADATA_BYTES)?,
             b"agit:writer-lease:v1",
         )?;
         let mut owner = [0; 16];
@@ -279,40 +350,7 @@ fn acquire_writer_lease(config: &PairConfig, takeover: bool) -> anyhow::Result<L
     let mut lease = [0; 32];
     lease[..16].copy_from_slice(&config.machine_id);
     lease[16..24].copy_from_slice(&(now + LEASE_SECONDS).to_le_bytes());
-    let encrypted = crypto.encrypt_head(&lease, b"agit:writer-lease:v1")?;
-    atomic_write(&lease_path, &encrypted)?;
-    Ok(lock)
-}
-
-struct LeaseLock {
-    file: fs::File,
-}
-
-impl LeaseLock {
-    fn acquire(path: &Path) -> anyhow::Result<Self> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        file.try_lock_exclusive()
-            .context("another sync operation is updating the remote")?;
-        file.set_len(0)?;
-        writeln!(file, "{}", std::process::id())?;
-        file.sync_all()?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for LeaseLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
-
-fn remote_root(config: &PairConfig) -> PathBuf {
-    config.remote.join(&config.namespace)
+    crypto.encrypt_head(&lease, b"agit:writer-lease:v1")
 }
 
 fn head_context(namespace: &str) -> String {
@@ -320,11 +358,12 @@ fn head_context(namespace: &str) -> String {
 }
 
 fn read_remote_head(
-    root: &Path,
+    remote: &mut Session,
     config: &PairConfig,
     crypto: &RemoteCrypto,
 ) -> anyhow::Result<RemoteHead> {
-    let encrypted = read_bounded(&root.join("HEAD"), MAX_REMOTE_METADATA_BYTES)
+    let encrypted = remote
+        .read("HEAD", remote::MAX_METADATA_BYTES)
         .context("sync remote has no published HEAD")?;
     let head: RemoteHead = serde_json::from_slice(
         &crypto.decrypt_metadata(&encrypted, head_context(&config.namespace).as_bytes())?,
@@ -332,42 +371,6 @@ fn read_remote_head(
     .context("decode authenticated remote head")?;
     anyhow::ensure!(head.version == 1, "unsupported remote head version");
     Ok(head)
-}
-
-fn read_bounded(path: &Path, limit: u64) -> anyhow::Result<Vec<u8>> {
-    let file = fs::File::open(path)?;
-    let length = file.metadata()?.len();
-    anyhow::ensure!(length <= limit, "remote file exceeds its size limit");
-    let mut bytes = Vec::with_capacity(length as usize);
-    file.take(limit + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() as u64 <= limit,
-        "remote file exceeds its size limit"
-    );
-    Ok(bytes)
-}
-
-fn remote_object_path(root: &Path, id: &ObjectId) -> PathBuf {
-    let hex = hex::encode(id);
-    root.join("objects").join(&hex[..2]).join(&hex[2..])
-}
-
-fn validate_namespace(namespace: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !namespace.is_empty() && namespace.len() <= 96,
-        "invalid sync namespace"
-    );
-    anyhow::ensure!(
-        namespace
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
-        "sync namespace may contain only letters, numbers, dot, dash, and underscore"
-    );
-    anyhow::ensure!(
-        namespace != "." && namespace != "..",
-        "invalid sync namespace"
-    );
-    Ok(())
 }
 
 fn parse_key(value: &str) -> anyhow::Result<[u8; 32]> {
@@ -378,29 +381,12 @@ fn parse_key(value: &str) -> anyhow::Result<[u8; 32]> {
     Ok(key)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().context("remote object has no parent")?;
-    ensure_durable_directory(parent)?;
+fn local_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path.parent().context("sync config has no parent")?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(bytes)?;
+    std::io::Write::write_all(&mut temporary, bytes)?;
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
-    fs::File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-fn ensure_durable_directory(path: &Path) -> anyhow::Result<()> {
-    if path.is_dir() {
-        return Ok(());
-    }
-    let parent = path.parent().context("directory has no parent")?;
-    ensure_durable_directory(parent)?;
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
-        Err(error) => return Err(error.into()),
-    }
-    fs::File::open(path)?.sync_all()?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -508,13 +494,26 @@ mod tests {
             0o600
         );
         let first_config = load(&config_one).unwrap();
-        acquire_writer_lease(&first_config, false).unwrap();
+        let mut first_remote =
+            Session::open(&first_config.remote, &first_config.namespace).unwrap();
+        first_remote.begin_writer().unwrap();
+        let first_lease = prepare_writer_lease(&mut first_remote, &first_config, false).unwrap();
+        first_remote.write("LEASE", &first_lease).unwrap();
+        drop(first_remote);
 
         let config_two = temporary.path().join("two.json");
         pair(&config_two, &remote, "project", Some(&first.key_hex)).unwrap();
         let second_config = load(&config_two).unwrap();
-        assert!(acquire_writer_lease(&second_config, false).is_err());
-        acquire_writer_lease(&second_config, true).unwrap();
+        let mut second_remote =
+            Session::open(&second_config.remote, &second_config.namespace).unwrap();
+        second_remote.begin_writer().unwrap();
+        assert!(prepare_writer_lease(&mut second_remote, &second_config, false).is_err());
+        drop(second_remote);
+        let mut takeover_remote =
+            Session::open(&second_config.remote, &second_config.namespace).unwrap();
+        takeover_remote.begin_writer().unwrap();
+        let takeover = prepare_writer_lease(&mut takeover_remote, &second_config, true).unwrap();
+        takeover_remote.write("LEASE", &takeover).unwrap();
     }
 
     #[test]

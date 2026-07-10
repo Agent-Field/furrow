@@ -87,6 +87,20 @@ agit sync --pull --bootstrap
 agit sync --pull
 ```
 
+For a direct laptop-to-desktop path with no central data plane, install `agit` on both machines and use existing public-key SSH access:
+
+```bash
+# Laptop: publish ciphertext directly into the desktop's agit helper.
+agit pair ssh://developer@desktop.local --name my-project
+agit sync --push
+
+# Desktop: pair to the same local account/namespace using the laptop's key.
+agit pair ssh://localhost --name my-project --key <pairing-key>
+agit sync --pull --bootstrap
+```
+
+SSH sync keeps one `BatchMode` connection open, batches up to 1,024 opaque object have-checks, and holds the remote writer lock until the authenticated HEAD is durable. The receiving machine can pull the stored state later after the sender disconnects.
+
 ## Agent Integration
 
 `agit mcp` is a local stdio MCP server. Bind it to one watched repository in any MCP-compatible coding agent:
@@ -133,13 +147,14 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Checkpointed pack startup and O(1) reference-log head/append
 - Authenticated XChaCha20-Poly1305 sync with opaque remote object names
 - Delta-only directory-remote push/pull across independent local stores
+- Persistent direct SSH helper transport with batched opaque have-checks
 - Reversible first-machine bootstrap and proven fast-forward materialization
 - Mandatory single-writer leases with stale-head and rollback rejection
 - Durable sibling preservation when machines edit concurrently or offline
 - MCP 2025-11-25 stdio server with bounded framing and negotiated lifecycle
 - Agent-safe snapshot, timeline, diff, fork, merge-plan, and confirmed rewind tools
 
-The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, exact reachability GC, and the first follow-only multi-machine sync backend. SSH/S3/WebDAV adapters, agent hooks, richer class-directed merge strategies, and teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
+The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, exact reachability GC, MCP, and follow-only multi-machine sync over directories or persistent SSH. S3/WebDAV adapters, richer class-directed merge strategies, and provenance-accelerated teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
 
 On a local APFS benchmark with one flat directory containing 50,000 files, a one-file watcher delta sealed in 0.165-0.170 seconds. The path index is disk-backed; the process does not retain a repository-sized in-memory file map.
 

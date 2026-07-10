@@ -35,6 +35,8 @@ enum Command {
         #[arg(long, default_value_t = 500)]
         debounce_ms: u64,
     },
+    #[command(name = "__remote", hide = true)]
+    RemoteHelper { namespace: String },
     /// Create a complete labeled snapshot now.
     Snap {
         #[arg(short, long)]
@@ -115,7 +117,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Pair this workspace with a developer-owned encrypted directory remote.
+    /// Pair with an encrypted directory or direct ssh://user@host remote.
     Pair {
         remote: PathBuf,
         /// Shared remote workspace name. Use the same value on every machine.
@@ -180,6 +182,9 @@ fn main() -> anyhow::Result<()> {
                 repository,
                 std::time::Duration::from_millis(debounce_ms.max(10)),
             )?;
+        }
+        Command::RemoteHelper { namespace } => {
+            agit::remote::serve(&namespace)?;
         }
         Command::Snap { message } => {
             let mut repository = AgitRepository::open(&cli.repo)?;
@@ -487,7 +492,7 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
                 println!("Paired {}", summary.namespace);
-                println!("Remote {}", summary.remote.display());
+                println!("Remote {}", summary.remote);
                 println!("Machine {}", summary.machine_id);
                 println!("Pairing key {}", summary.key_hex);
                 println!("Keep the pairing key private; use it once on each additional machine.");

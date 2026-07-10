@@ -990,6 +990,12 @@ fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
         .stderr(predicates::str::contains(
             "remote workspace changed since this machine last synchronized",
         ));
+    fs::write(
+        fixture.repo.join("after-stale-attempt.txt"),
+        b"writer retained\n",
+    )
+    .unwrap();
+    fixture.agit().args(["sync", "--push"]).assert().success();
 
     let mut remote_files = Vec::new();
     collect_files(&remote, &mut remote_files);
@@ -999,6 +1005,108 @@ fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
             .windows(b"TOKEN=original".len())
             .any(|window| window == b"TOKEN=original"));
     }
+}
+
+#[test]
+fn persistent_ssh_helper_syncs_independent_stores_over_framed_stdio() {
+    let fixture = Fixture::new();
+    let peer = fixture.repo.parent().unwrap().join("ssh-peer");
+    let peer_data = fixture.repo.parent().unwrap().join("ssh-peer-data");
+    let remote_data = fixture.repo.parent().unwrap().join("ssh-remote-data");
+    let wrapper = fixture.repo.parent().unwrap().join("fake-ssh.sh");
+    git(
+        fixture.repo.parent().unwrap(),
+        &["clone", fixture.repo.to_str().unwrap(), "ssh-peer"],
+    );
+    fs::write(
+        &wrapper,
+        b"#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nshift\nshift\nexec \"$AGIT_TEST_BIN\" \"$@\"\n",
+    )
+    .unwrap();
+    let mut mode = fs::metadata(&wrapper).unwrap().permissions();
+    mode.set_mode(0o755);
+    fs::set_permissions(&wrapper, mode).unwrap();
+
+    fixture.watch();
+    agit_at(&peer, &peer_data)
+        .args(["watch", "--no-daemon"])
+        .assert()
+        .success();
+    let ssh_agit = |repo: &Path, data: &Path| {
+        let mut command = agit_at(repo, data);
+        command
+            .env("AGIT_SSH_COMMAND", &wrapper)
+            .env("AGIT_REMOTE_DATA_DIR", &remote_data)
+            .env("AGIT_TEST_BIN", env!("CARGO_BIN_EXE_agit"));
+        command
+    };
+
+    let pair_output = ssh_agit(&fixture.repo, &fixture.data)
+        .args([
+            "--json",
+            "pair",
+            "ssh://fake-host",
+            "--name",
+            "ssh-workspace",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pair: Value = serde_json::from_slice(&pair_output).unwrap();
+    assert_eq!(pair["remote"], "ssh://fake-host");
+    let key = pair["key_hex"].as_str().unwrap();
+    ssh_agit(&peer, &peer_data)
+        .args([
+            "pair",
+            "ssh://fake-host",
+            "--name",
+            "ssh-workspace",
+            "--key",
+            key,
+        ])
+        .assert()
+        .success();
+    ssh_agit(&fixture.repo, &fixture.data)
+        .args(["sync", "--push"])
+        .assert()
+        .success();
+    let pull = ssh_agit(&peer, &peer_data)
+        .args(["--json", "sync", "--pull", "--bootstrap"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pull: Value = serde_json::from_slice(&pull).unwrap();
+    assert_eq!(pull["disposition"], "bootstrapped");
+    assert_eq!(fs::read(peer.join(".env")).unwrap(), b"TOKEN=original\n");
+    assert_eq!(
+        fs::read(peer.join("cache/dependency.bin")).unwrap().len(),
+        180_000
+    );
+
+    fs::write(fixture.repo.join("app.txt"), b"ssh delta\n").unwrap();
+    let push = ssh_agit(&fixture.repo, &fixture.data)
+        .args(["--json", "sync", "--push"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let push: Value = serde_json::from_slice(&push).unwrap();
+    assert!(push["uploaded_objects"].as_u64().unwrap() < 10);
+    let pull = ssh_agit(&peer, &peer_data)
+        .args(["--json", "sync", "--pull"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pull: Value = serde_json::from_slice(&pull).unwrap();
+    assert_eq!(pull["disposition"], "fast_forwarded");
+    assert_eq!(fs::read(peer.join("app.txt")).unwrap(), b"ssh delta\n");
 }
 
 #[test]
