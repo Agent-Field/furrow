@@ -14,6 +14,7 @@ Git protects commits. Agent checkpoints usually protect edits made through one a
 ./demo/shrink-cache.sh
 ./demo/find-regression.sh
 ./demo/parallel-agent-forks.sh
+./demo/five-agent-scale.sh
 ./demo/two-machine-sync.sh
 ```
 
