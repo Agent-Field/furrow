@@ -4,6 +4,7 @@
 **Audience:** Product, architecture, security, and independent technical reviewers
 **Scope:** A local-first engine that versions, forks, merges, and transports the *working state* of any repository — the layer git deliberately ignores
 **Last updated:** 2026-07-09
+**Companion:** `RUNNERS_DX_AND_COMMERCIAL_SPEC.md` (Document 2) covers the distributed runtime — ephemeral runners, network architecture, inter-agent coordination primitives, DX tiers, and the open-source/commercial model. This document remains authoritative for engine semantics wherever the two touch. Document 2 has no Phase-0/1 footprint.
 
 Draft 0.3 resolves the blocking review findings against 0.2: store placement, snapshot completeness, pool provenance, re-chunk cost claims, database capture semantics, fork-latency scaling, capture fidelity definition, rewind concurrency, remote chunk identity, and daemon budget reference configuration. It also adds first-class multi-machine sync to the open-source core.
 
