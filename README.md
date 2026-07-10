@@ -159,6 +159,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Rewind path traversal and symlink-parent escape protection
 - macOS and Linux builds
 - Native APFS clonefile and Linux FICLONE warm workspace forks
+- Pre-materialization fork disclosure from a streaming disk-backed index: entries, logical bytes, native-CoW projection, and worst-case copied bytes
 - Streaming-copy fallback with disclosed physical copy cost
 - Independent fork timelines, full-state consistency verification, and command launch
 - Exact base-to-head fork inspection with path-level add/modify/delete reporting

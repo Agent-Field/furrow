@@ -119,6 +119,14 @@ pub fn fork_workspace(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
 ) -> anyhow::Result<ForkReport> {
+    fork_workspace_excluding(source, destination, &[])
+}
+
+pub(crate) fn fork_workspace_excluding(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    excluded: &[&Path],
+) -> anyhow::Result<ForkReport> {
     let started = Instant::now();
     let source = source.as_ref();
     let destination = destination.as_ref();
@@ -200,6 +208,10 @@ pub fn fork_workspace(
             format!("read directory entry in {}", directory.display())
         })?;
         let source_path = entry.path();
+        let relative = source_path.strip_prefix(&source)?;
+        if excluded.iter().any(|excluded| relative == *excluded) {
+            continue;
+        }
         let destination_path = directories
             .last()
             .expect("directory stack is nonempty")

@@ -508,9 +508,22 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
         .stdout
         .clone();
     let summary: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(summary["name"], "agent-one");
+    assert_eq!(summary["plan"]["name"], "agent-one");
+    assert!(summary["plan"]["projected_native_cow_ms"].as_u64().unwrap() > 0);
+    assert_eq!(
+        summary["plan"]["worst_case_copied_bytes"],
+        summary["plan"]["logical_bytes"]
+    );
+    assert_eq!(summary["result"]["name"], "agent-one");
+    assert_eq!(summary["plan"]["files"], summary["result"]["files"]);
+    assert_eq!(
+        summary["plan"]["logical_bytes"],
+        summary["result"]["logical_bytes"]
+    );
     assert!(
-        summary["cloned_bytes"].as_u64().unwrap() + summary["copied_bytes"].as_u64().unwrap() > 0
+        summary["result"]["cloned_bytes"].as_u64().unwrap()
+            + summary["result"]["copied_bytes"].as_u64().unwrap()
+            > 0
     );
     assert_eq!(
         fs::read(destination.join(".env")).unwrap(),

@@ -1,6 +1,6 @@
 //! Rebuildable disk-backed path state for delta-only directory sealing.
 
-use crate::model::{ObjectId, TreeEntry};
+use crate::model::{EntryKind, ObjectId, TreeEntry};
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -10,6 +10,16 @@ pub const CHILD_BATCH: usize = 512;
 pub struct PathIndex {
     connection: Connection,
     transaction_active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PathUsage {
+    pub files: u64,
+    pub directories: u64,
+    pub symlinks: u64,
+    pub fifos: u64,
+    pub special: u64,
+    pub logical_bytes: u64,
 }
 
 impl PathIndex {
@@ -188,6 +198,31 @@ impl PathIndex {
                 row.get::<_, i64>(0)
             })? as u64)
     }
+
+    pub fn usage(&self) -> anyhow::Result<PathUsage> {
+        let mut statement = self.connection.prepare("SELECT entry FROM entries")?;
+        let mut rows = statement.query([])?;
+        let mut usage = PathUsage {
+            directories: 1,
+            ..PathUsage::default()
+        };
+        while let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(0)?;
+            let entry: TreeEntry =
+                serde_json::from_slice(&bytes).context("decode indexed tree entry")?;
+            match entry.kind {
+                EntryKind::File => {
+                    usage.files = usage.files.saturating_add(1);
+                    usage.logical_bytes = usage.logical_bytes.saturating_add(entry.size);
+                }
+                EntryKind::Directory => usage.directories = usage.directories.saturating_add(1),
+                EntryKind::Symlink => usage.symlinks = usage.symlinks.saturating_add(1),
+                EntryKind::Fifo => usage.fifos = usage.fifos.saturating_add(1),
+                EntryKind::SocketMarker => usage.special = usage.special.saturating_add(1),
+            }
+        }
+        Ok(usage)
+    }
 }
 
 impl Drop for PathIndex {
@@ -238,6 +273,11 @@ mod tests {
         index.upsert(b"dir/b", b"dir", &entry(b"b", 3)).unwrap();
         index.set_root(&[9; 32], "pack-one").unwrap();
         index.commit().unwrap();
+
+        let usage = index.usage().unwrap();
+        assert_eq!(usage.files, 2);
+        assert_eq!(usage.directories, 2);
+        assert_eq!(usage.logical_bytes, 2);
 
         let first = index.children_after(b"dir", None, 1).unwrap();
         assert_eq!(first[0].name, b"a");

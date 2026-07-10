@@ -390,9 +390,14 @@ fn main() -> anyhow::Result<()> {
             let name = name.unwrap_or_else(default_fork_name);
             let destination =
                 destination.unwrap_or_else(|| default_fork_destination(&repository, &name));
-            let summary = repository.fork(&name, &destination)?;
+            let plan = repository.prepare_fork(&name, &destination)?;
+            if !cli.json {
+                print_fork_plan(&plan);
+                io::stdout().flush()?;
+            }
+            let summary = repository.materialize_fork(plan.clone())?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&summary)?);
+                println!("{}", serde_json::json!({"plan": plan, "result": summary}));
             } else {
                 println!("Fork {}", summary.name);
                 println!("Path {}", summary.destination.display());
@@ -630,7 +635,10 @@ fn main() -> anyhow::Result<()> {
             let mut repository = AgitRepository::open(&cli.repo)?;
             let destination =
                 destination.unwrap_or_else(|| default_fork_destination(&repository, &name));
-            let summary = repository.fork(&name, &destination)?;
+            let plan = repository.prepare_fork(&name, &destination)?;
+            print_fork_plan(&plan);
+            io::stdout().flush()?;
+            let summary = repository.materialize_fork(plan)?;
             println!(
                 "Running in {} ({}; {} cloned, {} copied)",
                 summary.destination.display(),
@@ -936,6 +944,21 @@ fn print_plan(plan: &agit::RewindPlan) {
     for change in &plan.changes {
         println!("  {:<8} {}", change.action, change.path);
     }
+}
+
+fn print_fork_plan(plan: &agit::ForkPlan) {
+    println!(
+        "Fork plan: {} files, {} directories, {} logical",
+        plan.files,
+        plan.directories,
+        human_bytes(plan.logical_bytes)
+    );
+    println!(
+        "Native CoW target: about {} ms; streaming fallback: about {} ms and up to {} copied",
+        plan.projected_native_cow_ms,
+        plan.projected_streaming_copy_ms,
+        human_bytes(plan.worst_case_copied_bytes)
+    );
 }
 
 fn print_shrink_plan(plan: &agit::shrink::ShrinkPlan) {

@@ -196,7 +196,9 @@ fn call_tool(
         "agit.fork" => {
             let name = required_string(arguments, "name")?;
             let destination = default_fork_destination(repository.root(), name);
-            serialize(repository.fork(name, &destination)?)
+            let plan = repository.prepare_fork(name, &destination)?;
+            let result = repository.materialize_fork(plan.clone())?;
+            Ok(json!({"plan": plan, "result": result}))
         }
         "agit.merge_plan" => {
             serialize(repository.merge(required_string(arguments, "fork")?, None, true)?)
@@ -378,7 +380,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "agit.fork",
-            "Create an isolated full-state workspace for an agent or risky task.",
+            "Create an isolated full-state workspace and return its pre-materialization cost plan.",
             json!({
                 "type": "object",
                 "properties": {

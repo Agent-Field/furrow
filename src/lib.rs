@@ -23,7 +23,7 @@ pub mod watcher;
 
 pub use gc::GcReport;
 pub use repository::{
-    AgitRepository, ClaimOutcome, CoordOutcome, DiffChange, DiffSummary, ForkRemoval, ForkSummary,
-    ForkUpdates, MergeOutcome, ReleaseOutcome, RepositoryStatus, RewindPlan, SnapshotSummary,
-    SyncDisposition, SyncPullOutcome,
+    AgitRepository, ClaimOutcome, CoordOutcome, DiffChange, DiffSummary, ForkPlan, ForkRemoval,
+    ForkSummary, ForkUpdates, MergeOutcome, ReleaseOutcome, RepositoryStatus, RewindPlan,
+    SnapshotSummary, SyncDisposition, SyncPullOutcome,
 };

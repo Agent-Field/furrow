@@ -2,7 +2,7 @@ use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::claims;
 use crate::coord;
-use crate::fork::{fork_workspace, ForkReport, ForkTier};
+use crate::fork::{fork_workspace_excluding, ForkReport, ForkTier};
 use crate::gc::{self, GcReport};
 use crate::merge::{self, MergeAction, MergeConflict};
 use crate::model::{
@@ -106,6 +106,22 @@ pub struct ForkSummary {
     pub hardlinked_files: u64,
     pub elapsed_ms: u64,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkPlan {
+    pub name: String,
+    pub destination: PathBuf,
+    pub base_snapshot: String,
+    pub files: u64,
+    pub directories: u64,
+    pub symlinks: u64,
+    pub fifos: u64,
+    pub skipped_special: u64,
+    pub logical_bytes: u64,
+    pub worst_case_copied_bytes: u64,
+    pub projected_native_cow_ms: u64,
+    pub projected_streaming_copy_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -633,7 +649,7 @@ impl AgitRepository {
         })
     }
 
-    pub fn fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkSummary> {
+    pub fn prepare_fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkPlan> {
         validate_fork_name(name)?;
         let destination = absolute_destination(destination)?;
         anyhow::ensure!(
@@ -650,7 +666,50 @@ impl AgitRepository {
             Some(format!("fork base: {name}")),
             SnapshotTrigger::ForkBase,
         )?;
-        let report = fork_workspace(&self.root, &destination)?;
+        let usage = self.open_path_index()?.usage()?;
+        let entries = usage
+            .files
+            .saturating_add(usage.directories)
+            .saturating_add(usage.symlinks)
+            .saturating_add(usage.fifos)
+            .saturating_add(usage.special);
+        let projected_native_cow_ms = ceiling_div(entries.saturating_mul(1_000), 100_000).max(10);
+        let projected_streaming_copy_ms = projected_native_cow_ms.saturating_add(ceiling_div(
+            usage.logical_bytes.saturating_mul(1_000),
+            250 * 1024 * 1024,
+        ));
+        Ok(ForkPlan {
+            name: name.to_owned(),
+            destination,
+            base_snapshot: id_hex(&base),
+            files: usage.files,
+            directories: usage.directories,
+            symlinks: usage.symlinks,
+            fifos: usage.fifos,
+            skipped_special: usage.special,
+            logical_bytes: usage.logical_bytes,
+            worst_case_copied_bytes: usage.logical_bytes,
+            projected_native_cow_ms,
+            projected_streaming_copy_ms,
+        })
+    }
+
+    pub fn materialize_fork(&mut self, plan: ForkPlan) -> anyhow::Result<ForkSummary> {
+        validate_fork_name(&plan.name)?;
+        let destination = absolute_destination(&plan.destination)?;
+        anyhow::ensure!(
+            destination == plan.destination,
+            "prepared fork destination changed"
+        );
+        anyhow::ensure!(
+            !destination.exists(),
+            "fork destination already exists: {}",
+            destination.display()
+        );
+        let base = parse_id(&plan.base_snapshot)?;
+        let _: Snapshot = self.store.read_struct(&base, ObjectKind::Snapshot)?;
+        let report =
+            fork_workspace_excluding(&self.root, &destination, &[Path::new(WORKSPACE_FILE)])?;
 
         // A copied workspace identity would alias two mutable directories onto
         // one timeline. It is transport metadata, not captured user state.
@@ -666,11 +725,16 @@ impl AgitRepository {
             );
         }
 
-        let summary = fork_summary(name, destination, base, fork_head, report);
-        let record_path = self.forks_dir().join(format!("{name}.json"));
+        let summary = fork_summary(&plan.name, destination, base, fork_head, report);
+        let record_path = self.forks_dir().join(format!("{}.json", plan.name));
         fs::create_dir_all(self.forks_dir())?;
         atomic_write(&record_path, &serde_json::to_vec_pretty(&summary)?)?;
         Ok(summary)
+    }
+
+    pub fn fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkSummary> {
+        let plan = self.prepare_fork(name, destination)?;
+        self.materialize_fork(plan)
     }
 
     pub fn forks(&self) -> anyhow::Result<Vec<ForkSummary>> {
@@ -815,7 +879,7 @@ impl AgitRepository {
             .prefix(".agit-merge-")
             .tempdir_in(scratch_parent)?;
         let scratch = scratch_owner.path().join("workspace");
-        fork_workspace(&self.root, &scratch)?;
+        fork_workspace_excluding(&self.root, &scratch, &[Path::new(WORKSPACE_FILE)])?;
         let scratch_identity = scratch.join(WORKSPACE_FILE);
         if scratch_identity.exists() {
             fs::remove_file(scratch_identity)?;
@@ -2155,6 +2219,10 @@ fn validate_fork_name(name: &str) -> anyhow::Result<()> {
     );
     anyhow::ensure!(name != "." && name != "..", "invalid fork name");
     Ok(())
+}
+
+fn ceiling_div(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(value % divisor != 0)
 }
 
 fn absolute_destination(destination: &Path) -> anyhow::Result<PathBuf> {
