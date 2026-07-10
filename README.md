@@ -87,6 +87,23 @@ agit sync --pull --bootstrap
 agit sync --pull
 ```
 
+## Agent Integration
+
+`agit mcp` is a local stdio MCP server. Bind it to one watched repository in any MCP-compatible coding agent:
+
+```json
+{
+  "mcpServers": {
+    "agit": {
+      "command": "agit",
+      "args": ["--repo", "/absolute/path/to/project", "mcp"]
+    }
+  }
+}
+```
+
+The server exposes status, timeline, snapshots, fork inspection/creation, merge planning, and rewind. Rewind planning and application are separate tools; application requires a full 64-character snapshot ID repeated as an explicit confirmation. MCP merge is planning-only because verification commands execute shell code; apply verified merges through the CLI.
+
 Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding is therefore itself rewindable.
 
 ## What Works Today
@@ -119,6 +136,8 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Reversible first-machine bootstrap and proven fast-forward materialization
 - Mandatory single-writer leases with stale-head and rollback rejection
 - Durable sibling preservation when machines edit concurrently or offline
+- MCP 2025-11-25 stdio server with bounded framing and negotiated lifecycle
+- Agent-safe snapshot, timeline, diff, fork, merge-plan, and confirmed rewind tools
 
 The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, exact reachability GC, and the first follow-only multi-machine sync backend. SSH/S3/WebDAV adapters, agent hooks, richer class-directed merge strategies, and teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
 

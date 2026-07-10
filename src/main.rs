@@ -138,6 +138,8 @@ enum Command {
         #[arg(long, requires = "pull")]
         bootstrap: bool,
     },
+    /// Serve agit tools to coding agents over MCP stdio.
+    Mcp,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -537,6 +539,10 @@ fn main() -> anyhow::Result<()> {
                     "local and remote working states diverged; neither side was overwritten"
                 );
             }
+        }
+        Command::Mcp => {
+            let repository = AgitRepository::open(&cli.repo)?;
+            agit::mcp::run(repository)?;
         }
     }
     Ok(())

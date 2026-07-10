@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod chunker;
 pub mod fork;
 pub mod gc;
+pub mod mcp;
 pub mod merge;
 pub mod model;
 pub mod path_index;

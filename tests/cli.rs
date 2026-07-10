@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -998,6 +999,86 @@ fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
             .windows(b"TOKEN=original".len())
             .any(|window| window == b"TOKEN=original"));
     }
+}
+
+#[test]
+fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
+    let fixture = Fixture::new();
+    let snapshot = fixture.watch();
+    fs::write(fixture.repo.join(".env"), b"TOKEN=changed\n").unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agit"))
+        .env("AGIT_DATA_DIR", &fixture.data)
+        .env("AGIT_NO_DAEMON", "1")
+        .arg("--repo")
+        .arg(&fixture.repo)
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let requests = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},
+                "clientInfo":{"name":"agit-test","version":"1"}
+            }
+        }),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":"status","method":"tools/call",
+            "params":{"name":"agit.status","arguments":{}}
+        }),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"agit.snapshot","arguments":{"message":"agent boundary"}}
+        }),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":6,"method":"tools/call",
+            "params":{"name":"agit.rewind_apply","arguments":{"snapshot":snapshot}}
+        }),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"name":"agit.unknown","arguments":{}}
+        }),
+    ];
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for request in requests {
+            serde_json::to_writer(&mut *stdin, &request).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 7);
+    assert_eq!(responses[0]["error"]["code"], -32002);
+    assert_eq!(responses[1]["result"]["protocolVersion"], "2025-11-25");
+    let tools = responses[2]["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "agit.rewind_plan"));
+    assert!(tools.iter().any(|tool| tool["name"] == "agit.fork"));
+    assert_eq!(responses[3]["id"], "status");
+    assert_eq!(responses[3]["result"]["isError"], false);
+    assert_eq!(responses[4]["result"]["isError"], false);
+    assert_eq!(responses[5]["result"]["isError"], true);
+    assert!(responses[5]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("confirm_snapshot"));
+    assert_eq!(responses[6]["error"]["code"], -32602);
 }
 
 fn git(repo: &Path, args: &[&str]) {
