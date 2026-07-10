@@ -24,6 +24,7 @@ pub mod watcher;
 pub use gc::GcReport;
 pub use repository::{
     AgitRepository, BisectCheck, BisectOutcome, ClaimOutcome, CoordOutcome, DiffChange,
-    DiffSummary, ForkPlan, ForkRemoval, ForkSummary, ForkUpdates, MergeOutcome, ReleaseOutcome,
-    RepositoryStatus, RewindPlan, SnapshotSummary, SyncDisposition, SyncPullOutcome,
+    DiffSummary, FidelityAspect, FidelityReport, ForkPlan, ForkRemoval, ForkSummary, ForkUpdates,
+    MergeOutcome, ReleaseOutcome, RepositoryStatus, RewindPlan, SnapshotSummary, SyncDisposition,
+    SyncPullOutcome,
 };

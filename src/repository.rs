@@ -108,6 +108,20 @@ pub struct RepositoryStatus {
     pub watcher_running: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FidelityAspect {
+    pub aspect: &'static str,
+    pub fidelity: &'static str,
+    pub detail: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FidelityReport {
+    pub platform: &'static str,
+    pub grade: &'static str,
+    pub aspects: Vec<FidelityAspect>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkSummary {
     pub name: String,
@@ -418,6 +432,80 @@ impl AgitRepository {
             physical_bytes: stats.physical_bytes,
             watcher_running: self.watcher_running(),
         })
+    }
+
+    pub fn fidelity(&self) -> FidelityReport {
+        FidelityReport {
+            platform: std::env::consts::OS,
+            grade: "partial",
+            aspects: vec![
+                FidelityAspect {
+                    aspect: "regular_file_bytes",
+                    fidelity: "exact",
+                    detail: "content-addressed chunks are verified before restoration",
+                },
+                FidelityAspect {
+                    aspect: "directories_and_symlinks",
+                    fidelity: "exact",
+                    detail: "directory structure and symlink target bytes are preserved",
+                },
+                FidelityAspect {
+                    aspect: "mode_and_mtime",
+                    fidelity: "exact",
+                    detail: "permission bits and nanosecond modification times are restored",
+                },
+                FidelityAspect {
+                    aspect: "extended_attributes",
+                    fidelity: "best_effort",
+                    detail: "readable xattrs are preserved; permission-denied namespaces are omitted",
+                },
+                FidelityAspect {
+                    aspect: "sqlite",
+                    fidelity: "exact_plus_logical",
+                    detail: "raw database/WAL/SHM bytes are exact; forced seals also attach a checked logical backup",
+                },
+                FidelityAspect {
+                    aspect: "hard_link_groups",
+                    fidelity: "not_preserved_by_rewind",
+                    detail: "forks retain link groups, but snapshot restoration currently materializes independent files",
+                },
+                FidelityAspect {
+                    aspect: "sparse_holes",
+                    fidelity: "not_preserved",
+                    detail: "file bytes are exact but sparse files currently restore densely",
+                },
+                FidelityAspect {
+                    aspect: "ownership",
+                    fidelity: "not_captured",
+                    detail: "uid and gid are not stored in the current snapshot schema",
+                },
+                FidelityAspect {
+                    aspect: "acls",
+                    fidelity: "best_effort",
+                    detail: "only ACL state exposed through readable extended attributes is retained",
+                },
+                FidelityAspect {
+                    aspect: "fifos",
+                    fidelity: "exact_entry",
+                    detail: "FIFO entries and modes are recreated; FIFOs have no retained content",
+                },
+                FidelityAspect {
+                    aspect: "sockets",
+                    fidelity: "marker_only",
+                    detail: "runtime sockets are recorded as markers and intentionally not recreated",
+                },
+                FidelityAspect {
+                    aspect: "device_nodes",
+                    fidelity: "not_captured",
+                    detail: "device nodes are skipped with a capture-time warning",
+                },
+                FidelityAspect {
+                    aspect: "external_git_storage",
+                    fidelity: "out_of_scope",
+                    detail: "Git object stores referenced outside the watched root are not captured",
+                },
+            ],
+        }
     }
 
     pub fn gc(&mut self, dry_run: bool) -> anyhow::Result<GcReport> {

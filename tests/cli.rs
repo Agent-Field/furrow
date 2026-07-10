@@ -126,6 +126,33 @@ fn path_rewind_restores_ignored_secret_without_touching_new_work() {
 }
 
 #[test]
+fn status_fidelity_reports_exact_and_known_partial_capture_contracts() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let output = fixture
+        .agit()
+        .args(["--json", "status", "--fidelity"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(output["fidelity"]["grade"], "partial");
+    assert!(output["status"]["head"].as_str().unwrap().len() == 64);
+    let aspects = output["fidelity"]["aspects"].as_array().unwrap();
+    assert!(aspects.iter().any(|aspect| {
+        aspect["aspect"] == "regular_file_bytes" && aspect["fidelity"] == "exact"
+    }));
+    assert!(aspects.iter().any(|aspect| {
+        aspect["aspect"] == "hard_link_groups" && aspect["fidelity"] == "not_preserved_by_rewind"
+    }));
+    assert!(aspects.iter().any(|aspect| {
+        aspect["aspect"] == "sparse_holes" && aspect["fidelity"] == "not_preserved"
+    }));
+}
+
+#[test]
 fn try_auto_protects_an_unwatched_workspace_and_preserves_the_command_exit_code() {
     let fixture = Fixture::new();
     let output = fixture
@@ -1573,7 +1600,7 @@ fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
         serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
         serde_json::json!({
             "jsonrpc":"2.0","id":"status","method":"tools/call",
-            "params":{"name":"agit.status","arguments":{}}
+            "params":{"name":"agit.status","arguments":{"fidelity":true}}
         }),
         serde_json::json!({
             "jsonrpc":"2.0","id":5,"method":"tools/call",
@@ -1618,6 +1645,10 @@ fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
     assert!(tools.iter().any(|tool| tool["name"] == "agit.fork_updates"));
     assert_eq!(responses[3]["id"], "status");
     assert_eq!(responses[3]["result"]["isError"], false);
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["fidelity"]["grade"],
+        "partial"
+    );
     assert_eq!(responses[4]["result"]["isError"], false);
     assert_eq!(responses[5]["result"]["isError"], true);
     assert!(responses[5]["result"]["content"][0]["text"]

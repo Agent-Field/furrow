@@ -59,6 +59,9 @@ agit bisect -- cargo test
 # Browse protected states.
 agit timeline
 
+# Inspect the exact, best-effort, and currently unsupported fidelity aspects.
+agit status --fidelity
+
 # Preview and recover one ignored secret without touching newer work.
 agit rewind <snapshot> --paths .env --dry-run
 agit rewind <snapshot> --paths .env
@@ -158,6 +161,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Catalog reconstruction after deleting the SQLite index
 - Recovery from truncated pack tails
 - Human and JSON timelines
+- Human, JSON, and MCP fidelity reporting with explicit partial-grade limitations
 - Full and path-scoped dry-run/rewind
 - Automatic recovery when `git clean -fdx` removes `.agit/`
 - Symlink, executable mode, mtime, and extended-attribute restoration

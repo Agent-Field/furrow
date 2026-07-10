@@ -173,7 +173,14 @@ fn call_tool(
 ) -> anyhow::Result<Value> {
     validate_argument_keys(name, arguments)?;
     match name {
-        "agit.status" => serialize(repository.status()?),
+        "agit.status" => {
+            let status = repository.status()?;
+            if optional_bool(arguments, "fidelity")?.unwrap_or(false) {
+                Ok(json!({"status": status, "fidelity": repository.fidelity()}))
+            } else {
+                serialize(status)
+            }
+        }
         "agit.timeline" => {
             let limit = optional_u64(arguments, "limit")?.unwrap_or(20);
             anyhow::ensure!(
@@ -311,7 +318,7 @@ fn tool_names() -> &'static [&'static str] {
 
 fn validate_argument_keys(name: &str, arguments: &Map<String, Value>) -> anyhow::Result<()> {
     let allowed: &[&str] = match name {
-        "agit.status" => &[],
+        "agit.status" => &["fidelity"],
         "agit.timeline" => &["limit"],
         "agit.snapshot" => &["message"],
         "agit.diff" => &["target"],
@@ -339,8 +346,12 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "agit.status",
-            "Inspect workspace protection, store size, and watcher health.",
-            json!({"type": "object", "additionalProperties": false}),
+            "Inspect workspace protection, store health, and optional capture fidelity.",
+            json!({
+                "type": "object",
+                "properties": {"fidelity": {"type": "boolean", "default": false}},
+                "additionalProperties": false
+            }),
             true,
             false,
         ),

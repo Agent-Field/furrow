@@ -66,8 +66,12 @@ enum Command {
         #[arg(long)]
         sqlite_consistent: bool,
     },
-    /// Show workspace protection and store status.
-    Status,
+    /// Show workspace protection, store health, and optional fidelity guarantees.
+    Status {
+        /// Enumerate what rewind preserves exactly, approximately, or not at all.
+        #[arg(long)]
+        fidelity: bool,
+    },
     /// Create an isolated full-state workspace, optionally running a command inside it.
     Fork {
         /// Stable name used by `agit forks` and as the default directory name.
@@ -367,11 +371,18 @@ fn main() -> anyhow::Result<()> {
                 println!("Undo snapshot: {}", id_hex(&pre));
             }
         }
-        Command::Status => {
+        Command::Status { fidelity } => {
             let repository = AgitRepository::open(&cli.repo)?;
             let status = repository.status()?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
+                if fidelity {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": status, "fidelity": repository.fidelity()})
+                    );
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                }
             } else {
                 println!("Workspace: {}", status.workspace.display());
                 println!("Store:     {}", status.store.display());
@@ -389,6 +400,16 @@ fn main() -> anyhow::Result<()> {
                         "stopped"
                     }
                 );
+                if fidelity {
+                    let report = repository.fidelity();
+                    println!("Fidelity:  {} ({})", report.grade, report.platform);
+                    for aspect in report.aspects {
+                        println!(
+                            "  {:<28} {:<24} {}",
+                            aspect.aspect, aspect.fidelity, aspect.detail
+                        );
+                    }
+                }
             }
         }
         Command::Fork {
