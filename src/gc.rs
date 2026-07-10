@@ -926,4 +926,230 @@ mod tests {
         );
         assert_eq!(byte_mask(now, 0, true), ALL_CLASS_MASK);
     }
+
+    #[test]
+    fn gc_preserves_fork_machine_pin_and_shared_roots_across_index_recovery() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store_root = temporary.path().to_owned();
+        let mut store = ObjectStore::open(store_root.clone()).unwrap();
+        for (workspace, root) in [
+            ("main", b"/main".as_slice()),
+            ("fork", b"/fork".as_slice()),
+            ("machine", b"/machine".as_slice()),
+        ] {
+            store.ensure_workspace(workspace, root).unwrap();
+        }
+        let week = 7 * DAY_SECONDS;
+
+        let graph = |store: &ObjectStore,
+                     byte: u8,
+                     class: ContentClass,
+                     sealed_at: i64,
+                     parent: Option<ObjectId>| {
+            let chunk = store.put_bytes(ObjectKind::Chunk, &[byte; 64]).unwrap();
+            let blob = store
+                .put_struct(
+                    ObjectKind::Blob,
+                    &Blob {
+                        chunks: vec![ChunkRef { id: chunk, len: 64 }],
+                        total_len: 64,
+                    },
+                )
+                .unwrap();
+            let tree = store
+                .put_struct(
+                    ObjectKind::Tree,
+                    &Tree {
+                        entries: vec![TreeEntry {
+                            name: vec![b'a' + byte],
+                            kind: EntryKind::File,
+                            target: Some(blob),
+                            link_target: Vec::new(),
+                            mode: 0o100644,
+                            size: 64,
+                            mtime_secs: sealed_at,
+                            mtime_nanos: 0,
+                            xattrs: None,
+                            class,
+                        }],
+                        pages: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let snapshot = store
+                .put_struct(
+                    ObjectKind::Snapshot,
+                    &Snapshot {
+                        sealed_at_secs: sealed_at,
+                        ..snapshot(tree, parent)
+                    },
+                )
+                .unwrap();
+            (snapshot, chunk)
+        };
+
+        let abandoned = graph(&store, 1, ContentClass::Scratch, week, None);
+        store
+            .publish_snapshot("main", abandoned.0, week, None, SnapshotTrigger::Manual)
+            .unwrap();
+        let pinned = graph(
+            &store,
+            2,
+            ContentClass::Scratch,
+            week + 1,
+            Some(abandoned.0),
+        );
+        store
+            .publish_snapshot("main", pinned.0, week + 1, None, SnapshotTrigger::Manual)
+            .unwrap();
+        let main_head = graph(&store, 3, ContentClass::Source, week + 2, Some(pinned.0));
+        store
+            .publish_snapshot("main", main_head.0, week + 2, None, SnapshotTrigger::Manual)
+            .unwrap();
+        store.pin_snapshot("main", pinned.0).unwrap();
+
+        let fork_head = graph(&store, 4, ContentClass::Scratch, week, None);
+        store
+            .publish_snapshot("fork", fork_head.0, week, None, SnapshotTrigger::Manual)
+            .unwrap();
+        let machine_head = graph(&store, 5, ContentClass::Scratch, week, None);
+        store
+            .publish_snapshot(
+                "machine",
+                machine_head.0,
+                week,
+                None,
+                SnapshotTrigger::Manual,
+            )
+            .unwrap();
+
+        let shared_chunk = store
+            .put_bytes(ObjectKind::Chunk, b"shared protected bytes")
+            .unwrap();
+        let shared_blob = store
+            .put_struct(
+                ObjectKind::Blob,
+                &Blob {
+                    chunks: vec![ChunkRef {
+                        id: shared_chunk,
+                        len: 22,
+                    }],
+                    total_len: 22,
+                },
+            )
+            .unwrap();
+        let shared_tree = |store: &ObjectStore, class| {
+            store
+                .put_struct(
+                    ObjectKind::Tree,
+                    &Tree {
+                        entries: vec![TreeEntry {
+                            name: b"shared".to_vec(),
+                            kind: EntryKind::File,
+                            target: Some(shared_blob),
+                            link_target: Vec::new(),
+                            mode: 0o100644,
+                            size: 22,
+                            mtime_secs: week,
+                            mtime_nanos: 0,
+                            xattrs: None,
+                            class,
+                        }],
+                        pages: Vec::new(),
+                    },
+                )
+                .unwrap()
+        };
+        let expired_shared = store
+            .put_struct(
+                ObjectKind::Snapshot,
+                &Snapshot {
+                    sealed_at_secs: 2 * week,
+                    ..snapshot(
+                        shared_tree(&store, ContentClass::Scratch),
+                        Some(main_head.0),
+                    )
+                },
+            )
+            .unwrap();
+        store
+            .publish_snapshot(
+                "main",
+                expired_shared,
+                2 * week,
+                None,
+                SnapshotTrigger::Manual,
+            )
+            .unwrap();
+        let protected_shared = store
+            .put_struct(
+                ObjectKind::Snapshot,
+                &Snapshot {
+                    sealed_at_secs: 3 * week,
+                    ..snapshot(
+                        shared_tree(&store, ContentClass::Source),
+                        Some(expired_shared),
+                    )
+                },
+            )
+            .unwrap();
+        store
+            .publish_snapshot(
+                "main",
+                protected_shared,
+                3 * week,
+                None,
+                SnapshotTrigger::Manual,
+            )
+            .unwrap();
+
+        let now = 200 * DAY_SECONDS;
+        collect_locked_at(&mut store, false, now).unwrap();
+        assert!(store.read_bytes(&abandoned.1, ObjectKind::Chunk).is_err());
+        for chunk in [
+            pinned.1,
+            main_head.1,
+            fork_head.1,
+            machine_head.1,
+            shared_chunk,
+        ] {
+            assert!(store.read_bytes(&chunk, ObjectKind::Chunk).is_ok());
+        }
+
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(store_root.join(format!("catalog.sqlite3{suffix}")));
+        }
+        for workspace in ["main", "fork", "machine"] {
+            let _ = fs::remove_file(
+                store_root
+                    .join("workspaces")
+                    .join(workspace)
+                    .join("refs.index"),
+            );
+        }
+        let mut recovered = ObjectStore::open(store_root).unwrap();
+        for (workspace, root) in [
+            ("main", b"/main".as_slice()),
+            ("fork", b"/fork".as_slice()),
+            ("machine", b"/machine".as_slice()),
+        ] {
+            recovered.ensure_workspace(workspace, root).unwrap();
+            assert!(!recovered.timeline(workspace, 10).unwrap().is_empty());
+        }
+        for chunk in [pinned.1, fork_head.1, machine_head.1, shared_chunk] {
+            assert!(recovered.read_bytes(&chunk, ObjectKind::Chunk).is_ok());
+        }
+
+        recovered.unpin_snapshot("main", &pinned.0).unwrap();
+        recovered.purge_workspace("fork").unwrap();
+        recovered.purge_workspace("machine").unwrap();
+        collect_locked_at(&mut recovered, false, now).unwrap();
+        for chunk in [pinned.1, fork_head.1, machine_head.1] {
+            assert!(recovered.read_bytes(&chunk, ObjectKind::Chunk).is_err());
+        }
+        assert!(recovered
+            .read_bytes(&shared_chunk, ObjectKind::Chunk)
+            .is_ok());
+    }
 }
