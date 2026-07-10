@@ -102,12 +102,18 @@ pub enum SnapshotTrigger {
     Watcher,
     PreRewind,
     ForkBase,
+    AgentRun,
+    MergeSource,
+    PreMerge,
+    Merge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Snapshot {
     pub root_tree: ObjectId,
     pub parent: Option<ObjectId>,
+    #[serde(default)]
+    pub merge_parents: Vec<ObjectId>,
     pub sealed_at_secs: i64,
     pub sealed_at_nanos: u32,
     pub quality: SealQuality,

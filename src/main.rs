@@ -73,6 +73,24 @@ enum Command {
     },
     /// List full-state workspace forks created from this repository.
     Forks,
+    /// Run any agent or command inside a new isolated full-state fork.
+    Run {
+        name: String,
+        #[arg(long)]
+        destination: Option<PathBuf>,
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
+    /// Three-way merge a fork after verifying the result in a scratch workspace.
+    Merge {
+        fork: String,
+        /// Project verification command executed through /bin/sh in the scratch workspace.
+        #[arg(long)]
+        check: Option<String>,
+        /// Plan and report changes/conflicts without materializing or checking them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Stop watching this repository.
     Forget {
         #[arg(long)]
@@ -280,6 +298,86 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+        Command::Run {
+            name,
+            destination,
+            command,
+        } => {
+            anyhow::ensure!(!cli.json, "--json cannot be combined with `agit run`");
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let destination =
+                destination.unwrap_or_else(|| default_fork_destination(&repository, &name));
+            let summary = repository.fork(&name, &destination)?;
+            println!(
+                "Running in {} ({}; {} cloned, {} copied)",
+                summary.destination.display(),
+                summary.tier,
+                summary.cloned_bytes,
+                summary.copied_bytes
+            );
+            let (program, arguments) = command
+                .split_first()
+                .context("`agit run` requires a command after --")?;
+            let status = std::process::Command::new(program)
+                .args(arguments)
+                .current_dir(&summary.destination)
+                .env("AGIT_FORK_NAME", &summary.name)
+                .env("AGIT_FORK_BASE", &summary.base_snapshot)
+                .status()
+                .with_context(|| format!("run {:?} in fork", program))?;
+            let mut fork_repository = AgitRepository::open(&summary.destination)?;
+            let head = fork_repository.snapshot(
+                Some(format!("command completed in {}", summary.name)),
+                SnapshotTrigger::AgentRun,
+            )?;
+            println!("Fork head {}", &id_hex(&head)[..12]);
+            println!("Source workspace was not modified");
+            println!(
+                "Merge with: agit merge {} --check '<command>'",
+                summary.name
+            );
+            anyhow::ensure!(status.success(), "fork command exited with {status}");
+        }
+        Command::Merge {
+            fork,
+            check,
+            dry_run,
+        } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let outcome = repository.merge(&fork, check.as_deref(), dry_run)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!(
+                    "Merge {}: {} changes, {} conflicts",
+                    outcome.fork,
+                    outcome.changes,
+                    outcome.conflicts.len()
+                );
+                for conflict in &outcome.conflicts {
+                    println!(
+                        "  conflict {:<16} {}",
+                        conflict.kind,
+                        String::from_utf8_lossy(&conflict.path)
+                    );
+                }
+                if let Some(snapshot) = &outcome.result_snapshot {
+                    println!("Merged snapshot {}", &snapshot[..12]);
+                    if let Some(output) = &outcome.check_output {
+                        if !output.is_empty() {
+                            println!("Check output:\n{output}");
+                        }
+                    }
+                } else if dry_run && outcome.conflicts.is_empty() {
+                    println!("Dry run: source workspace was not changed");
+                }
+            }
+            anyhow::ensure!(
+                outcome.conflicts.is_empty(),
+                "merge stopped with {} conflict(s)",
+                outcome.conflicts.len()
+            );
         }
         Command::Forget { purge } => {
             AgitRepository::open(&cli.repo)?.forget(purge)?;

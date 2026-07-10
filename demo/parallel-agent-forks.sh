@@ -74,4 +74,19 @@ grep -q 'local-only' "$ALPHA/.env" && grep -q 'local-only' "$BETA/.env" \
 step "List the parallel workspaces"
 "$BIN" --repo "$REPO" forks
 
+step "Verification-gated merge of alpha"
+"$BIN" --repo "$REPO" merge alpha \
+  --check "grep -q 'alpha implementation' app.js && test -f .cache/build/alpha"
+grep -q 'alpha implementation' "$REPO/app.js" \
+  && ok "alpha converged only after its check passed" || fail "alpha merge missing"
+
+step "Overlapping beta edit stops as an explicit conflict"
+if "$BIN" --repo "$REPO" merge beta --dry-run; then
+  fail "beta should conflict with alpha on app.js"
+else
+  ok "beta conflict was reported without mutating the source"
+fi
+[[ ! -e "$REPO/migration.sql" ]] \
+  && ok "no partial beta changes landed" || fail "conflicted merge partially applied"
+
 printf '\n%bDemo complete.%b Workspaces retained at %s\n' "$green" "$reset" "$DEMO_ROOT"

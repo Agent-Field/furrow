@@ -2,6 +2,7 @@ use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::fork::{fork_workspace, ForkReport, ForkTier};
 use crate::gc::{self, GcReport};
+use crate::merge::{self, MergeAction, MergeConflict};
 use crate::model::{
     id_hex, parse_id, Blob, ChunkRef, EntryKind, ObjectId, ObjectKind, SealQuality, Snapshot,
     SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
@@ -86,6 +87,19 @@ pub struct ForkSummary {
     pub hardlinked_files: u64,
     pub elapsed_ms: u64,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeOutcome {
+    pub fork: String,
+    pub base_snapshot: String,
+    pub ours_snapshot: String,
+    pub theirs_snapshot: String,
+    pub result_snapshot: Option<String>,
+    pub changes: usize,
+    pub conflicts: Vec<MergeConflict>,
+    pub check: Option<String>,
+    pub check_output: Option<String>,
 }
 
 #[derive(Clone)]
@@ -188,7 +202,7 @@ impl AgitRepository {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<ObjectId> {
-        self.snapshot_internal(label, trigger, None)
+        self.snapshot_internal(label, trigger, None, Vec::new())
     }
 
     pub fn snapshot_changed_paths(
@@ -197,7 +211,7 @@ impl AgitRepository {
         trigger: SnapshotTrigger,
         changed_paths: &[PathBuf],
     ) -> anyhow::Result<ObjectId> {
-        self.snapshot_internal(label, trigger, Some(changed_paths))
+        self.snapshot_internal(label, trigger, Some(changed_paths), Vec::new())
     }
 
     fn snapshot_internal(
@@ -205,6 +219,7 @@ impl AgitRepository {
         label: Option<String>,
         trigger: SnapshotTrigger,
         changed_paths: Option<&[PathBuf]>,
+        merge_parents: Vec<ObjectId>,
     ) -> anyhow::Result<ObjectId> {
         let _maintenance = self.store.acquire_maintenance_shared()?;
         let parent = self.store.workspace_head(&self.workspace_id)?;
@@ -224,6 +239,7 @@ impl AgitRepository {
         let snapshot = Snapshot {
             root_tree,
             parent,
+            merge_parents,
             sealed_at_secs: secs,
             sealed_at_nanos: nanos,
             quality: SealQuality::Quiescent,
@@ -337,8 +353,146 @@ impl AgitRepository {
         Ok(forks)
     }
 
+    pub fn merge(
+        &mut self,
+        fork_name: &str,
+        check: Option<&str>,
+        dry_run: bool,
+    ) -> anyhow::Result<MergeOutcome> {
+        let mutation = self.acquire_mutation_lock()?;
+        let fork = self
+            .forks()?
+            .into_iter()
+            .find(|fork| fork.name == fork_name)
+            .with_context(|| format!("fork `{fork_name}` was not found"))?;
+        anyhow::ensure!(fork.destination.exists(), "fork directory no longer exists");
+
+        let mut fork_repository = AgitRepository::open(&fork.destination)?;
+        let theirs = fork_repository.snapshot(
+            Some(format!("merge source for {fork_name}")),
+            SnapshotTrigger::MergeSource,
+        )?;
+        let ours = self.snapshot(
+            Some(format!("before merge from {fork_name}")),
+            SnapshotTrigger::PreMerge,
+        )?;
+        let base = parse_id(&fork.base_snapshot)?;
+        let base_entries = self.snapshot_entry_map(&base)?;
+        let ours_entries = self.snapshot_entry_map(&ours)?;
+        let theirs_entries = self.snapshot_entry_map(&theirs)?;
+        let merge_plan = merge::plan(&base_entries, &ours_entries, &theirs_entries);
+        let mut outcome = MergeOutcome {
+            fork: fork_name.to_owned(),
+            base_snapshot: id_hex(&base),
+            ours_snapshot: id_hex(&ours),
+            theirs_snapshot: id_hex(&theirs),
+            result_snapshot: None,
+            changes: merge_plan.changes.len(),
+            conflicts: merge_plan.conflicts,
+            check: check.map(str::to_owned),
+            check_output: None,
+        };
+        if dry_run || !outcome.conflicts.is_empty() {
+            FileExt::unlock(&mutation)?;
+            return Ok(outcome);
+        }
+        let check = check.context("merge requires --check <command>")?;
+        anyhow::ensure!(
+            !check.trim().is_empty(),
+            "merge check command cannot be empty"
+        );
+
+        let (rewind_plan, target_entries) = merge_rewind_plan(&ours_entries, &merge_plan.changes);
+        let scratch_parent = self.root.parent().unwrap_or_else(|| Path::new("."));
+        let scratch_owner = tempfile::Builder::new()
+            .prefix(".agit-merge-")
+            .tempdir_in(scratch_parent)?;
+        let scratch = scratch_owner.path().join("workspace");
+        fork_workspace(&self.root, &scratch)?;
+        let scratch_identity = scratch.join(WORKSPACE_FILE);
+        if scratch_identity.exists() {
+            fs::remove_file(scratch_identity)?;
+        }
+        self.apply_plan_at(&scratch, &target_entries, &rewind_plan, &[])?;
+        let verification = std::process::Command::new("/bin/sh")
+            .args(["-c", check])
+            .current_dir(&scratch)
+            .output()
+            .with_context(|| format!("run merge check `{check}`"))?;
+        let check_output = command_output(&verification.stdout, &verification.stderr);
+        anyhow::ensure!(
+            verification.status.success(),
+            "merge check failed with {}\n{}",
+            verification.status,
+            check_output
+        );
+        outcome.check_output = Some(check_output);
+
+        let ours_snapshot: Snapshot = self.store.read_struct(&ours, ObjectKind::Snapshot)?;
+        let current_root = self.capture_root_retry()?;
+        anyhow::ensure!(
+            current_root == ours_snapshot.root_tree,
+            "source workspace changed while the merge was being verified; retry"
+        );
+        self.write_restore_intent(&RestoreIntent {
+            pre_snapshot: ours,
+            target_snapshot: theirs,
+            paths: Vec::new(),
+        })?;
+
+        let applied = self
+            .apply_plan_at(&self.root, &target_entries, &rewind_plan, &[])
+            .and_then(|_| {
+                self.invalidate_path_index()?;
+                self.snapshot_internal(
+                    Some(format!("merged fork {fork_name}")),
+                    SnapshotTrigger::Merge,
+                    None,
+                    vec![ours, theirs],
+                )
+            });
+        let result = match applied {
+            Ok(result) => result,
+            Err(error) => {
+                let rollback_plan = self.plan_rewind(&ours, &[])?;
+                let rollback_entries =
+                    self.entries_for_plan(&ours_snapshot.root_tree, &rollback_plan)?;
+                self.apply_plan_at(&self.root, &rollback_entries, &rollback_plan, &[])
+                    .context("merge failed and rollback also failed")?;
+                self.invalidate_path_index()?;
+                self.clear_restore_intent()?;
+                FileExt::unlock(&mutation)?;
+                return Err(error.context("merge aborted; source workspace was restored"));
+            }
+        };
+        self.clear_restore_intent()?;
+        FileExt::unlock(&mutation)?;
+        outcome.result_snapshot = Some(id_hex(&result));
+        Ok(outcome)
+    }
+
     fn forks_dir(&self) -> PathBuf {
         self.workspace_data_dir().join("forks")
+    }
+
+    fn snapshot_entry_map(
+        &self,
+        snapshot_id: &ObjectId,
+    ) -> anyhow::Result<BTreeMap<Vec<u8>, TreeEntry>> {
+        let snapshot: Snapshot = self.store.read_struct(snapshot_id, ObjectKind::Snapshot)?;
+        let mut entries: BTreeMap<Vec<u8>, TreeEntry> = self
+            .flatten_tree(&snapshot.root_tree)?
+            .into_iter()
+            .map(|(path, entry)| (path, entry.entry))
+            .collect();
+        // The pointer file is already excluded from snapshots; the containing
+        // directory mtime is likewise transport metadata, while its policy and
+        // hook children remain ordinary merge inputs.
+        entries.remove(b".agit".as_slice());
+        // Git remains canonical for repository history. Fork refs, indexes,
+        // worktree locks, and object-store mutations are never merged as files.
+        entries.retain(|path, _| path != b".git" && !path.starts_with(b".git/"));
+        Ok(entries)
     }
 
     fn snapshots_match_fork(
@@ -436,7 +590,7 @@ impl AgitRepository {
         })?;
 
         let result = self
-            .apply_rewind(&target_entries, &plan, paths)
+            .apply_plan_at(&self.root, &target_entries, &plan, paths)
             .and_then(|_| {
                 if sqlite_consistent {
                     self.restore_sqlite_backups(&target_snapshot.sqlite_backups, paths)?;
@@ -447,7 +601,7 @@ impl AgitRepository {
             let pre_snapshot: Snapshot = self.store.read_struct(&pre, ObjectKind::Snapshot)?;
             let rollback_plan = self.plan_rewind(&pre, paths)?;
             let pre_entries = self.entries_for_plan(&pre_snapshot.root_tree, &rollback_plan)?;
-            self.apply_rewind(&pre_entries, &rollback_plan, paths)
+            self.apply_plan_at(&self.root, &pre_entries, &rollback_plan, paths)
                 .context("rewind failed and rollback also failed")?;
             self.invalidate_path_index()?;
             self.clear_restore_intent()?;
@@ -1128,8 +1282,9 @@ impl AgitRepository {
         })
     }
 
-    fn apply_rewind(
+    fn apply_plan_at(
         &self,
+        root: &Path,
         target: &BTreeMap<Vec<u8>, FlatEntry>,
         plan: &RewindPlan,
         selected_paths: &[PathBuf],
@@ -1149,8 +1304,8 @@ impl AgitRepository {
             {
                 continue;
             }
-            let destination = safe_join(&self.root, path)?;
-            ensure_safe_parent(&self.root, &destination)?;
+            let destination = safe_join(root, path)?;
+            ensure_safe_parent(root, &destination)?;
             if let Ok(metadata) = destination.symlink_metadata() {
                 if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
                     remove_path(&destination)?;
@@ -1167,8 +1322,8 @@ impl AgitRepository {
             {
                 continue;
             }
-            let destination = safe_join(&self.root, path)?;
-            ensure_safe_parent(&self.root, &destination)?;
+            let destination = safe_join(root, path)?;
+            ensure_safe_parent(root, &destination)?;
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -1221,8 +1376,8 @@ impl AgitRepository {
         removals.sort_by_key(|path| std::cmp::Reverse(path.len()));
         for path in removals {
             if selected(&path, selected_paths) {
-                let destination = safe_join(&self.root, &path)?;
-                ensure_safe_parent(&self.root, &destination)?;
+                let destination = safe_join(root, &path)?;
+                ensure_safe_parent(root, &destination)?;
                 if destination.symlink_metadata().is_ok() {
                     remove_path(&destination)?;
                 }
@@ -1238,7 +1393,7 @@ impl AgitRepository {
             {
                 continue;
             }
-            let destination = safe_join(&self.root, path)?;
+            let destination = safe_join(root, path)?;
             let mtime = FileTime::from_unix_time(flat.entry.mtime_secs, flat.entry.mtime_nanos);
             filetime::set_file_mtime(destination, mtime)?;
         }
@@ -1329,7 +1484,7 @@ impl AgitRepository {
             .collect();
         let plan = self.plan_rewind(&intent.pre_snapshot, &paths)?;
         let entries = self.entries_for_plan(&snapshot.root_tree, &plan)?;
-        self.apply_rewind(&entries, &plan, &paths)?;
+        self.apply_plan_at(&self.root, &entries, &plan, &paths)?;
         self.invalidate_path_index()?;
         self.clear_restore_intent()?;
         FileExt::unlock(&lock)?;
@@ -1472,6 +1627,56 @@ fn fork_summary(
         elapsed_ms: report.elapsed.as_millis().min(u64::MAX as u128) as u64,
         created_at: now().0,
     }
+}
+
+fn merge_rewind_plan(
+    ours: &BTreeMap<Vec<u8>, TreeEntry>,
+    changes: &[merge::MergeChange],
+) -> (RewindPlan, BTreeMap<Vec<u8>, FlatEntry>) {
+    let mut rewind_changes = Vec::with_capacity(changes.len());
+    let mut target = BTreeMap::new();
+    for change in changes {
+        let (action, entry) = match &change.action {
+            MergeAction::Set(entry) => (
+                if ours.contains_key(&change.path) {
+                    "replace"
+                } else {
+                    "restore"
+                },
+                Some(entry.clone()),
+            ),
+            MergeAction::Remove => ("remove", None),
+        };
+        rewind_changes.push(RewindChange {
+            path: display_relative(&change.path),
+            action,
+            raw_path: change.path.clone(),
+        });
+        if let Some(entry) = entry {
+            target.insert(change.path.clone(), FlatEntry { entry });
+        }
+    }
+    (
+        RewindPlan {
+            target: "merge".to_owned(),
+            changes: rewind_changes,
+        },
+        target,
+    )
+}
+
+fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    const LIMIT: usize = 16 * 1024;
+    let mut combined = Vec::with_capacity(stdout.len().saturating_add(stderr.len()).min(LIMIT));
+    combined.extend_from_slice(stdout);
+    if !stdout.is_empty() && !stderr.is_empty() {
+        combined.push(b'\n');
+    }
+    combined.extend_from_slice(stderr);
+    if combined.len() > LIMIT {
+        combined.drain(..combined.len() - LIMIT);
+    }
+    String::from_utf8_lossy(&combined).trim().to_owned()
 }
 
 fn validate_name(name: &[u8]) -> anyhow::Result<()> {

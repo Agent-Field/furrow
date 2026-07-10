@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod chunker;
 pub mod fork;
 pub mod gc;
+pub mod merge;
 pub mod model;
 pub mod path_index;
 pub mod refs;
@@ -13,4 +14,6 @@ pub mod tree;
 pub mod watcher;
 
 pub use gc::GcReport;
-pub use repository::{AgitRepository, ForkSummary, RepositoryStatus, RewindPlan, SnapshotSummary};
+pub use repository::{
+    AgitRepository, ForkSummary, MergeOutcome, RepositoryStatus, RewindPlan, SnapshotSummary,
+};

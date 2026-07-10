@@ -56,10 +56,17 @@ agit rewind <snapshot>
 agit rewind <snapshot> --sqlite-consistent
 
 # Give an agent or risky command an isolated copy of the complete dirty state.
-agit fork auth-refactor -- claude
+agit run auth-refactor -- claude
 
 # Inspect active parallel workspaces and their actual clone/copy cost.
 agit forks
+
+# Converge only after the result passes the project's real verification command.
+agit merge auth-refactor --check "cargo test --all"
+
+# Reclaim bytes no retained workspace can reach.
+agit gc --dry-run
+agit gc
 ```
 
 Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding is therefore itself rewindable.
@@ -83,8 +90,14 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Native APFS clonefile and Linux FICLONE warm workspace forks
 - Streaming-copy fallback with disclosed physical copy cost
 - Independent fork timelines, full-state consistency verification, and command launch
+- Three-way full-state merge with explicit conflicts and scratch-fork verification
+- Crash-safe exact reachability GC with shared-chunk preservation
+- 64 KiB paged Merkle directories and disk-backed delta path indexing
+- Checkpointed pack startup and O(1) reference-log head/append
 
-The current implementation covers the Phase 0 recovery proof and the first Phase 2 warm-fork path from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md). Agent hooks, merge, multi-machine sync, and teleport remain subsequent milestones.
+The current implementation covers the recovery engine, continuous protection, warm forks, the process wrapper, exact merge planning with verification gating, and exact reachability GC. Agent hooks, richer class-directed merge strategies, multi-machine sync, and teleport remain subsequent milestones from [the system specification](DISTRIBUTED_AGENT_WORKSPACE_SPEC.md).
+
+On a local APFS benchmark with one flat directory containing 50,000 files, a one-file watcher delta sealed in 0.165-0.170 seconds. The path index is disk-backed; the process does not retain a repository-sized in-memory file map.
 
 ## Safety Model
 

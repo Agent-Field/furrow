@@ -696,6 +696,10 @@ fn trigger_name(trigger: &SnapshotTrigger) -> &'static str {
         SnapshotTrigger::Watcher => "watcher",
         SnapshotTrigger::PreRewind => "pre_rewind",
         SnapshotTrigger::ForkBase => "fork_base",
+        SnapshotTrigger::AgentRun => "agent_run",
+        SnapshotTrigger::MergeSource => "merge_source",
+        SnapshotTrigger::PreMerge => "pre_merge",
+        SnapshotTrigger::Merge => "merge",
     }
 }
 

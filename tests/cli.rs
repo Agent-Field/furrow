@@ -405,7 +405,7 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
     let command_destination = fixture._temp.path().join("agent-command");
     fixture
         .agit()
-        .args(["fork", "agent-command", "--destination"])
+        .args(["run", "agent-command", "--destination"])
         .arg(&command_destination)
         .args(["--", "sh", "-c", "printf isolated > command-result.txt"])
         .assert()
@@ -415,6 +415,94 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
         b"isolated"
     );
     assert!(!fixture.repo.join("command-result.txt").exists());
+}
+
+#[test]
+fn verified_merge_converges_independent_source_and_fork_changes() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let fork = fixture._temp.path().join("merge-agent");
+    fixture
+        .agit()
+        .args(["fork", "merge-agent", "--destination"])
+        .arg(&fork)
+        .assert()
+        .success();
+
+    fs::write(fixture.repo.join("app.txt"), b"source-only work\n").unwrap();
+    fs::write(fork.join("agent-result.txt"), b"fork-only work\n").unwrap();
+    fixture
+        .agit()
+        .args([
+            "merge",
+            "merge-agent",
+            "--check",
+            "grep -q 'source-only work' app.txt && grep -q 'fork-only work' agent-result.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"source-only work\n"
+    );
+    assert_eq!(
+        fs::read(fixture.repo.join("agent-result.txt")).unwrap(),
+        b"fork-only work\n"
+    );
+    let timeline = fixture
+        .agit()
+        .args(["--json", "timeline"])
+        .output()
+        .unwrap();
+    let timeline: Value = serde_json::from_slice(&timeline.stdout).unwrap();
+    assert_eq!(timeline[0]["trigger"], "merge");
+}
+
+#[test]
+fn merge_conflict_or_failed_check_never_mutates_source() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let conflict_fork = fixture._temp.path().join("conflict-agent");
+    fixture
+        .agit()
+        .args(["fork", "conflict-agent", "--destination"])
+        .arg(&conflict_fork)
+        .assert()
+        .success();
+    fs::write(fixture.repo.join("app.txt"), b"source version\n").unwrap();
+    fs::write(conflict_fork.join("app.txt"), b"fork version\n").unwrap();
+
+    fixture
+        .agit()
+        .args(["merge", "conflict-agent", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("conflict"));
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"source version\n"
+    );
+
+    let check_fork = fixture._temp.path().join("check-agent");
+    fixture
+        .agit()
+        .args(["fork", "check-agent", "--destination"])
+        .arg(&check_fork)
+        .assert()
+        .success();
+    fs::write(check_fork.join("check-only.txt"), b"candidate\n").unwrap();
+    fixture
+        .agit()
+        .args(["merge", "check-agent", "--check", "false"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("merge check failed"));
+    assert!(!fixture.repo.join("check-only.txt").exists());
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"source version\n"
+    );
 }
 
 #[test]

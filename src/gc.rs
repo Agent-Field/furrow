@@ -429,6 +429,7 @@ mod tests {
         Snapshot {
             root_tree,
             parent,
+            merge_parents: Vec::new(),
             sealed_at_secs: 1,
             sealed_at_nanos: 0,
             quality: SealQuality::Quiescent,
