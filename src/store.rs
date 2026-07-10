@@ -7,6 +7,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -386,6 +387,25 @@ impl ObjectStore {
 
     pub fn workspace_data_dir(&self, workspace_id: &str) -> PathBuf {
         self.root.join("workspaces").join(workspace_id)
+    }
+
+    pub(crate) fn workspace_roots(&self) -> anyhow::Result<Vec<(String, PathBuf)>> {
+        let mut roots = Vec::new();
+        for entry in fs::read_dir(self.root.join("workspaces"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || entry.path().join("detached").exists() {
+                continue;
+            }
+            let path = entry.path().join("root.path");
+            if !path.is_file() {
+                continue;
+            }
+            roots.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                PathBuf::from(std::ffi::OsString::from_vec(fs::read(path)?)),
+            ));
+        }
+        Ok(roots)
     }
 
     pub fn stats(&self) -> anyhow::Result<StoreStats> {

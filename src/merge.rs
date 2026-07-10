@@ -138,15 +138,17 @@ fn equivalent(left: Option<&TreeEntry>, right: Option<&TreeEntry>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => {
-            if left.kind != EntryKind::Directory || right.kind != EntryKind::Directory {
-                left == right
-            } else {
-                let mut left = left.clone();
-                let mut right = right.clone();
+            let mut left = left.clone();
+            let mut right = right.clone();
+            left.mtime_secs = 0;
+            left.mtime_nanos = 0;
+            right.mtime_secs = 0;
+            right.mtime_nanos = 0;
+            if left.kind == EntryKind::Directory && right.kind == EntryKind::Directory {
                 left.target = None;
                 right.target = None;
-                left == right
             }
+            left == right
         }
         _ => false,
     }
@@ -254,6 +256,20 @@ mod tests {
             plan(&base, &BTreeMap::new(), &theirs).conflicts[0].kind,
             ConflictKind::DeleteModify
         );
+    }
+
+    #[test]
+    fn identical_additions_with_different_timestamps_are_already_converged() {
+        let base = BTreeMap::new();
+        let ours = BTreeMap::from([(b"coord/task".to_vec(), file(1))]);
+        let mut timestamped = file(1);
+        timestamped.mtime_secs = 42;
+        timestamped.mtime_nanos = 7;
+        let theirs = BTreeMap::from([(b"coord/task".to_vec(), timestamped)]);
+
+        let plan = plan(&base, &ours, &theirs);
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.changes.is_empty());
     }
 
     #[test]

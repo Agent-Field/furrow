@@ -50,6 +50,11 @@ if "$BIN" --repo "$BETA" claim app.js --owner beta-agent; then
 else
   ok "beta saw alpha's advisory app.js claim before editing"
 fi
+"$BIN" --repo "$ALPHA" coord write tasks/alpha.txt \
+  --value "alpha owns app.js" --owner alpha-agent >/dev/null
+grep -q 'alpha owns app.js' "$BETA/.agit/coord/tasks/alpha.txt" \
+  && ok "alpha's versioned coordination note propagated eagerly to beta" \
+  || fail "coordination note did not propagate"
 
 step "Run two simulated agents concurrently"
 (

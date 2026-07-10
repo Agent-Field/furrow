@@ -594,6 +594,162 @@ fn advisory_claims_coordinate_sibling_forks_and_are_timeline_recorded() {
 }
 
 #[test]
+fn coord_values_propagate_eagerly_and_reconcile_offline_forks_and_tombstones() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let alpha = fixture._temp.path().join("coord-alpha");
+    let beta = fixture._temp.path().join("coord-beta");
+    fixture
+        .agit()
+        .args(["fork", "coord-alpha", "--destination"])
+        .arg(&alpha)
+        .assert()
+        .success();
+    fixture
+        .agit()
+        .args(["fork", "coord-beta", "--destination"])
+        .arg(&beta)
+        .assert()
+        .success();
+
+    agit_at(&alpha, &fixture.data)
+        .args([
+            "coord",
+            "write",
+            "tasks/current.md",
+            "--value",
+            "alpha is working",
+            "--owner",
+            "alpha-agent",
+        ])
+        .assert()
+        .success();
+    for root in [&fixture.repo, &alpha, &beta] {
+        assert_eq!(
+            fs::read(root.join(".agit/coord/tasks/current.md")).unwrap(),
+            b"alpha is working"
+        );
+    }
+
+    let offline = fixture._temp.path().join("coord-alpha-offline");
+    fs::rename(&alpha, &offline).unwrap();
+    agit_at(&beta, &fixture.data)
+        .args([
+            "coord",
+            "write",
+            "tasks/current.md",
+            "--value",
+            "beta continued",
+            "--owner",
+            "beta-agent",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(offline.join(".agit/coord/tasks/current.md")).unwrap(),
+        b"alpha is working"
+    );
+    fs::rename(&offline, &alpha).unwrap();
+    let recovered = agit_at(&alpha, &fixture.data)
+        .args(["coord", "read", "tasks/current.md"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(recovered, b"beta continued");
+
+    fs::rename(&alpha, &offline).unwrap();
+    agit_at(&beta, &fixture.data)
+        .args([
+            "coord",
+            "remove",
+            "tasks/current.md",
+            "--owner",
+            "beta-agent",
+        ])
+        .assert()
+        .success();
+    assert!(offline.join(".agit/coord/tasks/current.md").exists());
+    fs::rename(&offline, &alpha).unwrap();
+    let listed = agit_at(&alpha, &fixture.data)
+        .args(["--json", "coord", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: Value = serde_json::from_slice(&listed).unwrap();
+    assert!(listed.as_array().unwrap().is_empty());
+    assert!(!alpha.join(".agit/coord/tasks/current.md").exists());
+
+    let timeline = agit_at(&beta, &fixture.data)
+        .args(["--json", "timeline"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let timeline: Value = serde_json::from_slice(&timeline).unwrap();
+    assert_eq!(timeline[0]["trigger"], "coord");
+}
+
+#[test]
+fn watch_fork_returns_seals_after_an_exact_cursor() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    let worker = fixture._temp.path().join("observer-agent");
+    fixture
+        .agit()
+        .args(["fork", "observer-agent", "--destination"])
+        .arg(&worker)
+        .assert()
+        .success();
+
+    let timeline = agit_at(&worker, &fixture.data)
+        .args(["--json", "timeline"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let timeline: Value = serde_json::from_slice(&timeline).unwrap();
+    let cursor = timeline[0]["id"].as_str().unwrap();
+
+    fs::write(worker.join("agent-result.txt"), b"completed\n").unwrap();
+    let sealed = agit_at(&worker, &fixture.data)
+        .args(["--json", "snap", "-m", "agent completed task"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sealed: Value = serde_json::from_slice(&sealed).unwrap();
+
+    let updates = fixture
+        .agit()
+        .args([
+            "--json",
+            "watch-fork",
+            "observer-agent",
+            "--after",
+            cursor,
+            "--once",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let updates: Value = serde_json::from_slice(&updates).unwrap();
+    assert_eq!(updates["cursor_found"], true);
+    assert_eq!(updates["head"], sealed["snapshot"]);
+    assert_eq!(updates["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(updates["snapshots"][0]["id"], sealed["snapshot"]);
+    assert_eq!(updates["snapshots"][0]["label"], "agent completed task");
+}
+
+#[test]
 fn merge_conflict_or_failed_check_never_mutates_source() {
     let fixture = Fixture::new();
     fixture.watch();
@@ -1251,6 +1407,8 @@ fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
     assert!(tools.iter().any(|tool| tool["name"] == "agit.rewind_plan"));
     assert!(tools.iter().any(|tool| tool["name"] == "agit.fork"));
     assert!(tools.iter().any(|tool| tool["name"] == "agit.claim"));
+    assert!(tools.iter().any(|tool| tool["name"] == "agit.coord_write"));
+    assert!(tools.iter().any(|tool| tool["name"] == "agit.fork_updates"));
     assert_eq!(responses[3]["id"], "status");
     assert_eq!(responses[3]["result"]["isError"], false);
     assert_eq!(responses[4]["result"]["isError"], false);

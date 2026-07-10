@@ -69,6 +69,10 @@ agit diff auth-refactor
 AGIT_AGENT_ID=auth-agent agit claim 'src/auth/**' --ttl-seconds 3600
 agit claims
 
+# Share a versioned blackboard value immediately with sibling forks.
+AGIT_AGENT_ID=auth-agent agit coord write tasks/auth.md --value 'refresh tokens in progress'
+agit coord list
+
 # Converge only after the result passes the project's real verification command.
 agit merge auth-refactor --check "cargo test --all"
 
@@ -150,6 +154,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Explicit fork cleanup with safe timeline detachment
 - Transactional advisory path claims shared across sibling forks
 - Claim/release snapshots with owner, TTL, and conflict attribution in the DAG
+- Eager `.agit/coord/` blackboard propagation with offline reconciliation and deletion tombstones
 - Three-way full-state merge with explicit conflicts and scratch-fork verification
 - Crash-safe exact reachability GC with shared-chunk preservation
 - 64 KiB paged Merkle directories and disk-backed delta path indexing

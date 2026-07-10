@@ -3,7 +3,8 @@ use agit::{AgitRepository, SyncDisposition};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
-use std::io::{self, IsTerminal, Write};
+use std::fs;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -80,6 +81,16 @@ enum Command {
     },
     /// List full-state workspace forks created from this repository.
     Forks,
+    /// Stream newly sealed snapshots from a sibling fork.
+    WatchFork {
+        name: String,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        once: bool,
+        #[arg(long, default_value_t = 250)]
+        interval_ms: u64,
+    },
     /// Remove a completed fork and detach its timeline.
     #[command(name = "fork-rm")]
     ForkRemove {
@@ -103,6 +114,11 @@ enum Command {
         claim: String,
         #[arg(long)]
         owner: Option<String>,
+    },
+    /// Read and write the eagerly replicated coordination directory.
+    Coord {
+        #[command(subcommand)]
+        command: CoordCommand,
     },
     /// Run any agent or command inside a new isolated full-state fork.
     Run {
@@ -158,6 +174,30 @@ enum Command {
     },
     /// Serve agit tools to coding agents over MCP stdio.
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum CoordCommand {
+    /// Write a coordination value and propagate it to live sibling forks.
+    Write {
+        path: PathBuf,
+        #[arg(long, conflicts_with = "file")]
+        value: Option<String>,
+        #[arg(long, conflicts_with = "value")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Read a coordination value from this workspace.
+    Read { path: PathBuf },
+    /// List coordination values without reading their contents.
+    List,
+    /// Remove a coordination value and propagate a durable tombstone.
+    Remove {
+        path: PathBuf,
+        #[arg(long)]
+        owner: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -379,6 +419,43 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::WatchFork {
+            name,
+            after,
+            once,
+            interval_ms,
+        } => {
+            let repository = AgitRepository::open(&cli.repo)?;
+            let mut cursor = after;
+            loop {
+                let updates = repository.fork_updates(&name, cursor.as_deref(), 1000)?;
+                if !updates.cursor_found {
+                    eprintln!(
+                        "warning: cursor was not in the latest 1000 seals; replaying the retained window"
+                    );
+                }
+                if !updates.snapshots.is_empty() {
+                    if cli.json {
+                        println!("{}", serde_json::to_string(&updates)?);
+                    } else {
+                        for snapshot in &updates.snapshots {
+                            println!(
+                                "{}  {}  {:<12} {}",
+                                &snapshot.id[..12],
+                                snapshot.sealed_at,
+                                snapshot.trigger,
+                                snapshot.label.clone().unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+                cursor = updates.head;
+                if once {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms.max(50)));
+            }
+        }
         Command::ForkRemove { name, keep_files } => {
             let mut repository = AgitRepository::open(&cli.repo)?;
             let removal = repository.remove_fork(&name, keep_files)?;
@@ -447,6 +524,85 @@ fn main() -> anyhow::Result<()> {
                 println!("Snapshot {}", &outcome.snapshot[..12]);
             }
         }
+        Command::Coord { command } => match command {
+            CoordCommand::Write {
+                path,
+                value,
+                file,
+                owner,
+            } => {
+                let bytes = match (value, file) {
+                    (Some(value), None) => value.into_bytes(),
+                    (None, Some(file)) => fs::read(file)?,
+                    (None, None) => {
+                        let mut bytes = Vec::new();
+                        io::stdin().take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                        bytes
+                    }
+                    (Some(_), Some(_)) => unreachable!("clap enforces conflicts"),
+                };
+                anyhow::ensure!(bytes.len() <= 1024 * 1024, "coord value exceeds 1 MiB");
+                let mut repository = AgitRepository::open(&cli.repo)?;
+                let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
+                let outcome = repository.coord_write(&path, &bytes, &owner)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!(
+                        "Wrote coord/{} ({} bytes) to {} workspace(s)",
+                        outcome.propagation.path,
+                        outcome.propagation.bytes,
+                        outcome.propagation.propagated_workspaces
+                    );
+                    for failure in outcome.propagation.failures {
+                        eprintln!(
+                            "warning: {}: {}",
+                            failure.workspace.display(),
+                            failure.error
+                        );
+                    }
+                    println!("Snapshot {}", &outcome.snapshot[..12]);
+                }
+            }
+            CoordCommand::Read { path } => {
+                let repository = AgitRepository::open(&cli.repo)?;
+                let bytes = repository.coord_read(&path)?;
+                if cli.json {
+                    let value = String::from_utf8(bytes)
+                        .context("--json coord read requires UTF-8 content")?;
+                    println!("{}", serde_json::json!({"path": path, "value": value}));
+                } else {
+                    io::stdout().write_all(&bytes)?;
+                }
+            }
+            CoordCommand::List => {
+                let repository = AgitRepository::open(&cli.repo)?;
+                let entries = repository.coord_list()?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else if entries.is_empty() {
+                    println!("No coordination values");
+                } else {
+                    for entry in entries {
+                        println!("{:>8}  {}", entry.bytes, entry.path);
+                    }
+                }
+            }
+            CoordCommand::Remove { path, owner } => {
+                let mut repository = AgitRepository::open(&cli.repo)?;
+                let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
+                let outcome = repository.coord_remove(&path, &owner)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!(
+                        "Removed coord/{} from {} workspace(s)",
+                        outcome.propagation.path, outcome.propagation.propagated_workspaces
+                    );
+                    println!("Snapshot {}", &outcome.snapshot[..12]);
+                }
+            }
+        },
         Command::Run {
             name,
             destination,

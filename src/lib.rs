@@ -2,6 +2,7 @@ pub mod bundle;
 pub mod catalog;
 pub mod chunker;
 pub mod claims;
+pub mod coord;
 pub mod fork;
 pub mod gc;
 pub mod mcp;
@@ -21,7 +22,7 @@ pub mod watcher;
 
 pub use gc::GcReport;
 pub use repository::{
-    AgitRepository, ClaimOutcome, DiffChange, DiffSummary, ForkRemoval, ForkSummary, MergeOutcome,
-    ReleaseOutcome, RepositoryStatus, RewindPlan, SnapshotSummary, SyncDisposition,
-    SyncPullOutcome,
+    AgitRepository, ClaimOutcome, CoordOutcome, DiffChange, DiffSummary, ForkRemoval, ForkSummary,
+    ForkUpdates, MergeOutcome, ReleaseOutcome, RepositoryStatus, RewindPlan, SnapshotSummary,
+    SyncDisposition, SyncPullOutcome,
 };

@@ -218,6 +218,36 @@ fn call_tool(
                 .unwrap_or_else(|| repository.default_claim_owner());
             serialize(repository.release_claim(required_string(arguments, "claim")?, &owner)?)
         }
+        "agit.coord_list" => serialize(repository.coord_list()?),
+        "agit.coord_read" => {
+            let path = required_string(arguments, "path")?;
+            let bytes = repository.coord_read(Path::new(path))?;
+            let value = String::from_utf8(bytes).context("coord value is not UTF-8")?;
+            Ok(json!({"path": path, "value": value}))
+        }
+        "agit.coord_write" => {
+            let owner = optional_string(arguments, "owner")?
+                .map(str::to_owned)
+                .unwrap_or_else(|| repository.default_claim_owner());
+            serialize(repository.coord_write(
+                Path::new(required_string(arguments, "path")?),
+                required_string(arguments, "value")?.as_bytes(),
+                &owner,
+            )?)
+        }
+        "agit.coord_remove" => {
+            let owner = optional_string(arguments, "owner")?
+                .map(str::to_owned)
+                .unwrap_or_else(|| repository.default_claim_owner());
+            serialize(
+                repository.coord_remove(Path::new(required_string(arguments, "path")?), &owner)?,
+            )
+        }
+        "agit.fork_updates" => serialize(repository.fork_updates(
+            required_string(arguments, "fork")?,
+            optional_string(arguments, "after")?,
+            optional_u64(arguments, "limit")?.unwrap_or(100).min(1000) as usize,
+        )?),
         "agit.rewind_plan" => {
             let requested = required_string(arguments, "snapshot")?;
             anyhow::ensure!(
@@ -267,6 +297,11 @@ fn tool_names() -> &'static [&'static str] {
         "agit.claims",
         "agit.claim",
         "agit.release",
+        "agit.coord_list",
+        "agit.coord_read",
+        "agit.coord_write",
+        "agit.coord_remove",
+        "agit.fork_updates",
         "agit.rewind_plan",
         "agit.rewind_apply",
     ]
@@ -283,6 +318,11 @@ fn validate_argument_keys(name: &str, arguments: &Map<String, Value>) -> anyhow:
         "agit.claims" => &[],
         "agit.claim" => &["pattern", "owner", "ttl_seconds"],
         "agit.release" => &["claim", "owner"],
+        "agit.coord_list" => &[],
+        "agit.coord_read" => &["path"],
+        "agit.coord_write" => &["path", "value", "owner"],
+        "agit.coord_remove" => &["path", "owner"],
+        "agit.fork_updates" => &["fork", "after", "limit"],
         "agit.rewind_plan" => &["snapshot", "paths"],
         "agit.rewind_apply" => &["snapshot", "paths", "confirm_snapshot", "sqlite_consistent"],
         _ => unreachable!("tool name was validated before dispatch"),
@@ -398,6 +438,72 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             }),
             false,
+            false,
+        ),
+        tool(
+            "agit.coord_list",
+            "List eagerly replicated coordination files without reading their content.",
+            json!({"type": "object", "additionalProperties": false}),
+            true,
+            false,
+        ),
+        tool(
+            "agit.coord_read",
+            "Read one UTF-8 value from the versioned coordination directory.",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "maxLength": 1024}},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            true,
+            false,
+        ),
+        tool(
+            "agit.coord_write",
+            "Write a UTF-8 coordination value and eagerly propagate it to live sibling forks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "maxLength": 1024},
+                    "value": {"type": "string", "maxLength": 1048576},
+                    "owner": {"type": "string", "maxLength": 256}
+                },
+                "required": ["path", "value"],
+                "additionalProperties": false
+            }),
+            false,
+            false,
+        ),
+        tool(
+            "agit.coord_remove",
+            "Remove a coordination value and propagate a durable tombstone to sibling forks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "maxLength": 1024},
+                    "owner": {"type": "string", "maxLength": 256}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            false,
+            false,
+        ),
+        tool(
+            "agit.fork_updates",
+            "Return fork seals newer than an optional exact snapshot cursor.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "fork": {"type": "string"},
+                    "after": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}
+                },
+                "required": ["fork"],
+                "additionalProperties": false
+            }),
+            true,
             false,
         ),
         tool(

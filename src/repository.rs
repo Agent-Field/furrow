@@ -1,6 +1,7 @@
 use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::claims;
+use crate::coord;
 use crate::fork::{fork_workspace, ForkReport, ForkTier};
 use crate::gc::{self, GcReport};
 use crate::merge::{self, MergeAction, MergeConflict};
@@ -127,6 +128,21 @@ pub struct ReleaseOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CoordOutcome {
+    pub operation: &'static str,
+    pub propagation: coord::CoordPropagation,
+    pub snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkUpdates {
+    pub fork: String,
+    pub head: Option<String>,
+    pub cursor_found: bool,
+    pub snapshots: Vec<SnapshotSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MergeOutcome {
     pub fork: String,
     pub base_snapshot: String,
@@ -203,6 +219,7 @@ impl AgitRepository {
         let mut store = ObjectStore::open(store_root)?;
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         let family_id = ensure_family_id(&root, &store, &workspace_id)?;
+        coord::reconcile(&root, &store, &family_id)?;
         let mut repository = Self {
             root,
             workspace_id,
@@ -241,6 +258,7 @@ impl AgitRepository {
         };
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         let family_id = ensure_family_id(&root, &store, &workspace_id)?;
+        coord::reconcile(&root, &store, &family_id)?;
         let repository = Self {
             root,
             workspace_id,
@@ -404,6 +422,89 @@ impl AgitRepository {
         std::env::var("AGIT_AGENT_ID")
             .or_else(|_| std::env::var("AGIT_FORK_NAME"))
             .unwrap_or_else(|_| format!("workspace-{}", &self.workspace_id[..12]))
+    }
+
+    pub fn coord_write(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        owner: &str,
+    ) -> anyhow::Result<CoordOutcome> {
+        let propagation = coord::write(&self.root, &self.store, &self.family_id, path, bytes)?;
+        let snapshot = self.snapshot(
+            Some(format!("{owner} wrote coord/{}", propagation.path)),
+            SnapshotTrigger::Coord,
+        )?;
+        Ok(CoordOutcome {
+            operation: "write",
+            propagation,
+            snapshot: id_hex(&snapshot),
+        })
+    }
+
+    pub fn coord_remove(&mut self, path: &Path, owner: &str) -> anyhow::Result<CoordOutcome> {
+        let propagation = coord::remove(&self.root, &self.store, &self.family_id, path)?;
+        let snapshot = self.snapshot(
+            Some(format!("{owner} removed coord/{}", propagation.path)),
+            SnapshotTrigger::Coord,
+        )?;
+        Ok(CoordOutcome {
+            operation: "remove",
+            propagation,
+            snapshot: id_hex(&snapshot),
+        })
+    }
+
+    pub fn coord_read(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
+        coord::reconcile(&self.root, &self.store, &self.family_id)?;
+        coord::read(&self.root, path)
+    }
+
+    pub fn coord_list(&self) -> anyhow::Result<Vec<coord::CoordEntry>> {
+        coord::reconcile(&self.root, &self.store, &self.family_id)?;
+        coord::list(&self.root)
+    }
+
+    pub fn fork_updates(
+        &self,
+        name: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<ForkUpdates> {
+        anyhow::ensure!(
+            (1..=1000).contains(&limit),
+            "limit must be between 1 and 1000"
+        );
+        let fork = self
+            .forks()?
+            .into_iter()
+            .find(|fork| fork.name == name)
+            .with_context(|| format!("fork `{name}` was not found"))?;
+        anyhow::ensure!(fork.destination.exists(), "fork directory no longer exists");
+        let repository = AgitRepository::open(&fork.destination)?;
+        let timeline = repository.timeline(limit.saturating_add(1))?;
+        let head = timeline.first().map(|snapshot| snapshot.id.clone());
+        let (cursor_found, mut snapshots) = match after {
+            None => (true, timeline.into_iter().take(1).collect::<Vec<_>>()),
+            Some(cursor) => {
+                anyhow::ensure!(
+                    cursor.len() == 64 && cursor.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "fork update cursor must be a full snapshot ID"
+                );
+                let position = timeline.iter().position(|snapshot| snapshot.id == cursor);
+                match position {
+                    Some(position) => (true, timeline.into_iter().take(position).collect()),
+                    None => (false, timeline.into_iter().take(limit).collect()),
+                }
+            }
+        };
+        snapshots.reverse();
+        Ok(ForkUpdates {
+            fork: name.to_owned(),
+            head,
+            cursor_found,
+            snapshots,
+        })
     }
 
     pub fn pair(
