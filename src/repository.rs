@@ -1,3 +1,4 @@
+use crate::budget::{self, BudgetStatus};
 use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::claims;
@@ -126,6 +127,7 @@ pub struct RepositoryStatus {
     pub objects: u64,
     pub physical_bytes: u64,
     pub watcher_running: bool,
+    pub budget: BudgetStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -476,6 +478,7 @@ impl AgitRepository {
             objects: stats.objects,
             physical_bytes: stats.physical_bytes,
             watcher_running: self.watcher_running(),
+            budget: self.store.budget_status()?,
         })
     }
 
@@ -556,7 +559,12 @@ impl AgitRepository {
     }
 
     pub fn gc(&mut self, dry_run: bool) -> anyhow::Result<GcReport> {
-        gc::collect(&mut self.store, dry_run)
+        let report = gc::collect(&mut self.store, dry_run)?;
+        if !dry_run {
+            let status = self.store.budget_status()?;
+            budget::record_attempt(self.store.root(), status.physical_bytes, status.satisfied)?;
+        }
+        Ok(report)
     }
 
     pub fn pin(&mut self, snapshot: &ObjectId) -> anyhow::Result<bool> {
@@ -580,7 +588,24 @@ impl AgitRepository {
 
     pub fn gc_global(dry_run: bool) -> anyhow::Result<GcReport> {
         let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
-        gc::collect(&mut store, dry_run)
+        let report = gc::collect(&mut store, dry_run)?;
+        if !dry_run {
+            let status = store.budget_status()?;
+            budget::record_attempt(store.root(), status.physical_bytes, status.satisfied)?;
+        }
+        Ok(report)
+    }
+
+    pub fn budget_global(
+        max_store_bytes: Option<u64>,
+        reserved_free_bytes: Option<u64>,
+    ) -> anyhow::Result<BudgetStatus> {
+        let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
+        if max_store_bytes.is_some() || reserved_free_bytes.is_some() {
+            store.configure_budget(max_store_bytes, reserved_free_bytes)
+        } else {
+            store.budget_status()
+        }
     }
 
     pub fn global_store_physical_bytes() -> anyhow::Result<u64> {

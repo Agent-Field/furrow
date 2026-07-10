@@ -796,7 +796,6 @@ mod tests {
         let mut store = ObjectStore::open(temporary.path().to_owned()).unwrap();
         store.ensure_workspace("workspace", b"/workspace").unwrap();
         let week = 7 * DAY_SECONDS;
-        let now = 200 * DAY_SECONDS;
 
         let make_graph = |store: &ObjectStore,
                           bytes: &[u8],
@@ -869,7 +868,15 @@ mod tests {
             .publish_snapshot("workspace", head.0, 2 * week, None, SnapshotTrigger::Manual)
             .unwrap();
 
-        let report = collect_locked_at(&mut store, false, now).unwrap();
+        crate::budget::save(
+            store.root(),
+            crate::budget::BudgetConfig {
+                max_store_bytes: 1,
+                reserved_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        let report = store.enforce_budget(true).unwrap().unwrap();
         assert_eq!(report.retained_snapshots, 2);
         assert!(store.read_bytes(&old.0, ObjectKind::Snapshot).is_ok());
         assert!(store.read_bytes(&old.1, ObjectKind::Tree).is_ok());
@@ -888,6 +895,9 @@ mod tests {
                 .grade,
             "exact"
         );
+        let budget = store.budget_status().unwrap();
+        assert!(!budget.satisfied);
+        assert!(budget.over_store_bytes > 0);
     }
 
     #[test]

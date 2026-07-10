@@ -2046,6 +2046,50 @@ fn snapshots_can_be_pinned_and_unpinned_idempotently() {
     assert_eq!(unpin["changed"], true);
 }
 
+#[test]
+fn global_budget_is_persistent_visible_and_never_deletes_the_head_to_fit() {
+    let fixture = Fixture::new();
+    let head = fixture.watch();
+    let configured = fixture
+        .agit()
+        .args(["--json", "budget", "--max", "1", "--reserve-free", "0"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let configured: Value = serde_json::from_slice(&configured).unwrap();
+    assert_eq!(configured["max_store_bytes"], 1);
+    assert_eq!(configured["reserved_free_bytes"], 0);
+    assert_eq!(configured["satisfied"], false);
+    assert!(configured["over_store_bytes"].as_u64().unwrap() > 0);
+
+    let status = fixture
+        .agit()
+        .args(["--json", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).unwrap();
+    assert_eq!(status["head"], head);
+    assert_eq!(status["budget"]["max_store_bytes"], 1);
+    assert_eq!(status["budget"]["satisfied"], false);
+
+    let timeline = fixture
+        .agit()
+        .args(["--json", "timeline", "--limit", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let timeline: Value = serde_json::from_slice(&timeline).unwrap();
+    assert_eq!(timeline[0]["id"], head);
+    assert_eq!(timeline[0]["materialization"]["grade"], "exact");
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")

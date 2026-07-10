@@ -109,6 +109,10 @@ AGIT_AGENT_ID=auth-agent agit release 'src/auth/**'
 agit gc --dry-run
 agit gc
 
+# Inspect or change the global store ceiling and reserved-free-space floor.
+agit budget
+agit budget --max 20GiB --reserve-free 2GiB
+
 # Return a permanent restore point to normal retention when it is no longer needed.
 agit unpin <snapshot>
 
@@ -195,6 +199,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Permanent snapshot pins, dry-run retention previews, and exact pin/head-aware garbage collection
 - Immutable capture-time content classes with class-specific byte-retention windows
 - Timeline materialization grades with every missing path and its recovery route
+- Persistent global disk ceilings and reserved-free-space floors with automatic, backoff-aware GC
 - Catalog reconstruction after deleting the SQLite index
 - Recovery from truncated pack tails
 - Human and JSON timelines

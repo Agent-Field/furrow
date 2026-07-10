@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod bundle;
 pub mod catalog;
 pub mod chunker;
@@ -25,6 +26,7 @@ pub mod sync;
 pub mod tree;
 pub mod watcher;
 
+pub use budget::{BudgetConfig, BudgetStatus};
 pub use estimate::CaptureEstimate;
 pub use gc::GcReport;
 pub use repository::{

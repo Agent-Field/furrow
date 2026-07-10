@@ -1,4 +1,6 @@
+use crate::budget::{self, BudgetStatus};
 use crate::catalog::{CachedFile, Catalog, PackCheckpoint, TimelineRow};
+use crate::gc::{self, GcReport};
 use crate::model::{ObjectId, ObjectKind, SnapshotTrigger};
 use crate::refs::{RefLog, RefRecord};
 use crate::retention::RetentionLog;
@@ -412,7 +414,49 @@ impl ObjectStore {
             label,
             trigger,
         )?;
-        self.index_ref_record(workspace_id, &record)
+        self.index_ref_record(workspace_id, &record)?;
+        if let Err(error) = self.enforce_budget(false) {
+            eprintln!("warning: automatic store-budget enforcement failed: {error:#}");
+        }
+        Ok(())
+    }
+
+    pub fn budget_status(&self) -> anyhow::Result<BudgetStatus> {
+        let config = budget::load(&self.root)?;
+        budget::status(&self.root, config, self.stats()?.physical_bytes)
+    }
+
+    pub fn configure_budget(
+        &mut self,
+        max_store_bytes: Option<u64>,
+        reserved_free_bytes: Option<u64>,
+    ) -> anyhow::Result<BudgetStatus> {
+        let _maintenance = self.acquire_maintenance_exclusive()?;
+        let mut config = budget::load(&self.root)?;
+        if let Some(max_store_bytes) = max_store_bytes {
+            config.max_store_bytes = max_store_bytes;
+        }
+        if let Some(reserved_free_bytes) = reserved_free_bytes {
+            config.reserved_free_bytes = reserved_free_bytes;
+        }
+        budget::save(&self.root, config)?;
+        self.enforce_budget(true)?;
+        self.budget_status()
+    }
+
+    pub fn enforce_budget(&mut self, force: bool) -> anyhow::Result<Option<GcReport>> {
+        let before = self.budget_status()?;
+        if !before.pressured() {
+            budget::record_attempt(&self.root, before.physical_bytes, true)?;
+            return Ok(None);
+        }
+        if !force && !budget::should_retry(&self.root, before.physical_bytes)? {
+            return Ok(None);
+        }
+        let report = gc::collect(self, false)?;
+        let after = self.budget_status()?;
+        budget::record_attempt(&self.root, after.physical_bytes, after.satisfied)?;
+        Ok(Some(report))
     }
 
     pub fn root(&self) -> &Path {

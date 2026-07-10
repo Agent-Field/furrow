@@ -197,6 +197,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Inspect or configure the global content-store disk budget.
+    Budget {
+        /// Maximum physical pack size, for example 20GiB or 500MiB.
+        #[arg(long)]
+        max: Option<String>,
+        /// Minimum filesystem free space to preserve.
+        #[arg(long = "reserve-free")]
+        reserve_free: Option<String>,
+    },
     /// Pair with an encrypted directory or direct ssh://user@host remote.
     Pair {
         remote: PathBuf,
@@ -488,6 +497,17 @@ fn main() -> anyhow::Result<()> {
                 println!("Snapshots: {}", status.snapshots);
                 println!("Objects:   {}", status.objects);
                 println!("Pack data: {} bytes", status.physical_bytes);
+                println!(
+                    "Budget:    {} / {} ({} free; {})",
+                    human_bytes(status.budget.physical_bytes),
+                    human_bytes(status.budget.max_store_bytes),
+                    human_bytes(status.budget.available_bytes),
+                    if status.budget.satisfied {
+                        "satisfied"
+                    } else {
+                        "under pressure"
+                    }
+                );
                 println!(
                     "Watcher:   {}",
                     if status.watcher_running {
@@ -1031,6 +1051,33 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::Budget { max, reserve_free } => {
+            let max = max.as_deref().map(parse_byte_size).transpose()?;
+            let reserve_free = reserve_free.as_deref().map(parse_byte_size).transpose()?;
+            let status = AgitRepository::budget_global(max, reserve_free)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "Store {} / {}",
+                    human_bytes(status.physical_bytes),
+                    human_bytes(status.max_store_bytes)
+                );
+                println!(
+                    "Free {} / {} reserved",
+                    human_bytes(status.available_bytes),
+                    human_bytes(status.reserved_free_bytes)
+                );
+                println!(
+                    "Budget {}",
+                    if status.satisfied {
+                        "satisfied"
+                    } else {
+                        "cannot be met without deleting protected bytes"
+                    }
+                );
+            }
+        }
         Command::Pair { remote, name, key } => {
             let repository = AgitRepository::open(&cli.repo)?;
             let namespace = name.unwrap_or_else(|| default_sync_name(&repository));
@@ -1188,6 +1235,27 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn parse_byte_size(value: &str) -> anyhow::Result<u64> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    anyhow::ensure!(split > 0, "byte size must start with an integer");
+    let number: u64 = value[..split].parse()?;
+    let suffix = value[split..].trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024_u64,
+        "m" | "mb" | "mib" => 1024_u64.pow(2),
+        "g" | "gb" | "gib" => 1024_u64.pow(3),
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        _ => anyhow::bail!("unsupported byte-size suffix `{suffix}`"),
+    };
+    number
+        .checked_mul(multiplier)
+        .context("byte size exceeds the supported range")
+}
+
 fn install_hook_adapters(root: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
     let root = root.canonicalize()?;
     anyhow::ensure!(
@@ -1305,4 +1373,18 @@ fn spawn_background_watcher(repository: &AgitRepository, debounce_ms: u64) -> an
     println!("Watcher started with PID {}", child.id());
     println!("Log {}", log_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_size;
+
+    #[test]
+    fn parses_human_budget_sizes_without_ambiguous_fractions() {
+        assert_eq!(parse_byte_size("512MiB").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_byte_size("20 GiB").unwrap(), 20 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1000").unwrap(), 1000);
+        assert!(parse_byte_size("1.5GiB").is_err());
+        assert!(parse_byte_size("lots").is_err());
+    }
 }
