@@ -2,6 +2,7 @@ pub mod bundle;
 pub mod catalog;
 pub mod chunker;
 pub mod claims;
+pub mod content_class;
 pub mod coord;
 pub mod estimate;
 pub mod fork;
@@ -29,6 +30,6 @@ pub use gc::GcReport;
 pub use repository::{
     AgitRepository, BisectCheck, BisectOutcome, ClaimOutcome, CoordOutcome, DiffChange,
     DiffSummary, FidelityAspect, FidelityReport, ForkPlan, ForkRemoval, ForkSummary, ForkUpdates,
-    MergeOutcome, ReleaseOutcome, RepositoryStatus, RewindPlan, SnapshotSummary, SyncDisposition,
-    SyncPullOutcome,
+    MaterializationReport, MergeOutcome, MissingMaterializationPath, ReleaseOutcome,
+    RepositoryStatus, RewindPlan, SnapshotSummary, SyncDisposition, SyncPullOutcome,
 };

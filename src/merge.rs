@@ -206,6 +206,7 @@ mod tests {
             mtime_secs: 0,
             mtime_nanos: 0,
             xattrs: None,
+            class: Default::default(),
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
             mtime_secs: 0,
             mtime_nanos: 0,
             xattrs: None,
+            class: Default::default(),
         }
     }
 

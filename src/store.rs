@@ -334,6 +334,14 @@ impl ObjectStore {
             .collect())
     }
 
+    pub fn retained_snapshot_count(&self, id: &str) -> anyhow::Result<u64> {
+        let refs = RefLog::open(&self.root, id)?;
+        let head = refs.head()?.map_or(0, |record| record.sequence);
+        Ok(RetentionLog::open(&self.root, id)?
+            .state()?
+            .retained_count(head))
+    }
+
     pub fn pin_snapshot(&self, workspace_id: &str, snapshot_id: ObjectId) -> anyhow::Result<bool> {
         let _maintenance = self.acquire_maintenance_exclusive()?;
         anyhow::ensure!(

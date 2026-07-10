@@ -1,6 +1,7 @@
 use crate::catalog::CachedFile;
 use crate::chunker::ChunkStream;
 use crate::claims;
+use crate::content_class;
 use crate::coord;
 use crate::estimate::{self, CaptureEstimate};
 use crate::fork::{fork_workspace_excluding, ForkReport, ForkTier};
@@ -50,6 +51,23 @@ pub struct SnapshotSummary {
     pub sealed_at: i64,
     pub label: Option<String>,
     pub trigger: String,
+    pub materialization: MaterializationReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MaterializationReport {
+    pub grade: &'static str,
+    pub partial_classes: Vec<&'static str>,
+    pub missing_paths: Vec<MissingMaterializationPath>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MissingMaterializationPath {
+    pub path: String,
+    pub class: &'static str,
+    pub recovery: &'static str,
+    #[serde(skip)]
+    raw_path: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -441,19 +459,20 @@ impl AgitRepository {
                     sealed_at: row.sealed_at,
                     label: row.label,
                     trigger: row.trigger,
+                    materialization: self.materialization(&row.id)?,
                 })
             })
             .collect()
     }
 
     pub fn status(&self) -> anyhow::Result<RepositoryStatus> {
-        let timeline = self.timeline(100_000)?;
         let stats = self.store.stats()?;
+        let head = self.store.workspace_head(&self.workspace_id)?;
         Ok(RepositoryStatus {
             workspace: self.root.clone(),
             store: self.store.root().to_owned(),
-            head: timeline.first().map(|item| item.id.clone()),
-            snapshots: timeline.len(),
+            head: head.map(|id| id_hex(&id)),
+            snapshots: self.store.retained_snapshot_count(&self.workspace_id)? as usize,
             objects: stats.objects,
             physical_bytes: stats.physical_bytes,
             watcher_running: self.watcher_running(),
@@ -541,11 +560,22 @@ impl AgitRepository {
     }
 
     pub fn pin(&mut self, snapshot: &ObjectId) -> anyhow::Result<bool> {
+        let _maintenance = self.store.acquire_maintenance_exclusive()?;
+        let materialization = self.materialization(snapshot)?;
+        anyhow::ensure!(
+            materialization.grade == "exact",
+            "cannot pin a partial snapshot; {} path(s) are missing bytes",
+            materialization.missing_paths.len()
+        );
         self.store.pin_snapshot(&self.workspace_id, *snapshot)
     }
 
     pub fn unpin(&mut self, snapshot: &ObjectId) -> anyhow::Result<bool> {
         self.store.unpin_snapshot(&self.workspace_id, snapshot)
+    }
+
+    pub fn materialization(&self, snapshot_id: &ObjectId) -> anyhow::Result<MaterializationReport> {
+        derive_materialization(&self.store, snapshot_id)
     }
 
     pub fn gc_global(dry_run: bool) -> anyhow::Result<GcReport> {
@@ -1494,6 +1524,22 @@ impl AgitRepository {
 
     pub fn plan_rewind(&self, target: &ObjectId, paths: &[PathBuf]) -> anyhow::Result<RewindPlan> {
         let _maintenance = self.store.acquire_maintenance_shared()?;
+        let materialization = self.materialization(target)?;
+        let unavailable: Vec<_> = materialization
+            .missing_paths
+            .iter()
+            .filter(|missing| selected(&missing.raw_path, paths))
+            .collect();
+        anyhow::ensure!(
+            unavailable.is_empty(),
+            "snapshot is partial and cannot restore {} selected path(s): {}",
+            unavailable.len(),
+            unavailable
+                .iter()
+                .map(|missing| missing.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
         let current_policy = CapturePolicy::load(&self.root)?;
         let target_policy = CapturePolicy::from_rules(&target_snapshot.excluded_paths)?;
@@ -1868,6 +1914,8 @@ impl AgitRepository {
             .as_bytes()
             .to_vec();
         let mode = metadata.permissions().mode();
+        let relative = path.strip_prefix(&self.root)?.as_os_str().as_bytes();
+        let class = content_class::classify(relative);
         let xattrs = if file_type.is_file() || file_type.is_dir() {
             self.capture_xattrs(path)
                 .with_context(|| format!("capture xattrs for {}", path.display()))?
@@ -1889,9 +1937,9 @@ impl AgitRepository {
                 mtime_secs: secs,
                 mtime_nanos: nanos,
                 xattrs,
+                class,
             }
         } else if file_type.is_file() {
-            let relative = path.strip_prefix(&self.root)?.as_os_str().as_bytes();
             let target = self
                 .capture_file(path, Some(relative))
                 .with_context(|| format!("capture file {}", path.display()))?;
@@ -1905,6 +1953,7 @@ impl AgitRepository {
                 mtime_secs: secs,
                 mtime_nanos: nanos,
                 xattrs,
+                class,
             }
         } else if file_type.is_symlink() {
             TreeEntry {
@@ -1917,6 +1966,7 @@ impl AgitRepository {
                 mtime_secs: secs,
                 mtime_nanos: nanos,
                 xattrs: None,
+                class,
             }
         } else if file_type.is_fifo() {
             special_entry(name, EntryKind::Fifo, mode, secs, nanos)
@@ -1949,6 +1999,7 @@ impl AgitRepository {
             mtime_secs,
             mtime_nanos,
             xattrs: self.capture_xattrs(path)?,
+            class: content_class::classify(path.strip_prefix(&self.root)?.as_os_str().as_bytes()),
         })
     }
 
@@ -1980,9 +2031,10 @@ impl AgitRepository {
     }
 
     fn store_generation(&self) -> anyhow::Result<String> {
-        Ok(fs::read_to_string(self.store.root().join("packs/CURRENT"))?
-            .trim()
-            .to_owned())
+        Ok(format!(
+            "{}:tree-entry-class-v1",
+            fs::read_to_string(self.store.root().join("packs/CURRENT"))?.trim()
+        ))
     }
 
     fn invalidate_path_index(&self) -> anyhow::Result<()> {
@@ -2126,6 +2178,7 @@ impl AgitRepository {
                 mtime_secs: now().0,
                 mtime_nanos: 0,
                 xattrs: None,
+                class: crate::content_class::ContentClass::Database,
             };
             self.restore_file(&destination, &entry)?;
             let path_bytes = destination.as_os_str().as_bytes();
@@ -2693,6 +2746,76 @@ fn directory_target_only_difference(before: Option<&TreeEntry>, after: Option<&T
     before == after
 }
 
+fn recovery_route(class: crate::content_class::ContentClass) -> &'static str {
+    use crate::content_class::ContentClass;
+    match class {
+        ContentClass::Dependency | ContentClass::BuildOutput | ContentClass::Scratch => {
+            "regenerate-or-fetch"
+        }
+        ContentClass::Database => "replica-or-database-backup",
+        ContentClass::Source
+        | ContentClass::VcsMeta
+        | ContentClass::ConfigSecret
+        | ContentClass::Lockfile => "replica-or-none",
+    }
+}
+
+pub(crate) fn derive_materialization(
+    store: &ObjectStore,
+    snapshot_id: &ObjectId,
+) -> anyhow::Result<MaterializationReport> {
+    let snapshot: Snapshot = store.read_struct(snapshot_id, ObjectKind::Snapshot)?;
+    let mut stack = vec![(snapshot.root_tree, Vec::<u8>::new())];
+    let mut missing_paths = Vec::new();
+    let mut partial_classes = BTreeSet::new();
+    while let Some((tree_id, prefix)) = stack.pop() {
+        tree::for_each_entry(store, &tree_id, |entry| {
+            let mut path = prefix.clone();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&entry.name);
+            match (entry.kind, entry.target) {
+                (EntryKind::Directory, Some(target)) => stack.push((target, path)),
+                (EntryKind::File, Some(target)) => {
+                    let blob: Blob = store.read_struct(&target, ObjectKind::Blob)?;
+                    let mut missing = false;
+                    for chunk in &blob.chunks {
+                        if !store.contains_object(&chunk.id)? {
+                            missing = true;
+                            break;
+                        }
+                    }
+                    if missing {
+                        partial_classes.insert(entry.class);
+                        missing_paths.push(MissingMaterializationPath {
+                            path: String::from_utf8_lossy(&path).into_owned(),
+                            class: entry.class.as_str(),
+                            recovery: recovery_route(entry.class),
+                            raw_path: path,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+    }
+    missing_paths.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    Ok(MaterializationReport {
+        grade: if missing_paths.is_empty() {
+            "exact"
+        } else {
+            "partial"
+        },
+        partial_classes: partial_classes
+            .into_iter()
+            .map(|class| class.as_str())
+            .collect(),
+        missing_paths,
+    })
+}
+
 fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
     cached.device == metadata.dev()
         && cached.inode == metadata.ino()
@@ -2729,6 +2852,7 @@ fn special_entry(name: Vec<u8>, kind: EntryKind, mode: u32, secs: i64, nanos: u3
         mtime_secs: secs,
         mtime_nanos: nanos,
         xattrs: None,
+        class: crate::content_class::ContentClass::Scratch,
     }
 }
 

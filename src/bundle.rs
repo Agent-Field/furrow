@@ -293,6 +293,7 @@ mod tests {
                         mtime_secs: 0,
                         mtime_nanos: 0,
                         xattrs: Some(xattrs),
+                        class: Default::default(),
                     }],
                     pages: Vec::new(),
                 },

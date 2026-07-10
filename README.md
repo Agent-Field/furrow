@@ -193,6 +193,8 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Fsynced, hash-chained authoritative snapshot publication log
 - Crash-safe hourly/daily/weekly manifest thinning in a separate hash-chained control log
 - Permanent snapshot pins, dry-run retention previews, and exact pin/head-aware garbage collection
+- Immutable capture-time content classes with class-specific byte-retention windows
+- Timeline materialization grades with every missing path and its recovery route
 - Catalog reconstruction after deleting the SQLite index
 - Recovery from truncated pack tails
 - Human and JSON timelines

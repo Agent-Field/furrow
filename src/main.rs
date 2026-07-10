@@ -360,10 +360,11 @@ fn main() -> anyhow::Result<()> {
             } else {
                 for snapshot in timeline {
                     println!(
-                        "{}  {}  {:<10} {}",
+                        "{}  {}  {:<10} {:<7} {}",
                         &snapshot.id[..12],
                         snapshot.sealed_at,
                         snapshot.trigger,
+                        snapshot.materialization.grade,
                         snapshot.label.unwrap_or_default()
                     );
                 }

@@ -1,6 +1,7 @@
 //! Exact, bounded-memory reachability collection for the global object store.
 
 use crate::catalog::PackCheckpoint;
+use crate::content_class::{classify, ContentClass};
 use crate::model::{Blob, EntryKind, ObjectId, ObjectKind, Snapshot, Tree};
 use crate::refs::RefLog;
 use crate::retention::RetentionLog;
@@ -19,6 +20,9 @@ const OBJECT_VERSION: u8 = 1;
 const HEADER_LEN: u64 = 4 + 1 + 1 + 8 + 32 + 32;
 const RECORD_OVERHEAD: u64 = HEADER_LEN + OBJECT_END.len() as u64;
 const COMPACTION_BATCH: usize = 1_024;
+const ALL_CLASS_MASK: u16 = (1 << ContentClass::ALL.len()) - 1;
+const BLOB_BYTES_BIT: u16 = 1 << 15;
+const DAY_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GcReport {
@@ -73,6 +77,7 @@ impl MarkDatabase {
             "CREATE TABLE marks (
                 id BLOB PRIMARY KEY,
                 kind INTEGER NOT NULL,
+                mask INTEGER NOT NULL,
                 processed INTEGER NOT NULL DEFAULT 0
              ) WITHOUT ROWID;
              CREATE INDEX marks_pending ON marks(processed, id);
@@ -86,25 +91,35 @@ impl MarkDatabase {
         Ok(Self { path, connection })
     }
 
-    fn enqueue(&self, id: &ObjectId, kind: ObjectKind) -> anyhow::Result<bool> {
+    fn enqueue(&self, id: &ObjectId, kind: ObjectKind, mask: u16) -> anyhow::Result<bool> {
         Ok(self.connection.execute(
-            "INSERT OR IGNORE INTO marks(id, kind) VALUES(?1, ?2)",
-            params![id.as_slice(), kind as u8],
+            "INSERT INTO marks(id, kind, mask) VALUES(?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                mask = marks.mask | excluded.mask,
+                processed = 0
+             WHERE (marks.mask | excluded.mask) != marks.mask",
+            params![id.as_slice(), kind as u8, mask],
         )? != 0)
     }
 
-    fn next(&self) -> anyhow::Result<Option<(ObjectId, ObjectKind)>> {
+    fn next(&self) -> anyhow::Result<Option<(ObjectId, ObjectKind, u16)>> {
         self.connection
             .query_row(
-                "SELECT id, kind FROM marks WHERE processed = 0 ORDER BY id LIMIT 1",
+                "SELECT id, kind, mask FROM marks WHERE processed = 0 ORDER BY id LIMIT 1",
                 [],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u8>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, u8>(1)?,
+                        row.get::<_, u16>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .map(|(bytes, kind)| {
+            .map(|(bytes, kind, mask)| {
                 let id = vec_to_id(bytes)?;
                 let kind = ObjectKind::from_u8(kind).context("invalid kind in GC mark database")?;
-                Ok((id, kind))
+                Ok((id, kind, mask))
             })
             .transpose()
     }
@@ -222,11 +237,17 @@ fn enqueue_roots(
         } else {
             retention.plan(&refs, now)?
         };
+        let head_sequence = refs.head()?.map_or(0, |record| record.sequence);
         refs.for_each_record(|record| {
             summary.published_snapshots += 1;
             if state.retains(record.sequence, &record.snapshot_id) {
                 summary.retained_snapshots += 1;
-                if marks.enqueue(&record.snapshot_id, ObjectKind::Snapshot)? {
+                let mask = byte_mask(
+                    now,
+                    record.sealed_at,
+                    record.sequence == head_sequence || state.is_pinned(&record.snapshot_id),
+                );
+                if marks.enqueue(&record.snapshot_id, ObjectKind::Snapshot, mask)? {
                     summary.roots += 1;
                 }
             }
@@ -238,7 +259,7 @@ fn enqueue_roots(
             let intent: RestoreRoots = serde_json::from_slice(&fs::read(&intent_path)?)
                 .with_context(|| format!("read restore intent {}", intent_path.display()))?;
             for id in [intent.pre_snapshot, intent.target_snapshot] {
-                if marks.enqueue(&id, ObjectKind::Snapshot)? {
+                if marks.enqueue(&id, ObjectKind::Snapshot, ALL_CLASS_MASK)? {
                     summary.roots += 1;
                 }
             }
@@ -248,7 +269,7 @@ fn enqueue_roots(
         if incoming_path.exists() {
             let incoming: SyncRoot = serde_json::from_slice(&fs::read(&incoming_path)?)
                 .with_context(|| format!("read incoming sync root {}", incoming_path.display()))?;
-            if marks.enqueue(&incoming.snapshot, ObjectKind::Snapshot)? {
+            if marks.enqueue(&incoming.snapshot, ObjectKind::Snapshot, ALL_CLASS_MASK)? {
                 summary.roots += 1;
             }
         }
@@ -257,34 +278,47 @@ fn enqueue_roots(
 }
 
 fn traverse(store: &ObjectStore, marks: &MarkDatabase) -> anyhow::Result<()> {
-    while let Some((id, expected)) = marks.next()? {
+    while let Some((id, expected, mask)) = marks.next()? {
         let actual = store.object_kind(&id)?;
         anyhow::ensure!(actual == expected, "reachable object kind mismatch");
         let bytes = store.read_bytes_unlocked(&id, expected)?;
         match expected {
             ObjectKind::Snapshot => {
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-                marks.enqueue(&snapshot.root_tree, ObjectKind::Tree)?;
+                marks.enqueue(&snapshot.root_tree, ObjectKind::Tree, mask)?;
                 for backup in snapshot.sqlite_backups {
-                    marks.enqueue(&backup.blob, ObjectKind::Blob)?;
+                    let keep_bytes = mask & classify(&backup.path).bit() != 0;
+                    marks.enqueue(
+                        &backup.blob,
+                        ObjectKind::Blob,
+                        if keep_bytes { BLOB_BYTES_BIT } else { 0 },
+                    )?;
                 }
                 // Snapshot.parent is timeline metadata, not a reachability edge.
             }
             ObjectKind::Tree => {
                 let tree: Tree = serde_json::from_slice(&bytes)?;
                 for page in tree.pages {
-                    marks.enqueue(&page.target, ObjectKind::Tree)?;
+                    marks.enqueue(&page.target, ObjectKind::Tree, mask)?;
                 }
                 for entry in tree.entries {
                     if let Some(xattrs) = entry.xattrs {
-                        marks.enqueue(&xattrs, ObjectKind::Xattrs)?;
+                        marks.enqueue(&xattrs, ObjectKind::Xattrs, 0)?;
                     }
                     match (entry.kind, entry.target) {
                         (EntryKind::File, Some(target)) => {
-                            marks.enqueue(&target, ObjectKind::Blob)?;
+                            marks.enqueue(
+                                &target,
+                                ObjectKind::Blob,
+                                if mask & entry.class.bit() != 0 {
+                                    BLOB_BYTES_BIT
+                                } else {
+                                    0
+                                },
+                            )?;
                         }
                         (EntryKind::Directory, Some(target)) => {
-                            marks.enqueue(&target, ObjectKind::Tree)?;
+                            marks.enqueue(&target, ObjectKind::Tree, mask)?;
                         }
                         _ => {}
                     }
@@ -292,8 +326,10 @@ fn traverse(store: &ObjectStore, marks: &MarkDatabase) -> anyhow::Result<()> {
             }
             ObjectKind::Blob => {
                 let blob: Blob = serde_json::from_slice(&bytes)?;
-                for chunk in blob.chunks {
-                    marks.enqueue(&chunk.id, ObjectKind::Chunk)?;
+                if mask & BLOB_BYTES_BIT != 0 {
+                    for chunk in blob.chunks {
+                        marks.enqueue(&chunk.id, ObjectKind::Chunk, 0)?;
+                    }
                 }
             }
             ObjectKind::Chunk | ObjectKind::Xattrs => {}
@@ -301,6 +337,27 @@ fn traverse(store: &ObjectStore, marks: &MarkDatabase) -> anyhow::Result<()> {
         marks.processed(&id)?;
     }
     Ok(())
+}
+
+fn byte_mask(now: i64, sealed_at: i64, exact_root: bool) -> u16 {
+    if exact_root || sealed_at > now {
+        return ALL_CLASS_MASK;
+    }
+    let age = now.saturating_sub(sealed_at);
+    let mut mask = ContentClass::Source.bit()
+        | ContentClass::VcsMeta.bit()
+        | ContentClass::ConfigSecret.bit()
+        | ContentClass::Lockfile.bit();
+    if age <= 30 * DAY_SECONDS {
+        mask |= ContentClass::Database.bit();
+    }
+    if age <= 3 * DAY_SECONDS {
+        mask |= ContentClass::Dependency.bit() | ContentClass::BuildOutput.bit();
+    }
+    if age <= DAY_SECONDS {
+        mask |= ContentClass::Scratch.bit();
+    }
+    mask
 }
 
 fn reachable_payload_bytes(store: &ObjectStore, marks: &MarkDatabase) -> anyhow::Result<u64> {
@@ -543,6 +600,7 @@ mod tests {
                         mtime_secs: 1,
                         mtime_nanos: 0,
                         xattrs: Some(xattrs),
+                        class: Default::default(),
                     }],
                     pages: Vec::new(),
                 },
@@ -679,6 +737,7 @@ mod tests {
                             mtime_secs: index as i64,
                             mtime_nanos: 0,
                             xattrs: None,
+                            class: Default::default(),
                         }],
                         pages: Vec::new(),
                     },
@@ -729,5 +788,132 @@ mod tests {
         collect_locked_at(&mut store, false, now).unwrap();
         assert!(store.read_bytes(&chunks[1], ObjectKind::Chunk).is_err());
         assert!(store.read_bytes(&chunks[2], ObjectKind::Chunk).is_ok());
+    }
+
+    #[test]
+    fn expired_class_bytes_drop_while_manifests_and_head_remain_exact() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = ObjectStore::open(temporary.path().to_owned()).unwrap();
+        store.ensure_workspace("workspace", b"/workspace").unwrap();
+        let week = 7 * DAY_SECONDS;
+        let now = 200 * DAY_SECONDS;
+
+        let make_graph = |store: &ObjectStore,
+                          bytes: &[u8],
+                          class: ContentClass,
+                          sealed_at: i64,
+                          parent: Option<ObjectId>| {
+            let chunk = store.put_bytes(ObjectKind::Chunk, bytes).unwrap();
+            let blob = store
+                .put_struct(
+                    ObjectKind::Blob,
+                    &Blob {
+                        chunks: vec![ChunkRef {
+                            id: chunk,
+                            len: bytes.len() as u32,
+                        }],
+                        total_len: bytes.len() as u64,
+                    },
+                )
+                .unwrap();
+            let tree = store
+                .put_struct(
+                    ObjectKind::Tree,
+                    &Tree {
+                        entries: vec![TreeEntry {
+                            name: b"state".to_vec(),
+                            kind: EntryKind::File,
+                            target: Some(blob),
+                            link_target: Vec::new(),
+                            mode: 0o100644,
+                            size: bytes.len() as u64,
+                            mtime_secs: sealed_at,
+                            mtime_nanos: 0,
+                            xattrs: None,
+                            class,
+                        }],
+                        pages: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let snapshot = store
+                .put_struct(
+                    ObjectKind::Snapshot,
+                    &Snapshot {
+                        sealed_at_secs: sealed_at,
+                        ..snapshot(tree, parent)
+                    },
+                )
+                .unwrap();
+            (snapshot, tree, blob, chunk)
+        };
+
+        let old = make_graph(
+            &store,
+            b"expired log bytes",
+            ContentClass::Scratch,
+            week,
+            None,
+        );
+        store
+            .publish_snapshot("workspace", old.0, week, None, SnapshotTrigger::Manual)
+            .unwrap();
+        let head = make_graph(
+            &store,
+            b"current source bytes",
+            ContentClass::Source,
+            2 * week,
+            Some(old.0),
+        );
+        store
+            .publish_snapshot("workspace", head.0, 2 * week, None, SnapshotTrigger::Manual)
+            .unwrap();
+
+        let report = collect_locked_at(&mut store, false, now).unwrap();
+        assert_eq!(report.retained_snapshots, 2);
+        assert!(store.read_bytes(&old.0, ObjectKind::Snapshot).is_ok());
+        assert!(store.read_bytes(&old.1, ObjectKind::Tree).is_ok());
+        assert!(store.read_bytes(&old.2, ObjectKind::Blob).is_ok());
+        assert!(store.read_bytes(&old.3, ObjectKind::Chunk).is_err());
+        assert!(store.read_bytes(&head.3, ObjectKind::Chunk).is_ok());
+        let grade = crate::repository::derive_materialization(&store, &old.0).unwrap();
+        assert_eq!(grade.grade, "partial");
+        assert_eq!(grade.partial_classes, vec!["scratch"]);
+        assert_eq!(grade.missing_paths.len(), 1);
+        assert_eq!(grade.missing_paths[0].path, "state");
+        assert_eq!(grade.missing_paths[0].recovery, "regenerate-or-fetch");
+        assert_eq!(
+            crate::repository::derive_materialization(&store, &head.0)
+                .unwrap()
+                .grade,
+            "exact"
+        );
+    }
+
+    #[test]
+    fn byte_windows_match_the_declared_class_policy() {
+        let now = 100 * DAY_SECONDS;
+        let permanent = ContentClass::Source.bit()
+            | ContentClass::VcsMeta.bit()
+            | ContentClass::ConfigSecret.bit()
+            | ContentClass::Lockfile.bit();
+        assert_eq!(byte_mask(now, 0, false) & permanent, permanent);
+        assert_ne!(
+            byte_mask(now, now - 30 * DAY_SECONDS, false) & ContentClass::Database.bit(),
+            0
+        );
+        assert_eq!(
+            byte_mask(now, now - 30 * DAY_SECONDS - 1, false) & ContentClass::Database.bit(),
+            0
+        );
+        assert_ne!(
+            byte_mask(now, now - 3 * DAY_SECONDS, false) & ContentClass::Dependency.bit(),
+            0
+        );
+        assert_eq!(
+            byte_mask(now, now - DAY_SECONDS - 1, false) & ContentClass::Scratch.bit(),
+            0
+        );
+        assert_eq!(byte_mask(now, 0, true), ALL_CLASS_MASK);
     }
 }

@@ -249,6 +249,7 @@ mod tests {
             mtime_secs: 0,
             mtime_nanos: 0,
             xattrs: None,
+            class: Default::default(),
         }
     }
 
@@ -267,6 +268,7 @@ mod tests {
             mtime_secs: 0,
             mtime_nanos: 0,
             xattrs: None,
+            class: Default::default(),
         };
         index.upsert(b"dir", b"", &directory).unwrap();
         index.upsert(b"dir/a", b"dir", &entry(b"a", 2)).unwrap();

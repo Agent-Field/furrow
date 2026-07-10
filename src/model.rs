@@ -1,3 +1,4 @@
+use crate::content_class::ContentClass;
 use serde::{Deserialize, Serialize};
 
 pub type ObjectId = [u8; 32];
@@ -69,6 +70,8 @@ pub struct TreeEntry {
     pub mtime_secs: i64,
     pub mtime_nanos: u32,
     pub xattrs: Option<ObjectId>,
+    #[serde(default)]
+    pub class: ContentClass,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

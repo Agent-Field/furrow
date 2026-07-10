@@ -72,18 +72,7 @@ impl RetentionState {
 
     pub fn retains(&self, sequence: u64, snapshot_id: &ObjectId) -> bool {
         sequence > self.evaluated_through
-            || self
-                .retained
-                .binary_search_by(|range| {
-                    if sequence < range.first {
-                        std::cmp::Ordering::Greater
-                    } else if sequence > range.last {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-                .is_ok()
+            || self.retains_in_ranges(sequence)
             || self
                 .pins
                 .binary_search_by_key(&sequence, |pin| pin.sequence)
@@ -100,6 +89,33 @@ impl RetentionState {
             .iter()
             .map(|range| range.last - range.first + 1)
             .sum()
+    }
+
+    pub fn retained_count(&self, head: u64) -> u64 {
+        let mut count = self.retained_count_through();
+        if head > self.evaluated_through {
+            count = count.saturating_add(head - self.evaluated_through);
+        }
+        for pin in &self.pins {
+            if pin.sequence <= self.evaluated_through && !self.retains_in_ranges(pin.sequence) {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+    }
+
+    fn retains_in_ranges(&self, sequence: u64) -> bool {
+        self.retained
+            .binary_search_by(|range| {
+                if sequence < range.first {
+                    std::cmp::Ordering::Greater
+                } else if sequence > range.last {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
     }
 
     pub fn recent_sequences(&self, head: u64, limit: usize) -> Vec<u64> {
