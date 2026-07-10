@@ -6,6 +6,7 @@ pub mod merge;
 pub mod model;
 pub mod path_index;
 pub mod refs;
+pub mod remote_crypto;
 pub mod repository;
 pub mod sorted_dir;
 pub mod sqlite_adapter;
