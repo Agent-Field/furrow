@@ -250,6 +250,76 @@ fn shrink_previews_without_mutation_then_deletes_and_restores_dependency_caches(
 }
 
 #[test]
+fn bisect_finds_the_first_bad_snapshot_without_leaking_probe_side_effects() {
+    let fixture = Fixture::new();
+    fixture.watch();
+    fs::write(fixture.repo.join("notes.txt"), b"still good\n").unwrap();
+    fixture
+        .agit()
+        .args(["snap", "-m", "still good"])
+        .assert()
+        .success();
+
+    fs::write(fixture.repo.join("app.txt"), b"regression\n").unwrap();
+    let first_bad = fixture
+        .agit()
+        .args(["--json", "snap", "-m", "introduced regression"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_bad: Value = serde_json::from_slice(&first_bad).unwrap();
+    let first_bad = first_bad["snapshot"].as_str().unwrap();
+    fs::write(fixture.repo.join("later.txt"), b"unrelated later work\n").unwrap();
+    fixture
+        .agit()
+        .args(["snap", "-m", "later bad state"])
+        .assert()
+        .success();
+
+    let outcome = fixture
+        .agit()
+        .args([
+            "--json",
+            "bisect",
+            "--",
+            "/bin/sh",
+            "-c",
+            "grep -q 'tracked original' app.txt; code=$?; printf 'probe mutation\\n' > app.txt; exit $code",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let outcome: Value = serde_json::from_slice(&outcome).unwrap();
+    assert_eq!(outcome["first_bad_snapshot"], first_bad);
+    assert!(outcome["checks"].as_array().unwrap().len() <= 5);
+    assert!(outcome["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["passed"] == true));
+    assert!(outcome["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["passed"] == false));
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"regression\n"
+    );
+    assert!(!fs::read_dir(fixture._temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".agit-bisect-")));
+}
+
+#[test]
 fn full_rewind_restores_git_ignored_untracked_metadata_and_is_reversible() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();

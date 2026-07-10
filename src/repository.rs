@@ -28,6 +28,7 @@ use std::io::{BufReader, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WORKSPACE_FILE: &str = ".agit/workspace-id";
@@ -75,6 +76,25 @@ pub struct DiffSummary {
     pub base_snapshot: String,
     pub target_snapshot: String,
     pub changes: Vec<DiffChange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BisectCheck {
+    pub snapshot: String,
+    pub label: Option<String>,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub elapsed_ms: u64,
+    pub probe_fork_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BisectOutcome {
+    pub candidates: usize,
+    pub good_snapshot: String,
+    pub first_bad_snapshot: String,
+    pub checks: Vec<BisectCheck>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -788,6 +808,95 @@ impl AgitRepository {
         self.diff_snapshot_pair(target.to_owned(), base, head)
     }
 
+    pub fn bisect(
+        &mut self,
+        command: &[OsString],
+        good: Option<&str>,
+        bad: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<BisectOutcome> {
+        anyhow::ensure!(!command.is_empty(), "bisect command cannot be empty");
+        anyhow::ensure!(
+            (2..=10_000).contains(&limit),
+            "bisect limit must be 2..=10000"
+        );
+        anyhow::ensure!(
+            good.is_some() == bad.is_some(),
+            "--good and --bad must be provided together"
+        );
+
+        let boundary = self.snapshot(
+            Some("bisect source boundary".to_owned()),
+            SnapshotTrigger::Inspection,
+        )?;
+        let mut candidates: Vec<_> = self
+            .store
+            .timeline(&self.workspace_id, limit)?
+            .into_iter()
+            .map(|row| (row.id, row.label))
+            .collect();
+        candidates.reverse();
+        anyhow::ensure!(
+            candidates.len() >= 2,
+            "bisect requires at least two retained snapshots"
+        );
+
+        let (good_index, bad_index) = match (good, bad) {
+            (Some(good), Some(bad)) => {
+                let good = self.resolve_snapshot(good)?;
+                let bad = self.resolve_snapshot(bad)?;
+                let good_index = candidates
+                    .iter()
+                    .position(|(id, _)| *id == good)
+                    .context("good snapshot is outside the retained bisect window")?;
+                let bad_index = candidates
+                    .iter()
+                    .position(|(id, _)| *id == bad)
+                    .context("bad snapshot is outside the retained bisect window")?;
+                anyhow::ensure!(
+                    good_index < bad_index,
+                    "good snapshot must precede bad snapshot"
+                );
+                (good_index, bad_index)
+            }
+            (None, None) => (0, candidates.len() - 1),
+            _ => unreachable!("paired options were validated"),
+        };
+
+        let parent = self.root.parent().unwrap_or_else(|| Path::new("."));
+        let owner = tempfile::Builder::new()
+            .prefix(".agit-bisect-")
+            .tempdir_in(parent)?;
+        let scratch = owner.path().join("workspace");
+        fork_workspace_excluding(&self.root, &scratch, &[Path::new(WORKSPACE_FILE)])?;
+        let (scratch_repository, scratch_head) = AgitRepository::watch(&scratch)?;
+        let operation = (|| {
+            anyhow::ensure!(
+                self.snapshots_match_fork(&boundary, &scratch_repository, &scratch_head)?,
+                "source changed while the bisect scratch workspace was being created"
+            );
+            self.bisect_search(
+                &scratch,
+                boundary,
+                &candidates,
+                good_index,
+                bad_index,
+                command,
+            )
+        })();
+        let cleanup = scratch_repository.forget_internal(true, false);
+        match (operation, cleanup) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => {
+                Err(error.context("bisect succeeded but scratch cleanup failed"))
+            }
+            (Err(error), Err(cleanup)) => Err(error.context(format!(
+                "bisect failed; scratch cleanup also failed: {cleanup:#}"
+            ))),
+        }
+    }
+
     pub fn remove_fork(&mut self, name: &str, keep_files: bool) -> anyhow::Result<ForkRemoval> {
         validate_fork_name(name)?;
         let record_path = self.forks_dir().join(format!("{name}.json"));
@@ -955,6 +1064,140 @@ impl AgitRepository {
             return Ok(Vec::new());
         }
         claims::Registry::open(self.store.root(), &self.family_id)?.active()
+    }
+
+    fn bisect_search(
+        &self,
+        scratch: &Path,
+        boundary: ObjectId,
+        candidates: &[(ObjectId, Option<String>)],
+        mut good_index: usize,
+        mut bad_index: usize,
+        command: &[OsString],
+    ) -> anyhow::Result<BisectOutcome> {
+        let mut current = boundary;
+        let mut checks = BTreeMap::new();
+        anyhow::ensure!(
+            self.ensure_bisect_check(
+                scratch,
+                &mut current,
+                candidates,
+                good_index,
+                command,
+                &mut checks,
+            )?,
+            "selected good snapshot fails the bisect command"
+        );
+        anyhow::ensure!(
+            !self.ensure_bisect_check(
+                scratch,
+                &mut current,
+                candidates,
+                bad_index,
+                command,
+                &mut checks,
+            )?,
+            "selected bad snapshot passes the bisect command"
+        );
+
+        while bad_index - good_index > 1 {
+            let middle = good_index + (bad_index - good_index) / 2;
+            if self.ensure_bisect_check(
+                scratch,
+                &mut current,
+                candidates,
+                middle,
+                command,
+                &mut checks,
+            )? {
+                good_index = middle;
+            } else {
+                bad_index = middle;
+            }
+        }
+
+        Ok(BisectOutcome {
+            candidates: candidates.len(),
+            good_snapshot: id_hex(&candidates[good_index].0),
+            first_bad_snapshot: id_hex(&candidates[bad_index].0),
+            checks: checks.into_values().collect(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_bisect_check(
+        &self,
+        scratch: &Path,
+        current: &mut ObjectId,
+        candidates: &[(ObjectId, Option<String>)],
+        index: usize,
+        command: &[OsString],
+        checks: &mut BTreeMap<usize, BisectCheck>,
+    ) -> anyhow::Result<bool> {
+        if let Some(check) = checks.get(&index) {
+            return Ok(check.passed);
+        }
+        let (snapshot, label) = &candidates[index];
+        if current != snapshot {
+            self.apply_snapshot_transition_at(scratch, current, snapshot)?;
+            *current = *snapshot;
+        }
+
+        let parent = scratch.parent().context("bisect scratch has no parent")?;
+        let owner = tempfile::Builder::new()
+            .prefix("probe-")
+            .tempdir_in(parent)?;
+        let probe = owner.path().join("workspace");
+        let fork = fork_workspace_excluding(scratch, &probe, &[Path::new(WORKSPACE_FILE)])?;
+        let started = std::time::Instant::now();
+        let (program, arguments) = command
+            .split_first()
+            .context("bisect command cannot be empty")?;
+        let status = std::process::Command::new(program)
+            .args(arguments)
+            .current_dir(&probe)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("run bisect command at {}", &id_hex(snapshot)[..12]))?;
+        use std::os::unix::process::ExitStatusExt;
+        let check = BisectCheck {
+            snapshot: id_hex(snapshot),
+            label: label.clone(),
+            passed: status.success(),
+            exit_code: status.code(),
+            signal: status.signal(),
+            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            probe_fork_ms: fork.elapsed.as_millis().min(u64::MAX as u128) as u64,
+        };
+        let passed = check.passed;
+        checks.insert(index, check);
+        Ok(passed)
+    }
+
+    fn apply_snapshot_transition_at(
+        &self,
+        root: &Path,
+        current: &ObjectId,
+        target: &ObjectId,
+    ) -> anyhow::Result<()> {
+        let current: Snapshot = self.store.read_struct(current, ObjectKind::Snapshot)?;
+        let target_snapshot: Snapshot = self.store.read_struct(target, ObjectKind::Snapshot)?;
+        let mut changes = Vec::new();
+        self.diff_directory(
+            Some(current.root_tree),
+            Some(target_snapshot.root_tree),
+            Vec::new(),
+            &[],
+            &mut changes,
+        )?;
+        let plan = RewindPlan {
+            target: id_hex(target),
+            changes,
+        };
+        let entries = self.entries_for_plan(&target_snapshot.root_tree, &plan)?;
+        self.apply_plan_at(root, &entries, &plan, &[])
     }
 
     fn diff_snapshot_pair(
@@ -1170,7 +1413,11 @@ impl AgitRepository {
         Ok((pre, plan))
     }
 
-    pub fn forget(mut self, purge: bool) -> anyhow::Result<()> {
+    pub fn forget(self, purge: bool) -> anyhow::Result<()> {
+        self.forget_internal(purge, true)
+    }
+
+    fn forget_internal(mut self, purge: bool, announce: bool) -> anyhow::Result<()> {
         self.stop_watcher()?;
         if claims::registry_path(self.store.root(), &self.family_id).exists() {
             claims::Registry::open(self.store.root(), &self.family_id)?
@@ -1190,7 +1437,9 @@ impl AgitRepository {
         }
         if purge {
             self.store.purge_workspace(&self.workspace_id)?;
-            eprintln!("workspace detached; unreachable data will be removed by `agit gc`");
+            if announce {
+                eprintln!("workspace detached; unreachable data will be removed by `agit gc`");
+            }
         }
         Ok(())
     }

@@ -12,6 +12,7 @@ Git protects commits. Agent checkpoints usually protect edits made through one a
 ./demo/agent-disaster.sh
 ./demo/risky-command.sh
 ./demo/shrink-cache.sh
+./demo/find-regression.sh
 ./demo/parallel-agent-forks.sh
 ./demo/two-machine-sync.sh
 ```
@@ -51,6 +52,9 @@ agit try -m "dependency upgrade" -- npm install framework@latest
 # Preview and reversibly remove recognized dependency/build caches.
 agit shrink
 agit shrink --yes
+
+# Find the first retained state where a command starts failing.
+agit bisect -- cargo test
 
 # Browse protected states.
 agit timeline
@@ -123,6 +127,8 @@ SSH sync keeps one `BatchMode` connection open, batches up to 1,024 opaque objec
 
 `agit shrink` recognizes common JavaScript, Python, frontend, and Rust dependency/build caches. Preview is read-only; `--yes` first seals a complete restore point. Its result separates workspace bytes removed from protected-store bytes added and reports the net, because a never-before-captured cache cannot be both locally recoverable and immediately free its full physical size. Use repeated `--path <relative-path>` options for project-specific regenerable directories; Git and agit internals are always refused.
 
+`agit bisect -- <command>` treats exit zero as passing and searches the recent timeline from oldest passing state to newest failing state. Use `--good <snapshot> --bad <snapshot>` to choose explicit anchors and `--limit` to widen the retained window. The baseline moves by Merkle delta in one scratch workspace; each command runs in a disposable CoW child, so test/build side effects cannot alter the source or later probes. Check output is discarded rather than buffered; the result reports every tested snapshot, exit status, check time, and probe-fork time.
+
 ## Agent Integration
 
 `agit mcp` is a local stdio MCP server. Bind it to one watched repository in any MCP-compatible coding agent:
@@ -168,6 +174,7 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Claim/release snapshots with owner, TTL, and conflict attribution in the DAG
 - Eager `.agit/coord/` blackboard propagation with offline reconciliation and deletion tombstones
 - Streaming cache discovery with honest logical/physical/net `shrink` accounting and exact undo
+- Logarithmic snapshot bisection with delta-reused baselines and side-effect-isolated CoW probes
 - Three-way full-state merge with explicit conflicts and scratch-fork verification
 - Crash-safe exact reachability GC with shared-chunk preservation
 - 64 KiB paged Merkle directories and disk-backed delta path indexing

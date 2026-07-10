@@ -146,6 +146,20 @@ enum Command {
         #[arg(long = "path")]
         paths: Vec<PathBuf>,
     },
+    /// Find the first retained snapshot where a check starts failing.
+    Bisect {
+        /// Known passing snapshot; must be paired with --bad.
+        #[arg(long)]
+        good: Option<String>,
+        /// Known failing snapshot; must be paired with --good.
+        #[arg(long)]
+        bad: Option<String>,
+        /// Maximum number of recent snapshots in the search window.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
     /// Three-way merge a fork after verifying the result in a scratch workspace.
     Merge {
         fork: String,
@@ -778,6 +792,31 @@ fn main() -> anyhow::Result<()> {
                 println!("Undo with: agit rewind {}", id_hex(&before));
             }
             removal?;
+        }
+        Command::Bisect {
+            good,
+            bad,
+            limit,
+            command,
+        } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let outcome = repository.bisect(&command, good.as_deref(), bad.as_deref(), limit)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                for check in &outcome.checks {
+                    println!(
+                        "{}  {:<4}  check {:>6} ms  fork {:>4} ms  {}",
+                        &check.snapshot[..12],
+                        if check.passed { "pass" } else { "fail" },
+                        check.elapsed_ms,
+                        check.probe_fork_ms,
+                        check.label.clone().unwrap_or_default()
+                    );
+                }
+                println!("Last good: {}", outcome.good_snapshot);
+                println!("First bad: {}", outcome.first_bad_snapshot);
+            }
         }
         Command::Merge {
             fork,
