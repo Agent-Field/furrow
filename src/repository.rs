@@ -540,6 +540,14 @@ impl AgitRepository {
         gc::collect(&mut self.store, dry_run)
     }
 
+    pub fn pin(&mut self, snapshot: &ObjectId) -> anyhow::Result<bool> {
+        self.store.pin_snapshot(&self.workspace_id, *snapshot)
+    }
+
+    pub fn unpin(&mut self, snapshot: &ObjectId) -> anyhow::Result<bool> {
+        self.store.unpin_snapshot(&self.workspace_id, snapshot)
+    }
+
     pub fn gc_global(dry_run: bool) -> anyhow::Result<GcReport> {
         let mut store = ObjectStore::open(data_root()?.join("store-v1"))?;
         gc::collect(&mut store, dry_run)

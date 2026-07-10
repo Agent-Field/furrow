@@ -51,6 +51,10 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
+    /// Keep a snapshot exact across timeline thinning and garbage collection.
+    Pin { snapshot: String },
+    /// Return a pinned snapshot to the normal retention policy.
+    Unpin { snapshot: String },
     /// Inspect path-level changes in a fork or since a snapshot.
     Diff {
         /// Fork name, full snapshot ID, or snapshot prefix.
@@ -363,6 +367,36 @@ fn main() -> anyhow::Result<()> {
                         snapshot.label.unwrap_or_default()
                     );
                 }
+            }
+        }
+        Command::Pin { snapshot } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let id = repository.resolve_snapshot(&snapshot)?;
+            let changed = repository.pin(&id)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"snapshot": id_hex(&id), "pinned": true, "changed": changed})
+                );
+            } else if changed {
+                println!("Pinned {}", id_hex(&id));
+            } else {
+                println!("Already pinned {}", id_hex(&id));
+            }
+        }
+        Command::Unpin { snapshot } => {
+            let mut repository = AgitRepository::open(&cli.repo)?;
+            let id = repository.resolve_snapshot(&snapshot)?;
+            let changed = repository.unpin(&id)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"snapshot": id_hex(&id), "pinned": false, "changed": changed})
+                );
+            } else if changed {
+                println!("Unpinned {}", id_hex(&id));
+            } else {
+                println!("Snapshot was not pinned {}", id_hex(&id));
             }
         }
         Command::Diff { target } => {
@@ -982,6 +1016,10 @@ fn main() -> anyhow::Result<()> {
                 println!(
                     "{} objects reachable; {} unreachable",
                     report.reachable_objects, report.unreachable_objects
+                );
+                println!(
+                    "{} retained snapshots; {} historical snapshots thinned",
+                    report.retained_snapshots, report.thinned_snapshots
                 );
                 println!(
                     "{} bytes {} ({} -> {})",

@@ -1,6 +1,7 @@
 use crate::catalog::{CachedFile, Catalog, PackCheckpoint, TimelineRow};
 use crate::model::{ObjectId, ObjectKind, SnapshotTrigger};
 use crate::refs::{RefLog, RefRecord};
+use crate::retention::RetentionLog;
 use anyhow::Context;
 use fs2::FileExt;
 use serde::{de::DeserializeOwned, Serialize};
@@ -315,8 +316,14 @@ impl ObjectStore {
     }
 
     pub fn timeline(&self, id: &str, limit: usize) -> anyhow::Result<Vec<TimelineRow>> {
-        Ok(RefLog::open(&self.root, id)?
-            .recent(limit)?
+        let refs = RefLog::open(&self.root, id)?;
+        let Some(head) = refs.head()? else {
+            return Ok(Vec::new());
+        };
+        let state = RetentionLog::open(&self.root, id)?.state()?;
+        let sequences = state.recent_sequences(head.sequence, limit);
+        Ok(refs
+            .records_at_sequences(&sequences)?
             .into_iter()
             .map(|record| TimelineRow {
                 id: record.snapshot_id,
@@ -325,6 +332,25 @@ impl ObjectStore {
                 trigger: trigger_name(&record.trigger).to_owned(),
             })
             .collect())
+    }
+
+    pub fn pin_snapshot(&self, workspace_id: &str, snapshot_id: ObjectId) -> anyhow::Result<bool> {
+        let _maintenance = self.acquire_maintenance_exclusive()?;
+        anyhow::ensure!(
+            self.catalog.object(&snapshot_id)?.is_some(),
+            "snapshot bytes are no longer available to pin"
+        );
+        let refs = RefLog::open(&self.root, workspace_id)?;
+        RetentionLog::open(&self.root, workspace_id)?.pin(&refs, snapshot_id)
+    }
+
+    pub fn unpin_snapshot(
+        &self,
+        workspace_id: &str,
+        snapshot_id: &ObjectId,
+    ) -> anyhow::Result<bool> {
+        let _maintenance = self.acquire_maintenance_exclusive()?;
+        RetentionLog::open(&self.root, workspace_id)?.unpin(snapshot_id)
     }
 
     pub fn cached_file(

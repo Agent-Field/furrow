@@ -3,6 +3,7 @@
 use crate::catalog::PackCheckpoint;
 use crate::model::{Blob, EntryKind, ObjectId, ObjectKind, Snapshot, Tree};
 use crate::refs::RefLog;
+use crate::retention::RetentionLog;
 use crate::store::ObjectStore;
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -30,6 +31,16 @@ pub struct GcReport {
     pub physical_bytes_before: u64,
     pub physical_bytes_after: u64,
     pub reclaimed_bytes: u64,
+    pub published_snapshots: u64,
+    pub retained_snapshots: u64,
+    pub thinned_snapshots: u64,
+}
+
+#[derive(Default)]
+struct RootSummary {
+    roots: u64,
+    published_snapshots: u64,
+    retained_snapshots: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,8 +139,16 @@ pub fn collect(store: &mut ObjectStore, dry_run: bool) -> anyhow::Result<GcRepor
 }
 
 fn collect_locked(store: &mut ObjectStore, dry_run: bool) -> anyhow::Result<GcReport> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs() as i64;
+    collect_locked_at(store, dry_run, now)
+}
+
+fn collect_locked_at(store: &mut ObjectStore, dry_run: bool, now: i64) -> anyhow::Result<GcReport> {
     let marks = MarkDatabase::create(store.root())?;
-    let roots = enqueue_roots(store.root(), &marks)?;
+    let root_summary = enqueue_roots(store.root(), &marks, now, !dry_run)?;
     traverse(store, &marks)?;
 
     let reachable_objects = marks.counts()?.0;
@@ -144,7 +163,7 @@ fn collect_locked(store: &mut ObjectStore, dry_run: bool) -> anyhow::Result<GcRe
     if dry_run {
         return Ok(GcReport {
             dry_run: true,
-            roots,
+            roots: root_summary.roots,
             reachable_objects,
             unreachable_objects,
             reachable_payload_bytes: reachable_payload,
@@ -152,13 +171,18 @@ fn collect_locked(store: &mut ObjectStore, dry_run: bool) -> anyhow::Result<GcRe
             physical_bytes_before: before,
             physical_bytes_after: projected,
             reclaimed_bytes: before.saturating_sub(projected),
+            published_snapshots: root_summary.published_snapshots,
+            retained_snapshots: root_summary.retained_snapshots,
+            thinned_snapshots: root_summary
+                .published_snapshots
+                .saturating_sub(root_summary.retained_snapshots),
         });
     }
 
     let after = compact(store, &marks)?;
     Ok(GcReport {
         dry_run: false,
-        roots,
+        roots: root_summary.roots,
         reachable_objects,
         unreachable_objects,
         reachable_payload_bytes: reachable_payload,
@@ -166,14 +190,24 @@ fn collect_locked(store: &mut ObjectStore, dry_run: bool) -> anyhow::Result<GcRe
         physical_bytes_before: before,
         physical_bytes_after: after,
         reclaimed_bytes: before.saturating_sub(after),
+        published_snapshots: root_summary.published_snapshots,
+        retained_snapshots: root_summary.retained_snapshots,
+        thinned_snapshots: root_summary
+            .published_snapshots
+            .saturating_sub(root_summary.retained_snapshots),
     })
 }
 
-fn enqueue_roots(store_root: &Path, marks: &MarkDatabase) -> anyhow::Result<u64> {
-    let mut roots = 0_u64;
+fn enqueue_roots(
+    store_root: &Path,
+    marks: &MarkDatabase,
+    now: i64,
+    persist_retention: bool,
+) -> anyhow::Result<RootSummary> {
+    let mut summary = RootSummary::default();
     let workspaces = store_root.join("workspaces");
     if !workspaces.exists() {
-        return Ok(0);
+        return Ok(summary);
     }
     for entry in fs::read_dir(workspaces)? {
         let entry = entry?;
@@ -182,9 +216,19 @@ fn enqueue_roots(store_root: &Path, marks: &MarkDatabase) -> anyhow::Result<u64>
         }
         let workspace_id = entry.file_name().to_string_lossy().into_owned();
         let refs = RefLog::open(store_root, &workspace_id)?;
-        refs.for_each_snapshot(|id| {
-            if marks.enqueue(&id, ObjectKind::Snapshot)? {
-                roots += 1;
+        let retention = RetentionLog::open(store_root, &workspace_id)?;
+        let state = if persist_retention {
+            retention.apply(&refs, now)?
+        } else {
+            retention.plan(&refs, now)?
+        };
+        refs.for_each_record(|record| {
+            summary.published_snapshots += 1;
+            if state.retains(record.sequence, &record.snapshot_id) {
+                summary.retained_snapshots += 1;
+                if marks.enqueue(&record.snapshot_id, ObjectKind::Snapshot)? {
+                    summary.roots += 1;
+                }
             }
             Ok(())
         })?;
@@ -195,7 +239,7 @@ fn enqueue_roots(store_root: &Path, marks: &MarkDatabase) -> anyhow::Result<u64>
                 .with_context(|| format!("read restore intent {}", intent_path.display()))?;
             for id in [intent.pre_snapshot, intent.target_snapshot] {
                 if marks.enqueue(&id, ObjectKind::Snapshot)? {
-                    roots += 1;
+                    summary.roots += 1;
                 }
             }
         }
@@ -205,11 +249,11 @@ fn enqueue_roots(store_root: &Path, marks: &MarkDatabase) -> anyhow::Result<u64>
             let incoming: SyncRoot = serde_json::from_slice(&fs::read(&incoming_path)?)
                 .with_context(|| format!("read incoming sync root {}", incoming_path.display()))?;
             if marks.enqueue(&incoming.snapshot, ObjectKind::Snapshot)? {
-                roots += 1;
+                summary.roots += 1;
             }
         }
     }
-    Ok(roots)
+    Ok(summary)
 }
 
 fn traverse(store: &ObjectStore, marks: &MarkDatabase) -> anyhow::Result<()> {
@@ -598,5 +642,92 @@ mod tests {
         assert_eq!(report.reachable_objects, 2);
         assert!(store.read_bytes(&snapshot, ObjectKind::Snapshot).is_ok());
         assert!(store.read_bytes(&tree, ObjectKind::Tree).is_ok());
+    }
+
+    #[test]
+    fn thinning_reclaims_old_graphs_but_preserves_pins_and_head() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = ObjectStore::open(temporary.path().to_owned()).unwrap();
+        store.ensure_workspace("workspace", b"/workspace").unwrap();
+        let week = 7 * 24 * 60 * 60;
+        let now = 200 * 24 * 60 * 60;
+
+        let mut snapshots = Vec::new();
+        let mut chunks = Vec::new();
+        for index in 0..3_u8 {
+            let chunk = store.put_bytes(ObjectKind::Chunk, &[index; 32]).unwrap();
+            let blob = store
+                .put_struct(
+                    ObjectKind::Blob,
+                    &Blob {
+                        chunks: vec![ChunkRef { id: chunk, len: 32 }],
+                        total_len: 32,
+                    },
+                )
+                .unwrap();
+            let tree = store
+                .put_struct(
+                    ObjectKind::Tree,
+                    &Tree {
+                        entries: vec![TreeEntry {
+                            name: b"state".to_vec(),
+                            kind: EntryKind::File,
+                            target: Some(blob),
+                            link_target: Vec::new(),
+                            mode: 0o100644,
+                            size: 32,
+                            mtime_secs: index as i64,
+                            mtime_nanos: 0,
+                            xattrs: None,
+                        }],
+                        pages: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let sealed_at = week + index as i64;
+            let snapshot = store
+                .put_struct(
+                    ObjectKind::Snapshot,
+                    &Snapshot {
+                        sealed_at_secs: sealed_at,
+                        ..snapshot(tree, snapshots.last().copied())
+                    },
+                )
+                .unwrap();
+            store
+                .publish_snapshot(
+                    "workspace",
+                    snapshot,
+                    sealed_at,
+                    None,
+                    SnapshotTrigger::Manual,
+                )
+                .unwrap();
+            snapshots.push(snapshot);
+            chunks.push(chunk);
+        }
+        assert!(store.pin_snapshot("workspace", snapshots[1]).unwrap());
+
+        let preview = collect_locked_at(&mut store, true, now).unwrap();
+        assert_eq!(preview.published_snapshots, 3);
+        assert_eq!(preview.retained_snapshots, 2);
+        assert_eq!(preview.thinned_snapshots, 1);
+        assert_eq!(store.timeline("workspace", 10).unwrap().len(), 3);
+        assert!(store.read_bytes(&chunks[0], ObjectKind::Chunk).is_ok());
+
+        let collected = collect_locked_at(&mut store, false, now).unwrap();
+        assert_eq!(collected.retained_snapshots, 2);
+        assert!(store.read_bytes(&chunks[0], ObjectKind::Chunk).is_err());
+        assert!(store.read_bytes(&chunks[1], ObjectKind::Chunk).is_ok());
+        assert!(store.read_bytes(&chunks[2], ObjectKind::Chunk).is_ok());
+        let timeline = store.timeline("workspace", 10).unwrap();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].id, snapshots[2]);
+        assert_eq!(timeline[1].id, snapshots[1]);
+
+        assert!(store.unpin_snapshot("workspace", &snapshots[1]).unwrap());
+        collect_locked_at(&mut store, false, now).unwrap();
+        assert!(store.read_bytes(&chunks[1], ObjectKind::Chunk).is_err());
+        assert!(store.read_bytes(&chunks[2], ObjectKind::Chunk).is_ok());
     }
 }

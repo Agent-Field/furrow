@@ -88,6 +88,13 @@ impl RefLog {
         &self,
         mut visit: impl FnMut(ObjectId) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        self.for_each_record(|record| visit(record.snapshot_id))
+    }
+
+    pub fn for_each_record(
+        &self,
+        mut visit: impl FnMut(&RefRecord) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         if !self.path.exists() {
             return Ok(());
         }
@@ -109,13 +116,57 @@ impl RefLog {
                 frame.record.previous_frame == previous,
                 "broken reference hash chain"
             );
-            visit(frame.record.snapshot_id)?;
+            visit(&frame.record)?;
             offset = frame.end;
             previous = frame.frame_hash;
             sequence += 1;
         }
         FileExt::unlock(&lock)?;
         Ok(())
+    }
+
+    pub fn find(&self, snapshot_id: &ObjectId) -> anyhow::Result<Option<RefRecord>> {
+        let mut found = None;
+        self.for_each_record(|record| {
+            if record.snapshot_id == *snapshot_id {
+                found = Some(record.clone());
+            }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    pub fn records_at_sequences(&self, sequences: &[u64]) -> anyhow::Result<Vec<RefRecord>> {
+        if sequences.is_empty() || !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let lock = self.lock()?;
+        let mut log = self.open_log()?;
+        self.ensure_index(&mut log)?;
+        let mut index = File::open(&self.index_path)?;
+        let count = (index.metadata()?.len() - INDEX_MAGIC.len() as u64) / INDEX_RECORD_LEN as u64;
+        let mut records = Vec::with_capacity(sequences.len());
+        for sequence in sequences {
+            anyhow::ensure!(
+                *sequence > 0 && *sequence <= count,
+                "reference sequence is outside the indexed log"
+            );
+            index.seek(SeekFrom::Start(
+                INDEX_MAGIC.len() as u64 + (*sequence - 1) * INDEX_RECORD_LEN as u64,
+            ))?;
+            let indexed = read_index_record(&mut index)?;
+            let frame = read_frame_at(&mut log, indexed.start)?
+                .context("reference index points beyond the log")?;
+            anyhow::ensure!(
+                frame.record.sequence == *sequence
+                    && frame.end == indexed.end
+                    && frame.frame_hash == indexed.frame_hash,
+                "reference index does not match the authoritative log"
+            );
+            records.push(frame.record);
+        }
+        FileExt::unlock(&lock)?;
+        Ok(records)
     }
 
     /// Returns newest-first records while reading only O(limit) log frames once

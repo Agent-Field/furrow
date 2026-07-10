@@ -63,6 +63,9 @@ agit bisect -- cargo test
 # Browse protected states.
 agit timeline
 
+# Keep an important state exact regardless of its age.
+agit pin <snapshot>
+
 # Inspect the exact, best-effort, and currently unsupported fidelity aspects.
 agit status --fidelity
 
@@ -105,6 +108,9 @@ AGIT_AGENT_ID=auth-agent agit release 'src/auth/**'
 # Reclaim bytes no retained workspace can reach.
 agit gc --dry-run
 agit gc
+
+# Return a permanent restore point to normal retention when it is no longer needed.
+agit unpin <snapshot>
 
 # Pair two machines through an encrypted directory remote you control.
 agit pair /mnt/private/agit-sync --name my-project
@@ -185,6 +191,8 @@ Every actual rewind first publishes a complete `pre_rewind` snapshot. Rewinding 
 - Cross-repository content deduplication in an external per-user store
 - Hash-verified, framed append-only packs
 - Fsynced, hash-chained authoritative snapshot publication log
+- Crash-safe hourly/daily/weekly manifest thinning in a separate hash-chained control log
+- Permanent snapshot pins, dry-run retention previews, and exact pin/head-aware garbage collection
 - Catalog reconstruction after deleting the SQLite index
 - Recovery from truncated pack tails
 - Human and JSON timelines

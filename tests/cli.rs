@@ -2001,6 +2001,51 @@ fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
     assert_eq!(responses[6]["error"]["code"], -32602);
 }
 
+#[test]
+fn snapshots_can_be_pinned_and_unpinned_idempotently() {
+    let fixture = Fixture::new();
+    let snapshot = fixture.watch();
+
+    let pin = fixture
+        .agit()
+        .args(["--json", "pin", &snapshot])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pin: Value = serde_json::from_slice(&pin).unwrap();
+    assert_eq!(pin["snapshot"], snapshot);
+    assert_eq!(pin["pinned"], true);
+    assert_eq!(pin["changed"], true);
+
+    let repeated = fixture
+        .agit()
+        .args(["--json", "pin", &snapshot])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&repeated).unwrap()["changed"],
+        false
+    );
+
+    let unpin = fixture
+        .agit()
+        .args(["--json", "unpin", &snapshot])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let unpin: Value = serde_json::from_slice(&unpin).unwrap();
+    assert_eq!(unpin["snapshot"], snapshot);
+    assert_eq!(unpin["pinned"], false);
+    assert_eq!(unpin["changed"], true);
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")
