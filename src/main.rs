@@ -128,6 +128,15 @@ enum Command {
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
+    /// Run a command with exact before/after restore points in the current workspace.
+    #[command(name = "try")]
+    Attempt {
+        /// Human label recorded on both restore points.
+        #[arg(short, long)]
+        message: Option<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
     /// Three-way merge a fork after verifying the result in a scratch workspace.
     Merge {
         fork: String,
@@ -643,6 +652,44 @@ fn main() -> anyhow::Result<()> {
             );
             anyhow::ensure!(status.success(), "fork command exited with {status}");
         }
+        Command::Attempt { message, command } => {
+            anyhow::ensure!(!cli.json, "--json cannot be combined with `agit try`");
+            let (program, arguments) = command
+                .split_first()
+                .context("`agit try` requires a command after --")?;
+            let command_name = std::path::Path::new(program)
+                .file_name()
+                .unwrap_or(program.as_os_str())
+                .to_string_lossy();
+            let label = message.unwrap_or_else(|| command_name.into_owned());
+            anyhow::ensure!(!label.trim().is_empty(), "try label cannot be empty");
+            anyhow::ensure!(label.len() <= 256, "try label is limited to 256 bytes");
+            let (mut repository, before) = AgitRepository::attach_and_snapshot(
+                &cli.repo,
+                Some(format!("before try: {label}")),
+                SnapshotTrigger::AgentRun,
+            )?;
+            eprintln!("Protected {}", id_hex(&before));
+
+            let status = std::process::Command::new(program)
+                .args(arguments)
+                .current_dir(repository.root())
+                .env("AGIT_TRY_SNAPSHOT", id_hex(&before))
+                .status()
+                .with_context(|| format!("run {:?}", program))?;
+            let outcome = status
+                .code()
+                .map_or_else(|| status.to_string(), |code| format!("exit {code}"));
+            let after = repository.snapshot(
+                Some(format!("after try ({outcome}): {label}")),
+                SnapshotTrigger::AgentRun,
+            )?;
+            eprintln!("Result {}", id_hex(&after));
+            eprintln!("Undo with: agit rewind {}", id_hex(&before));
+            if !status.success() {
+                exit_with_status(status);
+            }
+        }
         Command::Merge {
             fork,
             check,
@@ -808,6 +855,15 @@ fn print_plan(plan: &agit::RewindPlan) {
     for change in &plan.changes {
         println!("  {:<8} {}", change.action, change.path);
     }
+}
+
+fn exit_with_status(status: std::process::ExitStatus) -> ! {
+    use std::os::unix::process::ExitStatusExt;
+
+    let code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
+    std::process::exit(code)
 }
 
 fn spawn_background_watcher(repository: &AgitRepository, debounce_ms: u64) -> anyhow::Result<()> {

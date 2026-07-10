@@ -126,6 +126,70 @@ fn path_rewind_restores_ignored_secret_without_touching_new_work() {
 }
 
 #[test]
+fn try_auto_protects_an_unwatched_workspace_and_preserves_the_command_exit_code() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .agit()
+        .args([
+            "try",
+            "-m",
+            "risky migration",
+            "--",
+            "/bin/sh",
+            "-c",
+            "rm -f .env; printf 'damaged\\n' > app.txt; exit 17",
+        ])
+        .assert()
+        .code(17)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let before = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Protected "))
+        .expect("pre-command snapshot was reported");
+    assert_eq!(before.len(), 64);
+    assert!(stderr.contains(&format!("Undo with: agit rewind {before}")));
+    assert!(!fixture.repo.join(".env").exists());
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"damaged\n"
+    );
+
+    fixture
+        .agit()
+        .args(["rewind", before, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(fixture.repo.join(".env")).unwrap(),
+        b"TOKEN=original\n"
+    );
+    assert_eq!(
+        fs::read(fixture.repo.join("app.txt")).unwrap(),
+        b"tracked original\n"
+    );
+
+    let timeline = fixture
+        .agit()
+        .args(["--json", "timeline", "--limit", "4"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let timeline: Value = serde_json::from_slice(&timeline).unwrap();
+    let timeline = timeline.as_array().unwrap();
+    assert!(timeline.iter().any(|snapshot| {
+        snapshot["label"] == "before try: risky migration" && snapshot["trigger"] == "initial"
+    }));
+    assert!(timeline.iter().any(|snapshot| {
+        snapshot["label"] == "after try (exit 17): risky migration"
+            && snapshot["trigger"] == "agent_run"
+    }));
+}
+
+#[test]
 fn full_rewind_restores_git_ignored_untracked_metadata_and_is_reversible() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();

@@ -10,6 +10,7 @@ Git protects commits. Agent checkpoints usually protect edits made through one a
 
 ```bash
 ./demo/agent-disaster.sh
+./demo/risky-command.sh
 ./demo/parallel-agent-forks.sh
 ./demo/two-machine-sync.sh
 ```
@@ -42,6 +43,9 @@ agit watch
 
 # Create a meaningful restore point before a risky agent task.
 agit snap -m "before dependency upgrade"
+
+# Run any command with automatic before/after restore points; no prior setup required.
+agit try -m "dependency upgrade" -- npm install framework@latest
 
 # Browse protected states.
 agit timeline

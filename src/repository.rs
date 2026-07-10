@@ -194,6 +194,18 @@ struct SyncState {
 
 impl AgitRepository {
     pub fn watch(root: &Path) -> anyhow::Result<(Self, ObjectId)> {
+        Self::attach_and_snapshot(
+            root,
+            Some("initial protection".to_owned()),
+            SnapshotTrigger::Manual,
+        )
+    }
+
+    pub fn attach_and_snapshot(
+        root: &Path,
+        label: Option<String>,
+        existing_trigger: SnapshotTrigger,
+    ) -> anyhow::Result<(Self, ObjectId)> {
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
@@ -232,11 +244,11 @@ impl AgitRepository {
             .workspace_head(&repository.workspace_id)?
             .is_some()
         {
-            SnapshotTrigger::Manual
+            existing_trigger
         } else {
             SnapshotTrigger::Initial
         };
-        let id = repository.snapshot(Some("initial protection".to_owned()), trigger)?;
+        let id = repository.snapshot(label, trigger)?;
         Ok((repository, id))
     }
 
