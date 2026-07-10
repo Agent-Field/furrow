@@ -59,3 +59,21 @@ Still unproven and therefore not claimed as achieved:
 - Ten-universe physical-memory/page-cache sharing. The harness measures startup wall time, CPU, and process RSS, but the `~1.0x` shared-page-cache goal remains unclaimed until resident pages are measured on Linux CoW filesystems.
 - Generic flat-directory Merkle diff is proportional to root page count; agent delta sealing avoids that path through the disk-backed changed-path index.
 - Fork verification remains O(entries) without a true immutable filesystem snapshot, even when hierarchy creation is atomic.
+
+## Warm SSH Session Smoke Baseline: 2026-07-10
+
+The CLI integration fixture runs two independent repositories and object stores
+through the real framed SSH-helper protocol, using a local wrapper in place of
+network transport. A peer publishes a small changed snapshot while the other
+side is blocked on the persistent HEAD subscription. The measured publish start
+through notification, pull, and workspace materialization was **255 ms** on the
+development Mac. The same test asserts one SSH helper process across multiple
+reconciliation cycles, a measured notification phase, and
+`reused_connection=true` on the second operation.
+
+This is a local protocol regression baseline, not a WAN result. Run the same
+test under latency/loss shaping before claiming the 100 ms RTT contract:
+
+```bash
+cargo test --test cli persistent_ssh_helper_syncs_independent_stores_over_framed_stdio -- --nocapture
+```
