@@ -54,8 +54,14 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         idle_minutes: u64,
     },
+    /// Exchange sealed object frames between stores.
+    Exchange {
+        #[command(subcommand)]
+        command: exchange::Exchange,
+    },
+    // Keep the imported top-level spellings available to existing callers.
     #[command(flatten)]
-    Exchange(exchange::Exchange),
+    ExchangeLegacy(exchange::Exchange),
     #[command(name = "__remote", hide = true)]
     RemoteHelper { namespace: String },
     #[command(name = "__namespace-probe", hide = true)]
@@ -575,7 +581,9 @@ fn main() -> anyhow::Result<()> {
             socket,
             idle_minutes,
         } => serve(socket, idle_minutes)?,
-        Command::Exchange(verb) => exchange::run(verb, &cli.repo, cli.json)?,
+        Command::Exchange { command: verb } | Command::ExchangeLegacy(verb) => {
+            exchange::run(verb, &cli.repo, cli.json)?
+        }
         Command::RemoteHelper { namespace } => {
             furrow::remote::serve(&namespace)?;
         }

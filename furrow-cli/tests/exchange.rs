@@ -24,7 +24,8 @@ fn furrow(data: &Path, repo: &Path) -> Command {
         .env("FURROW_DEDUP_SECRET", DEDUP)
         .arg("--json")
         .arg("--repo")
-        .arg(repo);
+        .arg(repo)
+        .arg("exchange");
     command
 }
 
