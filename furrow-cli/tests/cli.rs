@@ -118,18 +118,55 @@ fn wait_until(description: &str, timeout: Duration, mut predicate: impl FnMut() 
     panic!("timed out waiting for {description}");
 }
 
-fn follow_process(repo: &Path, data: &Path) -> ChildGuard {
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+struct FollowProcess {
+    _child: ChildGuard,
+    output: std::sync::mpsc::Receiver<String>,
+}
+
+impl FollowProcess {
+    fn wait_for(&self, prefix: &str) -> String {
+        // Cold publication includes durable disk writes and can take longer
+        // under the full suite's I/O load. Wait for the operation's completion
+        // message, rather than polling a file that can appear before it ends.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut seen = Vec::new();
+        loop {
+            match self
+                .output
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) if line.starts_with(prefix) => return line,
+                Ok(line) => seen.push(line),
+                Err(error) => panic!("follow did not report {prefix:?}: {error}; output: {seen:?}"),
+            }
+        }
+    }
+}
+
+fn follow_process(repo: &Path, data: &Path) -> FollowProcess {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
         .env("FURROW_DATA_DIR", data)
         .env("FURROW_NO_DAEMON", "1")
         .arg("--repo")
         .arg(repo)
         .args(["sync", "--follow", "--poll-seconds", "1"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .unwrap();
-    ChildGuard(child)
+    let stdout = child.stdout.take().unwrap();
+    let (send, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    FollowProcess {
+        _child: ChildGuard(child),
+        output,
+    }
 }
 
 /// Spawn `furrow watch --foreground` and return once the daemon has actually
@@ -806,6 +843,31 @@ fn path_rewind_refuses_to_follow_a_symlink_parent_outside_workspace() {
         .failure()
         .stderr(predicates::str::contains("symlink parent"));
     assert_eq!(fs::read(outside.join("value.txt")).unwrap(), b"outside\n");
+}
+
+#[test]
+fn watch_seals_and_restores_non_git_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("plain");
+    let data = temp.path().join("data");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("app.txt"), b"plain folder\n").unwrap();
+    let watched = furrow_at(&repo, &data)
+        .args(["--json", "watch", "--no-daemon"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let watched: Value = serde_json::from_slice(&watched).unwrap();
+    let head = watched["snapshot"].as_str().unwrap();
+    fs::write(repo.join("app.txt"), b"changed\n").unwrap();
+    furrow_at(&repo, &data)
+        .args(["rewind", head, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(repo.join("app.txt")).unwrap(), b"plain folder\n");
+    assert!(!repo.join(".git").exists());
 }
 
 #[test]
@@ -2669,16 +2731,8 @@ fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_d
         .assert()
         .success();
 
-    let _publisher = follow_process(&fixture.repo, &fixture.data);
-    wait_until(
-        "the first followed snapshot to publish",
-        Duration::from_secs(10),
-        || {
-            let mut files = Vec::new();
-            collect_files(&remote, &mut files);
-            files.iter().any(|path| path.file_name().unwrap() == "HEAD")
-        },
-    );
+    let publisher = follow_process(&fixture.repo, &fixture.data);
+    publisher.wait_for("Published ");
     let bootstrap = furrow_at(&peer, &peer_data)
         .args(["--json", "sync", "--pull", "--bootstrap"])
         .assert()
@@ -2690,7 +2744,7 @@ fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_d
     assert_eq!(bootstrap["disposition"], "bootstrapped");
     assert_eq!(fs::read(peer.join(".env")).unwrap(), b"TOKEN=original\n");
 
-    let _subscriber = follow_process(&peer, &peer_data);
+    let subscriber = follow_process(&peer, &peer_data);
     let bytes_before_delta = tree_physical_bytes(&remote);
     fs::write(fixture.repo.join("app.txt"), b"one small agent edit\n").unwrap();
     fixture
@@ -2699,10 +2753,12 @@ fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_d
         .assert()
         .success();
 
-    wait_until(
-        "the peer to receive the followed delta",
-        Duration::from_secs(12),
-        || fs::read(peer.join("app.txt")).ok().as_deref() == Some(b"one small agent edit\n"),
+    publisher.wait_for("Published ");
+    let received = subscriber.wait_for("Remote ");
+    assert!(received.ends_with("FastForwarded"), "{received}");
+    assert_eq!(
+        fs::read(peer.join("app.txt")).unwrap(),
+        b"one small agent edit\n"
     );
     let delta_bytes = tree_physical_bytes(&remote).saturating_sub(bytes_before_delta);
     assert!(

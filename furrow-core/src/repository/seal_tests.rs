@@ -137,6 +137,49 @@ fn seals_a_folder_that_is_not_a_git_repository() {
 }
 
 #[test]
+fn a_seal_during_publication_is_still_published_on_the_next_follow_cycle() {
+    let setup = Setup::new();
+    setup.write("app.txt", "first\n");
+    let (mut repository, first) = setup.seal(SealOptions::default());
+    let remote = setup._temp.path().join("remote");
+    repository.pair(&remote, "publication-race", None).unwrap();
+    let mut session = repository.sync_follow_session(None).unwrap();
+
+    // Stop between uploading a snapshot and recording the successful sync.
+    // A second process can seal a newer head during that network transfer.
+    let report = sync::push_on(
+        &repository.store,
+        first,
+        &session.config,
+        None,
+        true,
+        &mut session.remote,
+    )
+    .unwrap();
+    setup.write("app.txt", "second\n");
+    let mut other = FurrowRepository::open(&setup.root).unwrap();
+    let second = other.snapshot(None, SnapshotTrigger::Manual).unwrap();
+    let second_root = root_tree(&other, &second);
+    drop(other);
+
+    let published_root = parse_id(&report.root).unwrap();
+    repository
+        .write_sync_state(published_root, published_root)
+        .unwrap();
+    assert!(
+        matches!(
+            repository.sync_follow_once(&mut session).unwrap(),
+            SyncFollowOutcome::Published { .. }
+        ),
+        "a newer local seal must not be mistaken for the snapshot already uploaded"
+    );
+    assert_eq!(
+        sync::published_root_on(&session.config, &mut session.remote).unwrap(),
+        Some(second_root)
+    );
+}
+
+#[test]
 fn a_file_untouched_since_it_was_read_is_not_read_again() {
     let setup = Setup::new();
     setup.write("old.txt", "old\n");

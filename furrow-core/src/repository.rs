@@ -996,7 +996,8 @@ impl FurrowRepository {
         )?;
         let expected = self.read_sync_state()?.map(|state| state.remote_root);
         let report = sync::push_on(&self.store, snapshot, config, expected, takeover, remote)?;
-        self.write_sync_state(parse_id(&report.root)?)?;
+        let published_root = parse_id(&report.root)?;
+        self.write_sync_state(published_root, published_root)?;
         Ok(report)
     }
 
@@ -1084,7 +1085,7 @@ impl FurrowRepository {
             let pulled = pull.finish()?;
             self.write_sync_incoming(pulled.snapshot)?;
             drop(maintenance);
-            self.write_sync_state(pulled.root)?;
+            self.write_sync_state(pulled.root, local_snapshot.root_tree)?;
             self.clear_sync_incoming()?;
             return Ok(sync_pull_outcome(
                 SyncDisposition::UpToDate,
@@ -1264,7 +1265,7 @@ impl FurrowRepository {
             baseline_install_ms,
             watcher_requiesce_ms,
         };
-        self.write_sync_state(pulled.root)?;
+        self.write_sync_state(pulled.root, incoming.root_tree)?;
         self.clear_sync_incoming()?;
         Ok(sync_pull_outcome(
             if bootstrap {
@@ -1354,7 +1355,7 @@ impl FurrowRepository {
                 }) || (last_synced.is_none() && local_snapshot.root_tree == remote_root) =>
             {
                 if last_synced.is_none() {
-                    self.write_sync_state(remote_root)?;
+                    self.write_sync_state(remote_root, local_snapshot.root_tree)?;
                 }
                 Ok(SyncFollowOutcome::Idle)
             }
@@ -2676,25 +2677,19 @@ impl FurrowRepository {
         Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
     }
 
-    fn write_sync_state(&self, remote_root: ObjectId) -> anyhow::Result<()> {
+    /// Records the exact local tree reconciled with the remote. Another process
+    /// may have sealed a newer head during the transfer; rereading it here would
+    /// mark that untransferred tree as synced and make follow skip its update.
+    fn write_sync_state(&self, remote_root: ObjectId, local_root: ObjectId) -> anyhow::Result<()> {
         let path = self.sync_state_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let local_root = self
-            .store
-            .workspace_head(&self.workspace_id)?
-            .map(|snapshot| {
-                self.store
-                    .read_struct::<Snapshot>(&snapshot, ObjectKind::Snapshot)
-                    .map(|snapshot| snapshot.root_tree)
-            })
-            .transpose()?;
         atomic_write(
             &path,
             &serde_json::to_vec(&SyncState {
                 remote_root,
-                local_root,
+                local_root: Some(local_root),
             })?,
         )
     }
