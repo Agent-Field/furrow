@@ -1,8 +1,8 @@
 name: release
 
 # Publishes per-platform `furrow` binaries so callers can install it without a
-# Rust toolchain. Windows is absent on purpose: 13 source files use
-# `std::os::unix` with no `cfg(windows)` guards, so a native Windows build needs
+# Rust toolchain. Windows is absent on purpose: the workspace uses Unix-only
+# filesystem APIs and Unix sockets, so a native Windows build needs
 # a source port, not a build target. Windows users reach furrow through WSL,
 # which uses the linux asset.
 
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish (e.g. v0.1.0)"
+        description: "Existing tag to build and publish (e.g. v0.2.0)"
         required: true
         type: string
 
@@ -61,11 +61,11 @@ jobs:
 
       - name: Install toolchain
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
+          rustup show active-toolchain
           rustup target add ${{ matrix.target }}
 
       - name: Build
-        run: cargo +stable build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked -p furrow-cli --bin furrow --target ${{ matrix.target }}
 
       - name: Smoke test
         if: matrix.native
