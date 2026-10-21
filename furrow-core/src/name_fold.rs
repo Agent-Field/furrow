@@ -75,18 +75,38 @@ impl NameFolding {
 
 /// Whether creating `first` in `dir` makes `second` exist too.
 fn folds(dir: &Path, first: &str, second: &str) -> bool {
-    let created = dir.join(first);
-    if fs::write(&created, b"").is_err() {
+    // Exclusive creation protects existing workspace files, including ones
+    // whose names happen to match the probe's prefix. Keep the same random
+    // suffix when checking the alternate spelling on this directory's FS.
+    let Ok(created) = tempfile::Builder::new().prefix(first).tempfile_in(dir) else {
         return false;
-    }
-    let same = fs::symlink_metadata(dir.join(second)).is_ok();
-    let _ = fs::remove_file(&created);
-    same
+    };
+    let Some(name) = created.path().file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let suffix = name.strip_prefix(first).expect("probe filename prefix");
+    fs::symlink_metadata(dir.join(format!("{second}{suffix}"))).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folding_probe_preserves_existing_workspace_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for (first, second) in [
+            (".furrow-fold-Aa", ".furrow-fold-aA"),
+            (".furrow-fold-\u{e9}", ".furrow-fold-e\u{301}"),
+        ] {
+            let existing = dir.path().join(first);
+            fs::write(&existing, b"workspace content").unwrap();
+            let before = fs::read_dir(dir.path()).unwrap().count();
+            folds(dir.path(), first, second);
+            assert_eq!(fs::read(existing).unwrap(), b"workspace content");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
+        }
+    }
 
     #[test]
     fn case_folding_joins_names_that_differ_only_in_case() {
