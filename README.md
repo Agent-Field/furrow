@@ -19,9 +19,9 @@
 
 </div>
 
-**furrow copy-on-write forks your entire workspace, every file, dependency, and piece of local state, into a byte-exact copy in about a second. Fork it right here on your machine for another terminal, or send it to a cloud sandbox or your other laptop with the same guarantee.**
+**furrow snapshots your working directory, including ignored files, dependencies, and local state, and creates isolated forks locally or materializes snapshots on another machine.** Local forks use filesystem copy-on-write when available, with a streaming-copy fallback. Capture policy, filesystem support, and the fidelity report determine what can be restored.
 
-One fork, one primitive, wherever an agent runs: instant and disk-cheap right next to you, or sealed and encrypted so it can reach a completely different machine. You stop being the one who copies config and reseeds state by hand before an agent can even start.
+Local forks can share unchanged disk blocks on supported filesystems; sealed, encrypted objects carry captured state to another machine. This includes local files that would otherwise need to be copied and configured by hand before an agent can start.
 
 ```bash
 cd my-project && furrow watch
@@ -29,7 +29,7 @@ cd my-project && furrow watch
 
 That's the whole setup. From this moment your workspace is continuously sealed into an immutable, content-addressed timeline: fork it, diff it, merge it, materialize it on another machine, rewind it when anything — human or agent — breaks it. Git versions your commits; furrow versions everything between them.
 
-Local-first and Apache-2.0. No account, no telemetry, works offline. Remotes, when you add them, receive only ciphertext.
+Local-first and Apache-2.0. No account, no telemetry, works offline. Snapshot content is encrypted before it reaches a remote.
 
 Every scenario below is a runnable script in [`./demo/`](demo/).
 
@@ -43,7 +43,7 @@ Start your agents the way you always start them — just more of them. One optio
 alias claude='furrow exec -- claude'    # once, in your shell profile
 ```
 
-Now open three terminals and run `claude` in each. Each session gets a warm, isolated copy of the *full* working state — dependencies, `.env`, database, everything — via filesystem copy-on-write: ready in about a second, and ten universes cost roughly the disk of one. No cold `npm install`, no port collisions, no shared files to fight over.
+Now open three terminals and run `claude` in each. Each session gets an isolated copy of captured working state, including dependencies, `.env`, and database files unless excluded by policy. Filesystem copy-on-write can share unchanged disk blocks; the fallback copies files. Applications still need their own port configuration.
 
 While they work, **conflict radar** watches all universes and flags two agents touching the same file *before* merge time. Agents can partition work and leave notes for each other through plain files — no orchestrator. When a universe is done:
 
@@ -55,20 +55,20 @@ Skip the alias and sessions simply share the directory like today — still seal
 
 ## Parallel agents, another machine
 
-Same fork, different machine. Cloud sandboxes and second machines normally see your last push — never your dirty edits, `.env`, dev database, or Git index. furrow materializes your *current state*, exactly, on any machine that can reach yours (SSH over LAN or Tailscale), or through any S3-compatible bucket as an always-available encrypted mailbox. No hosted service required.
+Same fork, different machine. Cloud sandboxes and second machines normally see your last push — never your dirty edits, `.env`, dev database, or Git index. furrow can materialize captured state on another machine over SSH (including LAN or Tailscale), or through an S3-compatible bucket as an encrypted mailbox. Capture policy and the destination filesystem determine which files and metadata can be restored. No hosted service is required.
 
 ```bash
-furrow remote add ssh://dev@machine-a.tailnet --name my-project && furrow sync --follow
+furrow remote add ssh://dev@machine-a.example.test --name my-project && furrow sync --follow
 
 # on the other machine — the clone is your complete working state, not a checkout
-FURROW_RECOVERY_KEY=<key> furrow clone ssh://dev@machine-a.tailnet/my-project
+FURROW_RECOVERY_KEY=<key> furrow clone ssh://dev@machine-a.example.test/my-project
 ```
 
-`sync --follow` keeps a warm session both ways: seal on one machine, and it's on the other before you've switched chairs. Transfers are deduplicated deltas — a day of work syncs as kilobytes. Remotes hold only ciphertext; the recovery key (entered once per machine) is the only thing that can read a workspace.
+`sync --follow` keeps a session that reconciles sealed changes in either direction. Only missing objects transfer, so a small edit can send a small delta. Remotes hold ciphertext; a machine needs the recovery key to read it.
 
 > A laptop died mid-session. The exact working directory — dirty edits, `.env`, dev database — came back on a different machine from an S3 bucket that never saw plaintext.
 
-**Measured, end-to-end:** Agent A edits source and tests on one machine, furrow
+**Historical upstream measurements:** Agent A edits source and tests on one machine, furrow
 encrypts and publishes the sealed state, and Agent B receives a usable workspace
 on a separate machine, reviews it, and sends a follow-up change back.
 
@@ -84,7 +84,8 @@ turns. Rates include encryption and transport; handoff and materialization also
 include making the destination usable. Idle RSS was 16.6 MB on machine A and
 15.7 MB on machine B for its follower plus A's remote helper. The encrypted
 remote occupied 12.9 MB after the cold state and retained agent turns. These are
-observed integration results, not guarantees.
+observed integration results, not guarantees, and have not been remeasured for
+v0.2.0.
 
 ## Rewind what Git can't see
 
@@ -96,7 +97,7 @@ furrow rewind <snapshot> --paths .env    # one secret back, newer work untouched
 furrow rewind <snapshot>                 # or the whole workspace, byte-exact
 ```
 
-Restoration covers symlinks, permissions, extended attributes, SQLite (with a logically consistent image available), and Git's own mutable state. `--dry-run` previews any rewind's impact first.
+Restoration covers symlinks, permissions, supported user extended attributes, hard links, SQLite (with a logically consistent image available), and Git's own mutable state. macOS system-managed attributes are omitted. On filesystems that fold case or Unicode names, rewind holds colliding names out of its plan and reports them in `held`; the snapshot retains both entries. `--dry-run` previews a rewind's impact first.
 
 > `.env` and the dev SQLite database, both back, both intact, after an agent ran `git clean -fdx`.
 
@@ -109,7 +110,7 @@ Restoration covers symlinks, permissions, extended attributes, SQLite (with a lo
 
 ## Built for agents as first-class users
 
-The CLI is the agent API: `--json` everywhere, stable IDs from every mutation, structured errors, and destructive operations gated on explicit IDs plus `--yes` — a prompt in machine mode is an error, not a hang. `furrow hook install` turns agent turns into attributed restore points; `furrow events --follow` streams seals, conflicts, and merges as resumable NDJSON; `furrow mcp` serves harnesses that prefer MCP. Nothing in furrow knows which agent is calling — Claude Code, Codex, Cursor, or a shell script get the same contract.
+The CLI is the agent API: `--json` provides command results with stable snapshot IDs, while long-running commands use text or protocol streams. Rewind exposes `--dry-run` and `--yes` for scripted use. `furrow hook install` writes adapters for attributed restore points; `furrow events --follow` streams seals, conflicts, and merges as resumable NDJSON; `furrow mcp` serves harnesses that prefer MCP. Claude Code, Codex, Cursor, and shell scripts can use the same commands.
 
 <details>
 <summary><strong>Full command reference</strong> — every command, one line each</summary>
@@ -132,6 +133,9 @@ The CLI is the agent API: `--json` everywhere, stable IDs from every mutation, s
 | `furrow hook install` | Turn agent turns into attributed restore points |
 | `furrow events --follow` | Stream seals/conflicts/merges as NDJSON |
 | `furrow mcp` | Serve furrow over MCP for harnesses that prefer it |
+| `furrow exchange export\|published\|want\|import` | Exchange sealed object frames and track publication ledgers |
+| `furrow exchange rebind\|materialize` | Follow a moved workspace or restore an imported head |
+| `furrow serve --socket <path>` | Serve engine requests over a local Unix socket |
 
 </details>
 
@@ -139,14 +143,14 @@ The CLI is the agent API: `--json` everywhere, stable IDs from every mutation, s
 
 The load-bearing decisions, for readers who want them:
 
-- **Immutable Merkle DAG over content-defined chunks.** A snapshot ID exists only after every referenced byte is durable. Sealing cost scales with changed entries, never repository size; memory stays bounded regardless of file size.
+- **Immutable Merkle DAG over content-defined chunks.** A snapshot is published only after its referenced bytes are durable. Changed-path sealing visits supplied paths and their ancestors; full capture walks the tree and reuses a stat cache. New hard links or policy changes can require a full walk.
 - **Crash-safe by construction.** Hash-verified append-only packs, an fsynced hash-chained publication log, recovery from truncated pack tails and deleted indexes — SQLite is an advisory index, never the truth.
 - **Warm forks via native CoW** — APFS `clonefile`, Linux `FICLONE` — with a streaming-copy fallback whose cost is disclosed before the fork runs.
 - **Retention with honest grades.** Timelines thin under hard disk budgets; every snapshot knows whether it's byte-exact or partial, and every missing path knows its recovery route. Pins override everything. `furrow estimate` projects store cost before you ever attach.
 - **Encryption below the transport.** XChaCha20-Poly1305, opaque remote names, every chunk verified against its BLAKE3 identity on restore; path traversal and symlink-escape tricks rejected at the boundary.
-- **The store never lives inside the repository.** `.furrow/` holds a pointer and policy; deleting it is recoverable. Exclusions (`.furrowpolicy`: `exclude node_modules`) are honored by capture, watcher, and rewind alike.
+- **An external store by default.** Ordinary workspaces keep identity pointers in `.furrow/`; deleting them is recoverable from the store. Composed workspaces keep identity entirely in the store. Exclusions (`.furrowpolicy`: `exclude node_modules`) are honored by capture, watcher, and rewind alike.
 
-Reproducible performance claims — `cargo bench --bench engine` (regression ceilings checked on macOS and Linux; a 1M-file reference profile available). Methodology and baselines: [docs/performance.md](docs/performance.md).
+Reproducible performance harness — `cargo bench -p furrow-core --bench engine` (regression ceilings and a 1M-file reference profile are available). Methodology and historical baselines: [docs/performance.md](docs/performance.md).
 
 ## Honest edges
 
@@ -157,10 +161,38 @@ Reproducible performance claims — `cargo bench --bench engine` (regression cei
 
 ## Development
 
+The Cargo workspace contains three crates:
+
+- [`furrow-core/`](furrow-core/): the engine library, imported as `furrow`, with embedded UI assets in `furrow-core/ui/` and benchmarks in `furrow-core/benches/`.
+- [`furrow-cli/`](furrow-cli/): the `furrow` binary and CLI integration tests.
+- [`furrow-daemon/`](furrow-daemon/): persistent repositories and request handling for `furrow serve`.
+
+Use the Rust toolchain pinned in `rust-toolchain.toml`. From the repository root:
+
 ```bash
-cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+cargo build --release --locked -j 2
+./target/release/furrow --version
+cargo test --locked -j 2 --no-fail-fast
+cargo fmt --check
+# Optional, if Clippy is installed for the pinned toolchain:
+cargo clippy --locked --all-targets --all-features -j 2 -- -D warnings
+# Install the CLI from this checkout:
+cargo install --locked --path furrow-cli -j 2
 ```
+
+Build output lives in the ignored root `target/` directory. Release tags build
+`furrow-cli` for Linux and macOS on amd64 and arm64; their assets are named
+`furrow-linux-amd64`, `furrow-linux-arm64`, `furrow-darwin-amd64`, and
+`furrow-darwin-arm64`.
+
+Engine integrations can use `furrow exchange <verb> --help` and
+`furrow serve --help` to discover their runtime contract. Exchange encryption
+reads `FURROW_CELL_KEY` and `FURROW_DEDUP_SECRET` from the environment; export
+writes frames for the caller to transport. Hook sealing accepts repeatable
+`--changed PATH`, NUL-separated `--changed-stdin`, and `--cell-dir DIR` for an
+external directory composed as `.cell/`, replacing any root `.cell/` entry in
+the sealed tree. An explicitly empty changed list
+means nothing changed; omitting the list requests a full capture.
 
 The black-box suite runs against independent temporary Git repositories and isolated stores: secret recovery, reversible rewind, metadata fidelity, SQLite logical recovery, index reconstruction, truncated-pack recovery, path-escape rejection, interrupted-rewind recovery, and fork isolation.
 

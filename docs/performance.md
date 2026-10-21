@@ -1,16 +1,16 @@
 # furrow Performance Baselines
 
-This document records reproducible measurements, not extrapolated product claims. The harness is `benches/engine.rs`; every sample runs in a fresh subprocess so CPU and peak RSS are isolated from other scenarios.
+This document records reproducible measurements, not extrapolated product claims. The harness is `furrow-core/benches/engine.rs`; every sample runs in a fresh subprocess so CPU and peak RSS are isolated from other scenarios.
 
 ## Run It
 
 ```bash
-cargo bench --bench engine
-FURROW_BENCH_ENFORCE=1 cargo bench --bench engine
-FURROW_BENCH_PROFILE=reference cargo bench --bench engine
+cargo bench -p furrow-core --bench engine
+FURROW_BENCH_ENFORCE=1 cargo bench -p furrow-core --bench engine
+FURROW_BENCH_PROFILE=reference cargo bench -p furrow-core --bench engine
 ```
 
-The default developer profile uses three samples, 5,000 files, 100 changed files, a 128 MiB generated stream, a 32 MiB warm dependency, 721 snapshots spread over six months, and 1,000 tree/ref lookups. CI uses one smaller enforced smoke sample on macOS and Linux. The `reference` profile uses five samples, 1,000,000 files, a 1 GiB stream, and 17,281 historical snapshots.
+The default developer profile uses three samples, 5,000 files, 100 changed files, a 128 MiB generated stream, a 32 MiB warm dependency, 721 snapshots spread over six months, and 1,000 tree/ref lookups. A smaller enforced smoke profile is available for macOS and Linux. The `reference` profile uses five samples, 1,000,000 files, a 1 GiB stream, and 17,281 historical snapshots.
 
 Peak RSS comes from `getrusage(RUSAGE_SELF)`. CPU is user plus system time consumed inside the measured operation. Fixture construction, Git initialization, and baseline capture are outside wall/CPU timing but remain included in the subprocess peak-RSS measurement.
 
@@ -75,5 +75,5 @@ This is a local protocol regression baseline, not a WAN result. Run the same
 test under latency/loss shaping before claiming the 100 ms RTT contract:
 
 ```bash
-cargo test --test cli persistent_ssh_helper_syncs_independent_stores_over_framed_stdio -- --nocapture
+cargo test --locked -j 2 -p furrow-cli --test cli persistent_ssh_helper_syncs_independent_stores_over_framed_stdio -- --nocapture
 ```
