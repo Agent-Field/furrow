@@ -345,8 +345,10 @@ struct SyncState {
     local_root: Option<ObjectId>,
     /// Per-ref bookmarks for named refs. The flat `remote_root`/`local_root`
     /// fields above are the default (HEAD) ref's entry: they keep 0.1.0
-    /// state.json files decodable and let a downgraded binary still read the
-    /// default ref's bookmark.
+    /// state.json files decodable. A downgraded binary can still read the
+    /// default ref's bookmark after a default-ref sync, but a state.json that
+    /// only ever recorded named refs serializes `remote_root` as `null`, which
+    /// 0.1.0 cannot decode.
     #[serde(default)]
     refs: BTreeMap<String, SyncRefState>,
 }
@@ -903,9 +905,24 @@ impl FurrowRepository {
             Some("sync push boundary".to_owned()),
             SnapshotTrigger::SyncPush,
         )?;
-        let expected = self
+        let mut expected = self
             .read_sync_state(remote.ref_name())?
             .map(|s| s.remote_root);
+        // Upgrade path: a 0.1.0 workspace that only ever pushed a named ref
+        // (the documented workaround in the issue) stored that ref's bookmark
+        // in the flat default-ref fields, because 0.1.0 had no per-ref map.
+        // After upgrade the named ref has no entry of its own, so its existing
+        // remote head would be mistaken for a foreign one. If the legacy flat
+        // bookmark still matches this ref's published head, adopt it; a
+        // brand-new ref (whose head does not exist, or whose flat bookmark
+        // belongs to a different ref) keeps `expected = None`.
+        if remote.ref_name().is_some() && expected.is_none() {
+            if let Some(legacy) = self.read_sync_state(None)? {
+                if sync::published_root_on(config, remote)? == Some(legacy.remote_root) {
+                    expected = Some(legacy.remote_root);
+                }
+            }
+        }
         let report = sync::push_on(&self.store, snapshot, config, expected, takeover, remote)?;
         self.write_sync_state(remote.ref_name(), parse_id(&report.root)?)?;
         Ok(report)

@@ -2756,6 +2756,75 @@ fn sync_ref_flag_tracks_each_ref_s_bookmark_independently() {
 }
 
 #[test]
+fn sync_ref_flag_adopts_a_legacy_default_ref_bookmark_from_a_0_1_0_state_file() {
+    // A 0.1.0 workspace that only ever pushed a named ref (the documented
+    // workaround in the issue) stored that ref's bookmark in the flat
+    // default-ref fields, because 0.1.0 had no per-ref map. After upgrading,
+    // the named ref has no entry of its own, so its existing remote head must
+    // be adopted from the legacy flat bookmark rather than mistaken for a
+    // foreign one (which fails with "remote workspace changed since this
+    // machine last synchronized; pull before pushing").
+    let fixture = Fixture::new();
+    let remote = fixture.repo.parent().unwrap().join("upgrade-remote");
+    fixture.watch();
+    fixture
+        .furrow()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success();
+
+    // Publish the named ref (remote head now exists for it).
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+
+    // Rewrite the state.json into the 0.1.0 shape: the team-a bookmark lives
+    // in the flat default-ref fields and there is no per-ref map.
+    let workspace_id = fs::read_to_string(fixture.repo.join(".furrow/workspace-id")).unwrap();
+    let state_path = fixture
+        .data
+        .join("store-v1/workspaces")
+        .join(workspace_id.trim())
+        .join("sync/state.json");
+    let modern: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let remote_root = modern["refs"]["team-a"]["remote_root"].clone();
+    let local_root = modern["refs"]["team-a"]["local_root"].clone();
+    let legacy = serde_json::json!({ "remote_root": remote_root, "local_root": local_root });
+    fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    // An upgraded binary pushing that same named ref must still recognize the
+    // remote head (adopted from the legacy flat bookmark) and fast-forward.
+    fs::write(
+        fixture.repo.join("app.txt"),
+        b"post upgrade
+",
+    )
+    .unwrap();
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+
+    // The successful push migrates the bookmark back into the per-ref map.
+    let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["refs"]["team-a"]["remote_root"]
+            .as_array()
+            .map(Vec::len),
+        Some(32)
+    );
+}
+
+#[test]
 fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_deltas() {
     let fixture = Fixture::new();
     let peer = fixture.repo.parent().unwrap().join("follow-peer");
