@@ -3087,6 +3087,236 @@ fn sync_follow_publishes_after_upgrading_a_legacy_default_ref_bookmark() {
 }
 
 #[test]
+fn sync_ref_flag_keeps_a_legitimate_default_ref_bookmark_when_roots_collide() {
+    // A named ref published at the same content root as the default ref must
+    // not strip the default ref's bookmark. The adoption heuristic matches on
+    // content roots, so a first push to such a ref "adopts" the flat entry —
+    // but here the flat entry is the default ref's own live bookmark, and
+    // moving it makes the next default-ref push fail with "remote workspace
+    // changed since this machine last synchronized; pull before pushing".
+    let fixture = Fixture::new();
+    let peer = fixture.repo.parent().unwrap().join("collision-peer");
+    let peer_data = fixture.repo.parent().unwrap().join("collision-peer-data");
+    let remote = fixture.repo.parent().unwrap().join("collision-remote");
+    git(
+        fixture.repo.parent().unwrap(),
+        &["clone", fixture.repo.to_str().unwrap(), "collision-peer"],
+    );
+    fixture.watch();
+    furrow_at(&peer, &peer_data)
+        .args(["watch", "--no-daemon"])
+        .assert()
+        .success();
+
+    let pair_output = fixture
+        .furrow()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pair: Value = serde_json::from_slice(&pair_output).unwrap();
+    let key = pair["key_hex"].as_str().unwrap();
+    furrow_at(&peer, &peer_data)
+        .args([
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+            "--key",
+            key,
+        ])
+        .assert()
+        .success();
+
+    // A publishes the default ref.
+    fixture.furrow().args(["sync", "--push"]).assert().success();
+
+    // B pulls it and publishes team-a at the same content root.
+    furrow_at(&peer, &peer_data)
+        .args(["sync", "--pull", "--bootstrap"])
+        .assert()
+        .success();
+    furrow_at(&peer, &peer_data)
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+
+    // A pushes team-a for the first time: the flat bookmark matches team-a's
+    // head, but it is A's default-ref bookmark and must stay in place. (B is
+    // done publishing, so A takes over the ref's writer lease.)
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a", "--takeover"])
+        .assert()
+        .success();
+
+    let workspace_id = fs::read_to_string(fixture.repo.join(".furrow/workspace-id")).unwrap();
+    let state_path = fixture
+        .data
+        .join("store-v1/workspaces")
+        .join(workspace_id.trim())
+        .join("sync/state.json");
+    let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["remote_root"].as_array().map(Vec::len),
+        Some(32),
+        "the default ref's live bookmark must survive a colliding named-ref adoption: {state}"
+    );
+    assert_eq!(
+        state["refs"]["team-a"]["remote_root"]
+            .as_array()
+            .map(Vec::len),
+        Some(32)
+    );
+
+    // A's next default-ref push must succeed.
+    fs::write(fixture.repo.join("app.txt"), b"default advances\n").unwrap();
+    fixture.furrow().args(["sync", "--push"]).assert().success();
+}
+
+#[test]
+fn sync_ref_flag_idle_follow_persists_an_adopted_legacy_bookmark() {
+    // A 0.1.0 workspace that only ever pushed a named ref holds that ref's
+    // bookmark in the flat fields. When an upgraded `sync --follow --ref`
+    // adopts the bookmark and then stays idle (nothing to publish or pull),
+    // the adoption must still be persisted: otherwise the flat entry keeps
+    // reading as the default ref's bookmark and creating the default ref
+    // fails with "paired remote lost its published head; refusing to
+    // recreate it without re-pairing".
+    let fixture = Fixture::new();
+    let remote = fixture.repo.parent().unwrap().join("follow-idle-remote");
+    fixture.watch();
+    fixture
+        .furrow()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success();
+
+    // Publish the named ref, then rewrite state.json into the 0.1.0 shape:
+    // the team-a bookmark lives in the flat fields and there is no per-ref
+    // map. No local edits: follow has nothing to publish or pull.
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+    let workspace_id = fs::read_to_string(fixture.repo.join(".furrow/workspace-id")).unwrap();
+    let state_path = fixture
+        .data
+        .join("store-v1/workspaces")
+        .join(workspace_id.trim())
+        .join("sync/state.json");
+    let modern: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let remote_root = modern["refs"]["team-a"]["remote_root"].clone();
+    let local_root = modern["refs"]["team-a"]["local_root"].clone();
+    let legacy = serde_json::json!({ "remote_root": remote_root, "local_root": local_root });
+    fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    // Idle follow adopts the legacy bookmark and must persist the move.
+    let follower = follow_process_on(&fixture.repo, &fixture.data, Some("team-a"));
+    wait_until(
+        "idle follow to persist the adopted bookmark",
+        Duration::from_secs(30),
+        || {
+            fs::read(&state_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .map(|state| {
+                    state["refs"]["team-a"]["remote_root"]
+                        .as_array()
+                        .map(Vec::len)
+                        == Some(32)
+                        && state["remote_root"].is_null()
+                })
+                .unwrap_or(false)
+        },
+    );
+    drop(follower);
+
+    // With the flat fields cleared, the default ref can be created.
+    fixture.furrow().args(["sync", "--push"]).assert().success();
+}
+
+#[test]
+fn sync_ref_flag_pull_clears_an_adopted_legacy_bookmark() {
+    // The pull counterpart of the idle-follow test above: a successful pull
+    // of a named ref whose bookmark still lives in the legacy flat fields
+    // (0.1.0) must migrate it into the per-ref map. Retaining it leaves the
+    // flat entry readable as the default ref's bookmark, and creating the
+    // default ref afterwards fails with "paired remote lost its published
+    // head; refusing to recreate it without re-pairing".
+    let fixture = Fixture::new();
+    let remote = fixture.repo.parent().unwrap().join("pull-adopt-remote");
+    fixture.watch();
+    fixture
+        .furrow()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success();
+
+    // Publish the named ref, then rewrite state.json into the 0.1.0 shape:
+    // the team-a bookmark lives in the flat fields, no per-ref map.
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+    let workspace_id = fs::read_to_string(fixture.repo.join(".furrow/workspace-id")).unwrap();
+    let state_path = fixture
+        .data
+        .join("store-v1/workspaces")
+        .join(workspace_id.trim())
+        .join("sync/state.json");
+    let modern: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let remote_root = modern["refs"]["team-a"]["remote_root"].clone();
+    let local_root = modern["refs"]["team-a"]["local_root"].clone();
+    let legacy = serde_json::json!({ "remote_root": remote_root, "local_root": local_root });
+    fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    // The pull is up-to-date (nothing changed since the 0.1.0 push), and it
+    // must still migrate the bookmark out of the flat fields.
+    fixture
+        .furrow()
+        .args(["sync", "--pull", "--ref", "team-a"])
+        .assert()
+        .success();
+    let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["refs"]["team-a"]["remote_root"]
+            .as_array()
+            .map(Vec::len),
+        Some(32)
+    );
+    assert!(
+        state["remote_root"].is_null(),
+        "the adopted flat bookmark must move to refs.team-a, not linger as the default ref's: {state}"
+    );
+
+    // With the flat fields cleared, the default ref can be created.
+    fixture.furrow().args(["sync", "--push"]).assert().success();
+}
+
+#[test]
 fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_deltas() {
     let fixture = Fixture::new();
     let peer = fixture.repo.parent().unwrap().join("follow-peer");

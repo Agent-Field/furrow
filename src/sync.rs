@@ -235,7 +235,7 @@ fn push_locked(
     let crypto = RemoteCrypto::new(config.key);
     let snapshot_value: Snapshot = store.read_struct(&snapshot, ObjectKind::Snapshot)?;
     let base_root = if remote.exists(&head_key)? {
-        let current = read_remote_head(remote, config, &crypto)?;
+        let current = read_remote_head(remote, config, &crypto, ref_name.as_deref())?;
         anyhow::ensure!(
             current.snapshot == snapshot || Some(current.root) == expected_remote_root,
             "remote workspace changed since this machine last synchronized; pull before pushing"
@@ -391,7 +391,8 @@ pub(crate) fn pull_on(
     let (connect_auth_ms, connection_reused) = remote.begin_operation();
     let negotiate_started = Instant::now();
     let crypto = RemoteCrypto::new(config.key);
-    let head = read_remote_head(remote, config, &crypto)?;
+    let ref_name = remote.ref_name().map(str::to_owned);
+    let head = read_remote_head(remote, config, &crypto, ref_name.as_deref())?;
     let negotiate_ms = elapsed_ms(negotiate_started);
     let stream_started = Instant::now();
     let queue_file = tempfile::NamedTempFile::new()?;
@@ -527,7 +528,8 @@ impl<'session, 'store> StreamingPull<'session, 'store> {
         let (connect_auth_ms, connection_reused) = remote.begin_operation();
         let negotiate_started = Instant::now();
         let crypto = RemoteCrypto::new(config.key);
-        let head = read_remote_head(remote, config, &crypto)?;
+        let ref_name = remote.ref_name().map(str::to_owned);
+        let head = read_remote_head(remote, config, &crypto, ref_name.as_deref())?;
         let negotiate_ms = elapsed_ms(negotiate_started);
         let stream_started = Instant::now();
         let queue_file = tempfile::NamedTempFile::new()?;
@@ -733,13 +735,29 @@ pub(crate) fn published_root_on(
     config: &PairConfig,
     remote: &mut Session,
 ) -> anyhow::Result<Option<ObjectId>> {
+    let ref_name = remote.ref_name().map(str::to_owned);
+    published_root_for(config, remote, ref_name.as_deref())
+}
+
+/// Reads the published head root of an explicit `ref_name` through an
+/// already-open session, which may itself be bound to a different ref. The
+/// 0.1.0 bookmark migration consults the default ref's head while the session
+/// is bound to a named ref, to tell a legacy named-ref bookmark apart from
+/// the default ref's live one.
+pub(crate) fn published_root_for(
+    config: &PairConfig,
+    remote: &mut Session,
+    ref_name: Option<&str>,
+) -> anyhow::Result<Option<ObjectId>> {
     remote.begin_operation();
-    let head_key = remote::head_key(remote.ref_name());
+    let head_key = remote::head_key(ref_name);
     if !remote.exists(&head_key)? {
         return Ok(None);
     }
     let crypto = RemoteCrypto::new(config.key);
-    Ok(Some(read_remote_head(remote, config, &crypto)?.root))
+    Ok(Some(
+        read_remote_head(remote, config, &crypto, ref_name)?.root,
+    ))
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -793,18 +811,18 @@ fn read_remote_head(
     remote: &mut Session,
     config: &PairConfig,
     crypto: &RemoteCrypto,
+    ref_name: Option<&str>,
 ) -> anyhow::Result<RemoteHead> {
-    let ref_name = remote.ref_name().map(str::to_owned);
-    let head_key = remote::head_key(ref_name.as_deref());
+    let head_key = remote::head_key(ref_name);
     let encrypted = remote
         .read(&head_key, remote::MAX_METADATA_BYTES)
-        .with_context(|| match &ref_name {
+        .with_context(|| match ref_name {
             None => "sync remote has no published HEAD".to_owned(),
             Some(name) => format!("sync remote has no published ref '{name}'"),
         })?;
     let head: RemoteHead = serde_json::from_slice(&crypto.decrypt_metadata(
         &encrypted,
-        head_context(&config.namespace, ref_name.as_deref()).as_bytes(),
+        head_context(&config.namespace, ref_name).as_bytes(),
     )?)
     .context("decode authenticated remote head")?;
     anyhow::ensure!(head.version == 1, "unsupported remote head version");

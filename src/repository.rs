@@ -337,6 +337,27 @@ struct SyncRefState {
     local_root: Option<ObjectId>,
 }
 
+/// How a bookmark resolved by [`FurrowRepository::resolve_sync_bookmark`]
+/// (or the pull path's equivalent) relates to the legacy flat default-ref
+/// fields of a 0.1.0 state.json.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyAdoption {
+    /// No adoption happened: the bookmark came from the ref's own entry (or
+    /// nowhere), and a write leaves the flat fields alone.
+    None,
+    /// The legacy flat bookmark was adopted for a named ref but stays in
+    /// place: the default ref's published head still matches it, so it is
+    /// the default ref's live bookmark, not legacy named-ref state. Equal
+    /// content roots do not prove the bookmark belongs to the named ref.
+    Copy,
+    /// The legacy flat bookmark was adopted for a named ref and is cleared
+    /// on write: no default-ref head vouches for it, so it is this ref's
+    /// 0.1.0 bookmark and must move into `refs[name]` — left behind, it
+    /// would keep reading as the default ref's bookmark and block creating
+    /// the default head ("paired remote lost its published head").
+    Move,
+}
+
 #[derive(Debug, SerdeSerialize, Deserialize, Default)]
 struct SyncState {
     #[serde(default)]
@@ -912,18 +933,21 @@ impl FurrowRepository {
         // other push — the default ref, or a named ref with its own bookmark —
         // is answered by the recorded bookmark alone, so the extra round trip
         // (and the session handshake it performs) is confined to the upgrade.
-        let (expected, adopted_legacy) = match self.read_sync_state(remote.ref_name())? {
-            Some(state) => (Some(state.remote_root), false),
-            None if remote.ref_name().is_some() => {
+        let ref_name = remote.ref_name().map(str::to_owned);
+        let (expected, adoption) = match self.read_sync_state(ref_name.as_deref())? {
+            Some(state) => (Some(state.remote_root), LegacyAdoption::None),
+            None if ref_name.is_some() => {
                 let published_root = sync::published_root_on(config, remote)?;
-                let (bookmark, adopted) =
-                    self.resolve_sync_bookmark(remote.ref_name(), published_root)?;
-                (bookmark.map(|state| state.remote_root), adopted)
+                let (bookmark, adoption) =
+                    self.resolve_sync_bookmark(ref_name.as_deref(), published_root, || {
+                        sync::published_root_for(config, remote, None)
+                    })?;
+                (bookmark.map(|state| state.remote_root), adoption)
             }
-            None => (None, false),
+            None => (None, LegacyAdoption::None),
         };
         let report = sync::push_on(&self.store, snapshot, config, expected, takeover, remote)?;
-        self.write_sync_state(remote.ref_name(), parse_id(&report.root)?, adopted_legacy)?;
+        self.write_sync_state(ref_name.as_deref(), parse_id(&report.root)?, adoption)?;
         Ok(report)
     }
 
@@ -976,7 +1000,24 @@ impl FurrowRepository {
         remote: &mut crate::remote::Session,
     ) -> anyhow::Result<SyncPullOutcome> {
         let ref_name = remote.ref_name().map(str::to_owned);
-        let prior_sync = self.read_sync_state(ref_name.as_deref())?;
+        // A named ref with no bookmark of its own may still own the legacy
+        // flat bookmark (0.1.0). The default ref's published head decides
+        // whether an adoption moves the flat entry or keeps it as the
+        // default ref's live bookmark; fetch it only when an adoption is
+        // possible, and now — the pull below borrows the session.
+        let legacy_candidate = if ref_name.is_some() {
+            match (
+                self.read_sync_state(ref_name.as_deref())?,
+                self.read_sync_state(None)?,
+            ) {
+                (None, Some(legacy)) => {
+                    Some((legacy, sync::published_root_for(config, remote, None)?))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let local = if seal_boundary {
             self.snapshot(
                 Some("sync pull boundary".to_owned()),
@@ -1006,13 +1047,37 @@ impl FurrowRepository {
                 .restore(&remote_snapshot.claims)?;
         }
 
+        // Resolve the bookmark once the head is known: a legacy flat bookmark
+        // is adopted when it matches the ref's published root (or the root
+        // that head descends from, so an upgraded workspace still
+        // fast-forwards a ref that advanced while it was away); the default
+        // ref's own head arbitrates move vs. copy exactly like in
+        // `resolve_sync_bookmark`.
+        let (prior_sync, adoption) = match &legacy_candidate {
+            Some((legacy, default_root))
+                if Some(legacy.remote_root) == Some(remote_snapshot.root_tree)
+                    || Some(legacy.remote_root) == pull.base_root() =>
+            {
+                let adoption = if *default_root == Some(legacy.remote_root) {
+                    LegacyAdoption::Copy
+                } else {
+                    LegacyAdoption::Move
+                };
+                (Some(legacy.clone()), adoption)
+            }
+            _ => (
+                self.read_sync_state(ref_name.as_deref())?,
+                LegacyAdoption::None,
+            ),
+        };
+
         if local_snapshot.root_tree == remote_snapshot.root_tree {
             // Nothing to materialize, but the whole graph must still land and be
             // verified before the local identity adopts the remote snapshot.
             let pulled = pull.finish()?;
             self.write_sync_incoming(pulled.snapshot)?;
             drop(maintenance);
-            self.write_sync_state(ref_name.as_deref(), pulled.root, false)?;
+            self.write_sync_state(ref_name.as_deref(), pulled.root, adoption)?;
             self.clear_sync_incoming()?;
             return Ok(sync_pull_outcome(
                 SyncDisposition::UpToDate,
@@ -1187,7 +1252,7 @@ impl FurrowRepository {
             baseline_install_ms,
             watcher_requiesce_ms,
         };
-        self.write_sync_state(ref_name.as_deref(), pulled.root, false)?;
+        self.write_sync_state(ref_name.as_deref(), pulled.root, adoption)?;
         self.clear_sync_incoming()?;
         Ok(sync_pull_outcome(
             if bootstrap {
@@ -1328,8 +1393,11 @@ impl FurrowRepository {
             .workspace_head(&self.workspace_id)?
             .context("workspace has no sealed snapshot")?;
         let local_snapshot: Snapshot = self.store.read_struct(&local_head, ObjectKind::Snapshot)?;
-        let (last_synced, _) =
-            self.resolve_sync_bookmark(session.remote.ref_name(), remote_root)?;
+        let ref_name = session.remote.ref_name().map(str::to_owned);
+        let (last_synced, adoption) =
+            self.resolve_sync_bookmark(ref_name.as_deref(), remote_root, || {
+                sync::published_root_for(&session.config, &mut session.remote, None)
+            })?;
 
         match remote_root {
             None => Ok(SyncFollowOutcome::Published {
@@ -1341,8 +1409,11 @@ impl FurrowRepository {
                         && state.local_root == Some(local_snapshot.root_tree)
                 }) || (last_synced.is_none() && local_snapshot.root_tree == remote_root) =>
             {
-                if last_synced.is_none() {
-                    self.write_sync_state(session.remote.ref_name(), remote_root, false)?;
+                // Persist a first observation, and persist an adopted legacy
+                // bookmark (a move clears the flat fields) so the migration is
+                // durable even when follow stays idle and never publishes.
+                if last_synced.is_none() || adoption != LegacyAdoption::None {
+                    self.write_sync_state(session.remote.ref_name(), remote_root, adoption)?;
                 }
                 Ok(SyncFollowOutcome::Idle)
             }
@@ -2675,16 +2746,16 @@ impl FurrowRepository {
     }
 
     /// Read-modify-writes the bookmark for `ref_name` only, preserving every
-    /// other ref's entry and the flat default-ref entry. `adopted_legacy` is
-    /// set when the bookmark being written was adopted from the legacy flat
-    /// fields (see `resolve_sync_bookmark`): the adoption is then persisted
-    /// as a move, clearing the flat fields so they are no longer read as the
-    /// default ref's bookmark.
+    /// other ref's entry and the flat default-ref entry. `adoption` reports
+    /// how the bookmark being written relates to the legacy flat fields (see
+    /// `resolve_sync_bookmark`): only [`LegacyAdoption::Move`] clears them —
+    /// a copied adoption leaves them in place because they are the default
+    /// ref's live bookmark.
     fn write_sync_state(
         &self,
         ref_name: Option<&str>,
         remote_root: ObjectId,
-        adopted_legacy: bool,
+        adoption: LegacyAdoption,
     ) -> anyhow::Result<()> {
         let path = self.sync_state_path();
         if let Some(parent) = path.parent() {
@@ -2717,7 +2788,7 @@ impl FurrowRepository {
                         local_root,
                     },
                 );
-                if adopted_legacy {
+                if adoption == LegacyAdoption::Move {
                     state.remote_root = None;
                     state.local_root = None;
                 }
@@ -2735,28 +2806,38 @@ impl FurrowRepository {
     /// foreign one; a brand-new ref — whose head does not exist, or whose
     /// flat bookmark belongs to a different ref — keeps `None`.
     ///
-    /// The second return value reports an adoption. The caller passes it to
-    /// `write_sync_state`, which persists the adopted entry as a move, not a
-    /// copy: the match against the published head proves the flat entry was
-    /// this ref's, and leaving it in place would keep it readable as the
-    /// default ref's bookmark — a workspace that only pushed named refs on
-    /// 0.1.0 could then never create the default ref after upgrading (the
-    /// push guard refuses to create the default head against the stale
-    /// `expected` root).
+    /// The adoption is a [`LegacyAdoption::Move`] (the write clears the flat
+    /// fields) only when the default ref's own published head — fetched
+    /// lazily via `default_published_root`, only once an adoption is
+    /// possible — does not also match the flat bookmark. When it does, the
+    /// flat entry is the default ref's live bookmark: equal content roots do
+    /// not prove the bookmark belongs to the named ref, so the adoption is a
+    /// [`LegacyAdoption::Copy`] and the flat entry stays. A moved bookmark
+    /// that was really the default ref's would break the next default-ref
+    /// push ("remote workspace changed since this machine last
+    /// synchronized"); a copied one that was really the named ref's would
+    /// block creating the default head ("paired remote lost its published
+    /// head"), so the default head arbitrates.
     fn resolve_sync_bookmark(
         &self,
         ref_name: Option<&str>,
         published_root: Option<ObjectId>,
-    ) -> anyhow::Result<(Option<SyncRefState>, bool)> {
+        default_published_root: impl FnOnce() -> anyhow::Result<Option<ObjectId>>,
+    ) -> anyhow::Result<(Option<SyncRefState>, LegacyAdoption)> {
         let bookmark = self.read_sync_state(ref_name)?;
         if let (Some(_), None) = (ref_name, &bookmark) {
             if let Some(legacy) = self.read_sync_state(None)? {
                 if published_root == Some(legacy.remote_root) {
-                    return Ok((Some(legacy), true));
+                    let adoption = if default_published_root()? == Some(legacy.remote_root) {
+                        LegacyAdoption::Copy
+                    } else {
+                        LegacyAdoption::Move
+                    };
+                    return Ok((Some(legacy), adoption));
                 }
             }
         }
-        Ok((bookmark, false))
+        Ok((bookmark, LegacyAdoption::None))
     }
 
     fn clear_sync_incoming(&self) -> anyhow::Result<()> {
