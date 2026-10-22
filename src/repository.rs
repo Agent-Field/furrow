@@ -905,24 +905,10 @@ impl FurrowRepository {
             Some("sync push boundary".to_owned()),
             SnapshotTrigger::SyncPush,
         )?;
-        let mut expected = self
-            .read_sync_state(remote.ref_name())?
+        let published_root = sync::published_root_on(config, remote)?;
+        let expected = self
+            .resolve_sync_bookmark(remote.ref_name(), published_root)?
             .map(|s| s.remote_root);
-        // Upgrade path: a 0.1.0 workspace that only ever pushed a named ref
-        // (the documented workaround in the issue) stored that ref's bookmark
-        // in the flat default-ref fields, because 0.1.0 had no per-ref map.
-        // After upgrade the named ref has no entry of its own, so its existing
-        // remote head would be mistaken for a foreign one. If the legacy flat
-        // bookmark still matches this ref's published head, adopt it; a
-        // brand-new ref (whose head does not exist, or whose flat bookmark
-        // belongs to a different ref) keeps `expected = None`.
-        if remote.ref_name().is_some() && expected.is_none() {
-            if let Some(legacy) = self.read_sync_state(None)? {
-                if sync::published_root_on(config, remote)? == Some(legacy.remote_root) {
-                    expected = Some(legacy.remote_root);
-                }
-            }
-        }
         let report = sync::push_on(&self.store, snapshot, config, expected, takeover, remote)?;
         self.write_sync_state(remote.ref_name(), parse_id(&report.root)?)?;
         Ok(report)
@@ -1329,7 +1315,7 @@ impl FurrowRepository {
             .workspace_head(&self.workspace_id)?
             .context("workspace has no sealed snapshot")?;
         let local_snapshot: Snapshot = self.store.read_struct(&local_head, ObjectKind::Snapshot)?;
-        let last_synced = self.read_sync_state(session.remote.ref_name())?;
+        let last_synced = self.resolve_sync_bookmark(session.remote.ref_name(), remote_root)?;
 
         match remote_root {
             None => Ok(SyncFollowOutcome::Published {
@@ -2715,6 +2701,30 @@ impl FurrowRepository {
             }
         }
         atomic_write(&path, &serde_json::to_vec(&state)?)
+    }
+
+    /// Resolves the sync bookmark for `ref_name`, upgrading a legacy 0.1.0
+    /// state.json where a named ref's bookmark lived in the flat default-ref
+    /// fields (there was no per-ref map before the named-ref fix). If the ref
+    /// has no entry of its own but the flat bookmark's `remote_root` still
+    /// matches this ref's currently published head (`published_root`), the
+    /// flat bookmark is adopted so the existing head is not mistaken for a
+    /// foreign one; a brand-new ref — whose head does not exist, or whose
+    /// flat bookmark belongs to a different ref — keeps `None`.
+    fn resolve_sync_bookmark(
+        &self,
+        ref_name: Option<&str>,
+        published_root: Option<ObjectId>,
+    ) -> anyhow::Result<Option<SyncRefState>> {
+        let bookmark = self.read_sync_state(ref_name)?;
+        if ref_name.is_some() && bookmark.is_none() {
+            if let Some(legacy) = self.read_sync_state(None)? {
+                if published_root == Some(legacy.remote_root) {
+                    return Ok(Some(legacy));
+                }
+            }
+        }
+        Ok(bookmark)
     }
 
     fn clear_sync_incoming(&self) -> anyhow::Result<()> {

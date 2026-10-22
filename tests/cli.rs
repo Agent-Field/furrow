@@ -119,12 +119,21 @@ fn wait_until(description: &str, timeout: Duration, mut predicate: impl FnMut() 
 }
 
 fn follow_process(repo: &Path, data: &Path) -> ChildGuard {
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    follow_process_on(repo, data, None)
+}
+
+fn follow_process_on(repo: &Path, data: &Path, ref_name: Option<&str>) -> ChildGuard {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"));
+    command
         .env("FURROW_DATA_DIR", data)
         .env("FURROW_NO_DAEMON", "1")
         .arg("--repo")
         .arg(repo)
-        .args(["sync", "--follow", "--poll-seconds", "1"])
+        .args(["sync", "--follow", "--poll-seconds", "1"]);
+    if let Some(name) = ref_name {
+        command.args(["--ref", name]);
+    }
+    let child = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -2821,6 +2830,125 @@ fn sync_ref_flag_adopts_a_legacy_default_ref_bookmark_from_a_0_1_0_state_file() 
             .as_array()
             .map(Vec::len),
         Some(32)
+    );
+}
+
+#[test]
+fn sync_follow_publishes_after_upgrading_a_legacy_default_ref_bookmark() {
+    // The fallback that adopts a 0.1.0 flat bookmark must reach `sync
+    // --follow`, not just `sync --push`. Follow chooses between push and pull
+    // from `last_synced` before it ever calls `sync_push_on`, so a workspace
+    // upgraded with an unpublished edit would otherwise fall into the pull arm
+    // and pause with "Divergence preserved" even though nothing diverged.
+    let fixture = Fixture::new();
+    let peer = fixture.repo.parent().unwrap().join("follow-upgrade-peer");
+    let peer_data = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("follow-upgrade-peer-data");
+    let remote = fixture.repo.parent().unwrap().join("follow-upgrade-remote");
+    git(
+        fixture.repo.parent().unwrap(),
+        &[
+            "clone",
+            fixture.repo.to_str().unwrap(),
+            "follow-upgrade-peer",
+        ],
+    );
+    fixture.watch();
+    furrow_at(&peer, &peer_data)
+        .args(["watch", "--no-daemon"])
+        .assert()
+        .success();
+
+    let pair_output = fixture
+        .furrow()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pair: Value = serde_json::from_slice(&pair_output).unwrap();
+    let key = pair["key_hex"].as_str().unwrap();
+    furrow_at(&peer, &peer_data)
+        .args([
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+            "--key",
+            key,
+        ])
+        .assert()
+        .success();
+
+    // Publish the named ref so its remote head exists, then rewrite the
+    // state.json into the 0.1.0 shape (the bookmark in the flat fields, no
+    // per-ref map), exactly like a machine that only ever pushed `team-a` on
+    // 0.1.0.
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+    let workspace_id = fs::read_to_string(fixture.repo.join(".furrow/workspace-id")).unwrap();
+    let state_path = fixture
+        .data
+        .join("store-v1/workspaces")
+        .join(workspace_id.trim())
+        .join("sync/state.json");
+    let modern: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let remote_root = modern["refs"]["team-a"]["remote_root"].clone();
+    let local_root = modern["refs"]["team-a"]["local_root"].clone();
+    let legacy = serde_json::json!({ "remote_root": remote_root, "local_root": local_root });
+    fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    // An unpublished edit at upgrade time.
+    fs::write(fixture.repo.join("app.txt"), b"after upgrade edit\n").unwrap();
+    fixture
+        .furrow()
+        .args(["snap", "-m", "upgrade edit"])
+        .assert()
+        .success();
+
+    // Follow must publish the edit (adopting the legacy flat bookmark) rather
+    // than diverge; a publish migrates the bookmark back into the per-ref map,
+    // which is the observable signal that follow took the push arm.
+    let _follower = follow_process_on(&fixture.repo, &fixture.data, Some("team-a"));
+    wait_until(
+        "follow to publish the upgraded ref",
+        Duration::from_secs(10),
+        || {
+            fs::read(&state_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .map(|state| {
+                    state["refs"]["team-a"]["remote_root"]
+                        .as_array()
+                        .map(Vec::len)
+                        == Some(32)
+                })
+                .unwrap_or(false)
+        },
+    );
+
+    // The edited snapshot really reached the remote: a peer pulling `team-a`
+    // sees the post-upgrade content, not the original publish.
+    furrow_at(&peer, &peer_data)
+        .args(["--json", "sync", "--pull", "--ref", "team-a", "--bootstrap"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(peer.join("app.txt")).unwrap(),
+        b"after upgrade edit\n"
     );
 }
 
