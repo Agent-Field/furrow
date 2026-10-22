@@ -2632,6 +2632,130 @@ fn sync_ref_flag_publishes_and_pulls_an_independent_named_head() {
 }
 
 #[test]
+fn sync_ref_flag_tracks_each_ref_s_bookmark_independently() {
+    let fixture = Fixture::new();
+    let peer = fixture.repo.parent().unwrap().join("ref-peer");
+    let peer_data = fixture.repo.parent().unwrap().join("ref-peer-data");
+    let remote = fixture.repo.parent().unwrap().join("ref-remote");
+    git(
+        fixture.repo.parent().unwrap(),
+        &["clone", fixture.repo.to_str().unwrap(), "ref-peer"],
+    );
+    fixture.watch();
+    furrow_at(&peer, &peer_data)
+        .args(["watch", "--no-daemon"])
+        .assert()
+        .success();
+
+    let pair_output = fixture
+        .furrow()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pair: Value = serde_json::from_slice(&pair_output).unwrap();
+    let key = pair["key_hex"].as_str().unwrap();
+    furrow_at(&peer, &peer_data)
+        .args([
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+            "--key",
+            key,
+        ])
+        .assert()
+        .success();
+
+    // A workspace can push several named refs: each keeps its own bookmark, so
+    // a brand-new ref must not be mistaken for another ref's published head
+    // (which is what trips the "paired remote lost its published head" guard
+    // before the fix), and the default ref stays pushable alongside them.
+    fs::write(fixture.repo.join("app.txt"), b"team a\n").unwrap();
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+    fs::write(fixture.repo.join("app.txt"), b"team b\n").unwrap();
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-b"])
+        .assert()
+        .success();
+    fs::write(fixture.repo.join("app.txt"), b"default\n").unwrap();
+    fixture.furrow().args(["sync", "--push"]).assert().success();
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+
+    // Peers can pull any named ref.
+    furrow_at(&peer, &peer_data)
+        .args(["--json", "sync", "--pull", "--ref", "team-b", "--bootstrap"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(peer.join("app.txt")).unwrap(), b"team b\n");
+
+    // Pulling a named ref must not clobber another ref's bookmark on this
+    // machine: after pulling team-b, pushing the default ref still succeeds
+    // (before the fix it failed with "remote workspace changed since this
+    // machine last synchronized; pull before pushing" because the pull
+    // overwrote the default ref's bookmark), and team-a's bookmark survives.
+    fixture
+        .furrow()
+        .args(["sync", "--pull", "--ref", "team-b", "--bootstrap"])
+        .assert()
+        .success();
+    fixture.furrow().args(["sync", "--push"]).assert().success();
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+
+    // Each named ref has its own published HEAD on the remote, and the sync
+    // state records one bookmark per named ref.
+    let namespace_root = fs::read_dir(&remote)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(namespace_root.join("HEAD").is_file());
+    assert!(namespace_root.join("refs/team-a/HEAD").is_file());
+    assert!(namespace_root.join("refs/team-b/HEAD").is_file());
+    let workspace_id = fs::read_to_string(fixture.repo.join(".furrow/workspace-id")).unwrap();
+    let state_path = fixture
+        .data
+        .join("store-v1/workspaces")
+        .join(workspace_id.trim())
+        .join("sync/state.json");
+    let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["refs"]["team-a"]["remote_root"]
+            .as_array()
+            .map(Vec::len),
+        Some(32)
+    );
+    assert_eq!(
+        state["refs"]["team-b"]["remote_root"]
+            .as_array()
+            .map(Vec::len),
+        Some(32)
+    );
+}
+
+#[test]
 fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_deltas() {
     let fixture = Fixture::new();
     let peer = fixture.repo.parent().unwrap().join("follow-peer");

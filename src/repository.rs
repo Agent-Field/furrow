@@ -330,11 +330,25 @@ struct RestoreIntent {
     paths: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, SerdeSerialize, Deserialize)]
-struct SyncState {
+#[derive(Debug, SerdeSerialize, Deserialize, Clone)]
+struct SyncRefState {
     remote_root: ObjectId,
     #[serde(default)]
     local_root: Option<ObjectId>,
+}
+
+#[derive(Debug, SerdeSerialize, Deserialize, Default)]
+struct SyncState {
+    #[serde(default)]
+    remote_root: Option<ObjectId>,
+    #[serde(default)]
+    local_root: Option<ObjectId>,
+    /// Per-ref bookmarks for named refs. The flat `remote_root`/`local_root`
+    /// fields above are the default (HEAD) ref's entry: they keep 0.1.0
+    /// state.json files decodable and let a downgraded binary still read the
+    /// default ref's bookmark.
+    #[serde(default)]
+    refs: BTreeMap<String, SyncRefState>,
 }
 
 impl FurrowRepository {
@@ -889,9 +903,11 @@ impl FurrowRepository {
             Some("sync push boundary".to_owned()),
             SnapshotTrigger::SyncPush,
         )?;
-        let expected = self.read_sync_state()?.map(|state| state.remote_root);
+        let expected = self
+            .read_sync_state(remote.ref_name())?
+            .map(|s| s.remote_root);
         let report = sync::push_on(&self.store, snapshot, config, expected, takeover, remote)?;
-        self.write_sync_state(parse_id(&report.root)?)?;
+        self.write_sync_state(remote.ref_name(), parse_id(&report.root)?)?;
         Ok(report)
     }
 
@@ -943,7 +959,8 @@ impl FurrowRepository {
         config: &sync::PairConfig,
         remote: &mut crate::remote::Session,
     ) -> anyhow::Result<SyncPullOutcome> {
-        let prior_sync = self.read_sync_state()?;
+        let ref_name = remote.ref_name().map(str::to_owned);
+        let prior_sync = self.read_sync_state(ref_name.as_deref())?;
         let local = if seal_boundary {
             self.snapshot(
                 Some("sync pull boundary".to_owned()),
@@ -979,7 +996,7 @@ impl FurrowRepository {
             let pulled = pull.finish()?;
             self.write_sync_incoming(pulled.snapshot)?;
             drop(maintenance);
-            self.write_sync_state(pulled.root)?;
+            self.write_sync_state(ref_name.as_deref(), pulled.root)?;
             self.clear_sync_incoming()?;
             return Ok(sync_pull_outcome(
                 SyncDisposition::UpToDate,
@@ -1154,7 +1171,7 @@ impl FurrowRepository {
             baseline_install_ms,
             watcher_requiesce_ms,
         };
-        self.write_sync_state(pulled.root)?;
+        self.write_sync_state(ref_name.as_deref(), pulled.root)?;
         self.clear_sync_incoming()?;
         Ok(sync_pull_outcome(
             if bootstrap {
@@ -1295,7 +1312,7 @@ impl FurrowRepository {
             .workspace_head(&self.workspace_id)?
             .context("workspace has no sealed snapshot")?;
         let local_snapshot: Snapshot = self.store.read_struct(&local_head, ObjectKind::Snapshot)?;
-        let last_synced = self.read_sync_state()?;
+        let last_synced = self.read_sync_state(session.remote.ref_name())?;
 
         match remote_root {
             None => Ok(SyncFollowOutcome::Published {
@@ -1308,7 +1325,7 @@ impl FurrowRepository {
                 }) || (last_synced.is_none() && local_snapshot.root_tree == remote_root) =>
             {
                 if last_synced.is_none() {
-                    self.write_sync_state(remote_root)?;
+                    self.write_sync_state(session.remote.ref_name(), remote_root)?;
                 }
                 Ok(SyncFollowOutcome::Idle)
             }
@@ -1426,6 +1443,14 @@ impl FurrowRepository {
         if copied_identity.exists() {
             fs::remove_file(&copied_identity)?;
         }
+        // A fork joins its parent's family: claims, coordination values and
+        // the conflict radar are scoped per family in the shared store, and
+        // coord propagation addresses workspaces by their family marker. The
+        // copy above excludes .furrow (sync keys and identity must not
+        // propagate), so re-seed the marker here instead of letting
+        // ensure_family_id mint a fresh random id and isolate the fork from
+        // its siblings.
+        write_family_marker(&destination, &self.family_id)?;
         let (fork_repository, fork_head) = if report.atomic_hierarchy {
             self.verify_atomic_fork(&base, &destination, &report)?;
             let fork_repository = FurrowRepository::attach_existing_snapshot(&destination, base)?;
@@ -1573,6 +1598,9 @@ impl FurrowRepository {
             .with_context(|| format!("publish fork {}", destination.display()))?;
         File::open(&destination_parent)?.sync_all()?;
         std::mem::forget(staging);
+        // See materialize_fork: a fork joins its parent's family, so seed the
+        // family marker before watch() attaches the new repository.
+        write_family_marker(&destination, &self.family_id)?;
 
         let tier = match (cow_cloned.files, store_restored.files) {
             (_, 0) if cow_cloned.files > 0 => ForkTier::NativeCow,
@@ -2610,19 +2638,41 @@ impl FurrowRepository {
         self.workspace_data_dir().join("sync/state.json")
     }
 
-    fn read_sync_state(&self) -> anyhow::Result<Option<SyncState>> {
+    /// Returns the bookmark recorded for `ref_name`: the flat entry for the
+    /// default ref, and `refs[name]` for a named ref. A ref with no recorded
+    /// bookmark yields `None`, so a first push to a fresh named ref sees no
+    /// `expected` head instead of a stale one owned by another ref.
+    fn read_sync_state(&self, ref_name: Option<&str>) -> anyhow::Result<Option<SyncRefState>> {
         let path = self.sync_state_path();
         if !path.exists() {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+        let state: SyncState = serde_json::from_slice(&fs::read(path)?)?;
+        match ref_name {
+            None => Ok(state.remote_root.map(|remote_root| SyncRefState {
+                remote_root,
+                local_root: state.local_root,
+            })),
+            Some(name) => Ok(state.refs.get(name).cloned()),
+        }
     }
 
-    fn write_sync_state(&self, remote_root: ObjectId) -> anyhow::Result<()> {
+    /// Read-modify-writes the bookmark for `ref_name` only, preserving every
+    /// other ref's entry and the flat default-ref entry.
+    fn write_sync_state(
+        &self,
+        ref_name: Option<&str>,
+        remote_root: ObjectId,
+    ) -> anyhow::Result<()> {
         let path = self.sync_state_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let mut state: SyncState = if path.exists() {
+            serde_json::from_slice(&fs::read(&path)?)?
+        } else {
+            SyncState::default()
+        };
         let local_root = self
             .store
             .workspace_head(&self.workspace_id)?
@@ -2632,13 +2682,22 @@ impl FurrowRepository {
                     .map(|snapshot| snapshot.root_tree)
             })
             .transpose()?;
-        atomic_write(
-            &path,
-            &serde_json::to_vec(&SyncState {
-                remote_root,
-                local_root,
-            })?,
-        )
+        match ref_name {
+            None => {
+                state.remote_root = Some(remote_root);
+                state.local_root = local_root;
+            }
+            Some(name) => {
+                state.refs.insert(
+                    name.to_owned(),
+                    SyncRefState {
+                        remote_root,
+                        local_root,
+                    },
+                );
+            }
+        }
+        atomic_write(&path, &serde_json::to_vec(&state)?)
     }
 
     fn clear_sync_incoming(&self) -> anyhow::Result<()> {
@@ -3955,6 +4014,22 @@ fn ensure_family_id(
     };
     write_family_id(root, store, workspace_id, &family_id)?;
     Ok(family_id)
+}
+
+/// Seed a freshly materialized workspace's family marker so a fork joins its
+/// parent's family. The copy excludes `.furrow`, but claims, coordination
+/// values and the conflict radar are scoped per family in the shared store,
+/// so without the marker `ensure_family_id` would mint a fresh random id and
+/// the fork could not coordinate with its siblings.
+fn write_family_marker(root: &Path, family_id: &str) -> anyhow::Result<()> {
+    let repository_path = root.join(FAMILY_FILE);
+    fs::create_dir_all(
+        repository_path
+            .parent()
+            .context("family file has no parent")?,
+    )?;
+    atomic_write(&repository_path, format!("{family_id}\n").as_bytes())?;
+    Ok(())
 }
 
 fn write_family_id(
