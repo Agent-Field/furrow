@@ -905,10 +905,22 @@ impl FurrowRepository {
             Some("sync push boundary".to_owned()),
             SnapshotTrigger::SyncPush,
         )?;
-        let published_root = sync::published_root_on(config, remote)?;
-        let expected = self
-            .resolve_sync_bookmark(remote.ref_name(), published_root)?
-            .map(|s| s.remote_root);
+        // Only the 0.1.0 upgrade path needs to read the ref's currently
+        // published head: a named ref with no per-ref bookmark may have its
+        // bookmark in the legacy flat default-ref fields, and that flat entry
+        // is adopted only when it still matches the published head. Every
+        // other push — the default ref, or a named ref with its own bookmark —
+        // is answered by the recorded bookmark alone, so the extra round trip
+        // (and the session handshake it performs) is confined to the upgrade.
+        let expected = match self.read_sync_state(remote.ref_name())? {
+            Some(state) => Some(state.remote_root),
+            None if remote.ref_name().is_some() => {
+                let published_root = sync::published_root_on(config, remote)?;
+                self.resolve_sync_bookmark(remote.ref_name(), published_root)?
+                    .map(|s| s.remote_root)
+            }
+            None => None,
+        };
         let report = sync::push_on(&self.store, snapshot, config, expected, takeover, remote)?;
         self.write_sync_state(remote.ref_name(), parse_id(&report.root)?)?;
         Ok(report)

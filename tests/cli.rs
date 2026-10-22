@@ -2834,6 +2834,69 @@ fn sync_ref_flag_adopts_a_legacy_default_ref_bookmark_from_a_0_1_0_state_file() 
 }
 
 #[test]
+fn sync_push_timings_report_a_fresh_connection_without_the_legacy_upgrade_read() {
+    // Only the 0.1.0 upgrade path — a named ref with no per-ref bookmark —
+    // reads the ref's published head, which consumes the session's first
+    // begin_operation(). Every other push (the default ref, or a named ref
+    // that already has its own bookmark) must answer from the recorded
+    // bookmark alone, so its timings report reused_connection=false; the
+    // unguarded head read made it print true and double the connect/auth cost.
+    let fixture = Fixture::new();
+    let remote = fixture.repo.parent().unwrap().join("timings-remote");
+    fixture.watch();
+    fixture
+        .furrow()
+        .args([
+            "--json",
+            "pair",
+            remote.to_str().unwrap(),
+            "--name",
+            "shared-workspace",
+        ])
+        .assert()
+        .success();
+
+    fs::write(fixture.repo.join("app.txt"), b"default ref\n").unwrap();
+    let push = fixture
+        .furrow()
+        .args(["sync", "--push", "--timings"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&push).contains("reused_connection=false"),
+        "a fresh default-ref push must not read the remote head: {}",
+        String::from_utf8_lossy(&push)
+    );
+
+    // The first push to a named ref legitimately reads the head (to adopt a
+    // possible legacy flat bookmark); the second must answer from its own
+    // recorded bookmark and therefore also report a fresh connection.
+    fs::write(fixture.repo.join("app.txt"), b"named ref one\n").unwrap();
+    fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a"])
+        .assert()
+        .success();
+    fs::write(fixture.repo.join("app.txt"), b"named ref two\n").unwrap();
+    let push = fixture
+        .furrow()
+        .args(["sync", "--push", "--ref", "team-a", "--timings"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&push).contains("reused_connection=false"),
+        "a named ref with its own bookmark must not read the remote head: {}",
+        String::from_utf8_lossy(&push)
+    );
+}
+
+#[test]
 fn sync_follow_publishes_after_upgrading_a_legacy_default_ref_bookmark() {
     // The fallback that adopts a 0.1.0 flat bookmark must reach `sync
     // --follow`, not just `sync --push`. Follow chooses between push and pull
