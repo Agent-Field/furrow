@@ -198,7 +198,9 @@ those entries. Long workspace paths use Windows verbatim absolute paths.
 File replacement retries sharing violations for at most 1.27 seconds before
 reporting a blocked-file error. File durability uses FlushFileBuffers;
 directory syncing is a no-op on Windows. POSIX extended attributes and native
-CoW are unavailable there; forks use independent streaming copies.
+CoW are unavailable there; forks use independent streaming copies. Restore previews
+ignore Windows directory timestamp differences and compare their children
+recursively: NTFS directory listings can report a stale last-write time.
 
 Engine integrations can use `furrow exchange <verb> --help` and
 `furrow serve --help` to discover their runtime contract. Exchange encryption
@@ -216,6 +218,16 @@ installer. Debug command parsing alone can use more than Windows' default 1 MiB 
 also needs headroom. The reserve uses virtual address space and commits pages on
 use. Keep this workspace configuration when building Windows artifacts.
 
+
+Relocated Windows tests use a debug companion built with
+`--features furrow-core/fault-injection`, matching Cargo's test dependencies.
+Crash tests arm these points through their own environment; ordinary release
+builds compile them out.
+
+The CLI, daemon and exchange behavioural suites run on native Windows as well as
+Unix. Tests scope POSIX mode changes, executable hook scripts, privileged symlink
+creation and macOS attributes to the platforms that support them. Windows warm
+materialization checks use NTFS file IDs to detect unintended rewrites.
 
 The black-box suite runs against independent temporary Git repositories and isolated stores: secret recovery, reversible rewind, metadata fidelity, SQLite logical recovery, index reconstruction, truncated-pack recovery, path-escape rejection, interrupted-rewind recovery, and fork isolation.
 

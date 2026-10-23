@@ -1,16 +1,16 @@
-#![cfg(unix)]
-
 //! The exchange verbs through the real binary: two data directories, frames
 //! carried between them as inbox files, and the secrets only in the environment.
 
 use assert_cmd::Command;
 use furrow::exchange::frame;
 use furrow::model::{id_hex, SnapshotTrigger};
+#[cfg(unix)]
+use furrow::platform::symlink;
+use furrow::platform::MetadataExt;
 use furrow::repository::{FurrowRepository, SealOptions};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const CELL_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -68,7 +68,9 @@ fn source() -> Source {
     )
     .unwrap();
     fs::write(tree.join("tool.sh"), b"#!/bin/sh\n").unwrap();
-    fs::set_permissions(tree.join("tool.sh"), fs::Permissions::from_mode(0o750)).unwrap();
+    furrow::platform::set_mode(tree.join("tool.sh"), 0o750).unwrap();
+    // P2/W4: Unix fixture links require privileges Windows does not guarantee.
+    #[cfg(unix)]
     symlink("dir/one.txt", tree.join("shortcut")).unwrap();
     fs::write(cell.join("logs/turn-1"), b"turn one").unwrap();
     for path in [
@@ -140,6 +142,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn two_data_dirs_round_trip_byte_identical() {
     let src = source();
@@ -253,6 +256,7 @@ fn two_data_dirs_round_trip_byte_identical() {
     assert_eq!(dump(&b_cell), dump(&src.cell));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn keys_come_only_from_the_environment() {
     let src = source();
@@ -311,6 +315,7 @@ fn keys_come_only_from_the_environment() {
     }
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_bad_ledger_name_is_refused_before_anything_is_written() {
     let src = source();
@@ -342,6 +347,7 @@ fn files_of(root: &Path) -> BTreeMap<String, (u32, Vec<u8>)> {
 /// A take that dies part way through writing the changed files leaves a whole
 /// tree, never a mix of two heads: the next use of the folder rolls it back to
 /// the head it held, and the take can then be done again.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_materialize_that_dies_mid_write_leaves_a_whole_tree() {
     let src = source();
@@ -380,6 +386,7 @@ fn a_materialize_that_dies_mid_write_leaves_a_whole_tree() {
     assert_eq!(fs::read(tree.join("added.txt")).unwrap(), b"added\n");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn materialize_answers_the_paths_it_set_apart_on_a_folding_file_system() {
     let temp = tempfile::tempdir().unwrap();
@@ -390,8 +397,10 @@ fn materialize_answers_the_paths_it_set_apart_on_a_folding_file_system() {
     );
     fs::create_dir_all(&from).unwrap();
     fs::create_dir_all(&onto).unwrap();
-    fs::write(from.join("Readme.md"), b"lower\n").unwrap();
-    fs::write(from.join("README.md"), b"upper\n").unwrap();
+    // P2/W4: build the colliding snapshot from legal local names so NTFS can
+    // exercise an incoming tree that its own filesystem cannot hold.
+    fs::write(from.join("lower"), b"lower\n").unwrap();
+    fs::write(from.join("upper"), b"upper\n").unwrap();
     let (_, head) = FurrowRepository::attach_and_seal_in(
         &data,
         &from,
@@ -400,7 +409,29 @@ fn materialize_answers_the_paths_it_set_apart_on_a_folding_file_system() {
         SealOptions::default(),
     )
     .unwrap();
-    let head = id_hex(&head);
+    let store = furrow::exchange::open_store(&data).unwrap();
+    let mut snapshot: furrow::model::Snapshot = store
+        .read_struct(&head, furrow::model::ObjectKind::Snapshot)
+        .unwrap();
+    let mut entries = Vec::new();
+    furrow::tree::for_each_entry(&store, &snapshot.root_tree, |mut entry| {
+        entry.name = match entry.name.as_slice() {
+            b"upper" => b"README.md".to_vec(),
+            b"lower" => b"Readme.md".to_vec(),
+            _ => panic!("unexpected fixture entry"),
+        };
+        entries.push(entry);
+        Ok(())
+    })
+    .unwrap();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    snapshot.root_tree = furrow::tree::write(&store, entries).unwrap();
+    let head = id_hex(
+        &store
+            .put_struct(furrow::model::ObjectKind::Snapshot, &snapshot)
+            .unwrap(),
+    );
+    drop(store);
 
     let answer = furrow(&data, &onto)
         .env("FURROW_TEST_NAME_FOLDING", "case")
@@ -416,12 +447,21 @@ fn materialize_answers_the_paths_it_set_apart_on_a_folding_file_system() {
     assert_eq!(answer["held"][0]["path"], "Readme.md");
     assert_eq!(answer["held"][0]["reason"], "same name as README.md here");
     assert_eq!(fs::read(onto.join("README.md")).unwrap(), b"upper\n");
-    assert!(!onto.join("Readme.md").exists());
+    let names: Vec<_> = fs::read_dir(&onto)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(names.iter().any(|name| name == "README.md"));
+    assert!(!names.iter().any(|name| name == "Readme.md"));
 
     // Nothing is held where every name is kept, and the answer says no more.
     let plain = temp.path().join("plain");
     fs::create_dir_all(&plain).unwrap();
     let answer = run(&data, &plain, &["materialize", "--head", &head]);
-    assert!(answer.get("held").is_none());
-    assert!(plain.join("Readme.md").exists());
+    if furrow::name_fold::NameFolding::probe(&plain).is_active() {
+        assert_eq!(answer["held"][0]["path"], "Readme.md");
+    } else {
+        assert!(answer.get("held").is_none());
+        assert_eq!(fs::read(plain.join("Readme.md")).unwrap(), b"lower\n");
+    }
 }

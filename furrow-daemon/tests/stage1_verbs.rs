@@ -1,21 +1,25 @@
-#![cfg(unix)]
-
 //! Stage 1 contract 5.2: the five sync verbs over the daemon's socket.
 
 use furrow::exchange::frame;
 use furrow::model::{id_hex, parse_id};
+#[cfg(unix)]
+use furrow::platform::symlink;
+use furrow::platform::MetadataExt;
 use furrow_daemon::{Config, Server, Stop};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{symlink, MetadataExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tempfile::TempDir;
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 const LEDGER: &str = "0123456789abcdef";
 const SMALL_FRAME: usize = 300 * 1024;
@@ -91,6 +95,8 @@ impl Store {
     fn fill(&self) {
         fs::write(self.tree.join("src/main.rs"), b"fn main() {}\n").unwrap();
         fs::write(self.tree.join("big.bin"), pseudo_random(1 << 20)).unwrap();
+        // P2/W4: Unix fixture links require privileges Windows does not guarantee.
+        #[cfg(unix)]
         symlink("src/main.rs", self.tree.join("link")).unwrap();
     }
 }
@@ -198,6 +204,7 @@ fn dump(root: &Path) -> BTreeMap<String, String> {
     nodes
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn export_published_want_import_materialize_over_socket() {
     let daemon = Daemon::start();
@@ -255,6 +262,7 @@ fn export_published_want_import_materialize_over_socket() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn export_matches_the_command_line_path() {
     let daemon = Daemon::start();
@@ -305,6 +313,7 @@ fn export_matches_the_command_line_path() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn two_stores_export_in_parallel() {
     let daemon = Daemon::start();
@@ -331,6 +340,7 @@ fn two_stores_export_in_parallel() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_client_leaving_mid_export_keeps_the_ledger_consistent() {
     let daemon = Daemon::start();
@@ -363,11 +373,13 @@ fn a_client_leaving_mid_export_keeps_the_ledger_consistent() {
 }
 
 /// Points stdout and stderr at a file for the life of the guard.
+#[cfg(unix)]
 struct Capture {
     saved: [i32; 2],
     file: PathBuf,
 }
 
+#[cfg(unix)]
 impl Capture {
     fn begin(file: PathBuf) -> Self {
         let target = fs::File::create(&file).unwrap();
@@ -399,15 +411,19 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
         .any(|w| w == needle.as_bytes())
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn keys_absent_from_logs() {
-    let daemon = Daemon::start();
+    let mut daemon = Daemon::start();
     let a = daemon.store("a");
     a.fill();
     let mut client = daemon.connect();
     let head = client.seal(&a);
 
     let capture = Capture::begin(daemon.dir.path().join("captured.log"));
+    std::io::stderr()
+        .write_all(b"furrow capture active\n")
+        .unwrap();
     let report = client.export(&a, &head, &a.root.join("outbox"));
     let mut bad = cell_args();
     bad["head"] = json!(head);
@@ -419,6 +435,7 @@ fn keys_absent_from_logs() {
         json!({"head": head, "cell_key": 12345, "dedup": DEDUP}),
     );
     let logged = capture.end();
+    assert!(contains(&logged, "furrow capture active"));
 
     for secret in [CELL_KEY, DEDUP] {
         assert!(!contains(&logged, secret), "daemon output holds a key");
@@ -428,6 +445,10 @@ fn keys_absent_from_logs() {
     }
     assert!(!refusal.to_string().contains(&CELL_KEY[..40]));
     assert!(refusal["err"].as_str().unwrap().contains("cell_key"));
+    // P2: close SQLite handles before scanning durable bytes because Windows
+    // enforces byte-range locks against readers of an active database.
+    daemon.stop.stop();
+    daemon.thread.take().unwrap().join().unwrap();
     // No key reaches the disk either: not in the store, the outbox or the ledger.
     for file in walk(daemon.dir.path()) {
         let bytes = fs::read(&file).unwrap();
@@ -439,7 +460,6 @@ fn keys_absent_from_logs() {
             ));
         }
     }
-    daemon.finish();
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
@@ -449,6 +469,14 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         for entry in fs::read_dir(&next).unwrap() {
             let path = entry.unwrap().path();
             let meta = fs::symlink_metadata(&path).unwrap();
+            // P2: AF_UNIX sockets are reparse points on Windows, not readable files.
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if meta.file_attributes() & 0x400 != 0 {
+                    continue;
+                }
+            }
             if meta.is_dir() {
                 stack.push(path);
             } else if meta.is_file() {
@@ -457,4 +485,44 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+#[cfg(windows)]
+struct Capture {
+    saved: [*mut std::ffi::c_void; 2],
+    file: fs::File,
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl Capture {
+    fn begin(path: PathBuf) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        let file = fs::File::create(&path).unwrap();
+        // P2: Rust writes through Win32 standard handles, not CRT descriptors.
+        // Keep the replacement alive until both original handles are restored.
+        let saved = unsafe { [GetStdHandle(-11i32 as u32), GetStdHandle(-12i32 as u32)] };
+        for kind in [-11i32, -12] {
+            assert_ne!(
+                unsafe { SetStdHandle(kind as u32, file.as_raw_handle()) },
+                0
+            );
+        }
+        Self { saved, file, path }
+    }
+
+    fn end(self) -> Vec<u8> {
+        for (kind, handle) in [-11i32, -12].into_iter().zip(self.saved) {
+            assert_ne!(unsafe { SetStdHandle(kind as u32, handle) }, 0);
+        }
+        drop(self.file);
+        fs::read(self.path).unwrap()
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+    fn SetStdHandle(kind: u32, handle: *mut std::ffi::c_void) -> i32;
 }

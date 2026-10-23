@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 //! A cold primed import explores the graph incrementally: each pass learns
 //! only what the objects it stored opened up, instead of re-walking all of it.
 
@@ -52,6 +50,7 @@ fn wide_source() -> Source {
     }
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn wide_primed_import_takes_everything_and_leaves_nothing() {
     let src = wide_source();
@@ -69,6 +68,7 @@ fn wide_primed_import_takes_everything_and_leaves_nothing() {
     assert_eq!(fs::read_dir(&inbox).unwrap().count(), 0);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn walk_reports_each_missing_object_once_and_follows_expand() {
     let src = wide_source();

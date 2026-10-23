@@ -1,15 +1,79 @@
-#![cfg(unix)]
-
 use assert_cmd::Command;
+use furrow::platform::symlink;
+use furrow::platform::MetadataExt;
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+fn furrow_bin() -> std::ffi::OsString {
+    // P2: native runners relocate the executable from the build machine.
+    std::env::var_os("CARGO_BIN_EXE_furrow").unwrap_or_else(|| env!("CARGO_BIN_EXE_furrow").into())
+}
+
+// P2/W2: subprocess tests use the production native-shell seam. PowerShell
+// writes exact bytes so Windows tests retain the same content assertions.
+fn shell_args(command: &str) -> Vec<std::ffi::OsString> {
+    let script = native_script(command);
+    let shell = furrow::platform::shell(&script);
+    let mut args: Vec<_> = std::iter::once(shell.get_program().to_owned())
+        .chain(shell.get_args().map(|arg| arg.to_owned()))
+        .collect();
+    // CLI argv cannot carry CommandExt's raw-argument flag. The encoded script
+    // has no inner quotes, so normal argv quoting can supply the outer pair.
+    #[cfg(windows)]
+    {
+        *args.last_mut().unwrap() = script.into();
+    }
+    #[cfg(unix)]
+    let _ = &mut args;
+    args
+}
+
+fn native_script(command: &str) -> String {
+    #[cfg(unix)]
+    return command.to_owned();
+    #[cfg(windows)]
+    {
+        let script = match command {
+            "rm -f .env; printf 'damaged\\n' > app.txt; exit 17" => "Remove-Item .env; [IO.File]::WriteAllText('app.txt', ('damaged'+[char]10)); exit 17",
+            "grep -q 'tracked original' app.txt; code=$?; printf 'probe mutation\\n' > app.txt; exit $code" => "$code=1; if ((Get-Content -Raw app.txt).Contains('tracked original')) {$code=0}; [IO.File]::WriteAllText('app.txt', ('probe mutation'+[char]10)); exit $code",
+            "printf isolated > command-result.txt" => "[IO.File]::WriteAllText('command-result.txt','isolated')",
+            "printf '%s|%s|%s' \"$FURROW_UNIVERSE_INDEX\" \"$FURROW_WORKDIR\" \"$PORT\" > universe.txt" => "[IO.File]::WriteAllText('universe.txt',($env:FURROW_UNIVERSE_INDEX+'|'+$env:FURROW_WORKDIR+'|'+$env:PORT))",
+            "pwd > observed-workdir.txt; printf retained > failed-result.txt; exit 7" => "[IO.File]::WriteAllText('observed-workdir.txt',$pwd.Path); [IO.File]::WriteAllText('failed-result.txt','retained'); exit 7",
+            "printf 'job edit\\n' >> app.txt && printf 'created by job\\n' > job-output.txt" => "[IO.File]::AppendAllText('app.txt',('job edit'+[char]10)); [IO.File]::WriteAllText('job-output.txt',('created by job'+[char]10))",
+            "printf 'from a\\n' > marker-a.txt" => "[IO.File]::WriteAllText('marker-a.txt',('from a'+[char]10))",
+            "printf 'from b\\n' > marker-b.txt" => "[IO.File]::WriteAllText('marker-b.txt',('from b'+[char]10))",
+            "grep -q 'source-only work' app.txt && grep -q 'fork-only work' agent-result.txt" => "if (!((Get-Content -Raw app.txt).Contains('source-only work') -and (Get-Content -Raw agent-result.txt).Contains('fork-only work'))) {exit 1}",
+            "grep -q 'peer work' peer-only.txt && grep -q 'source work' source-only.txt" => "if (!((Get-Content -Raw peer-only.txt).Contains('peer work') -and (Get-Content -Raw source-only.txt).Contains('source work'))) {exit 1}",
+            "grep -q 'source diverged' app.txt && grep -q 'fork-only work based on base' agent-result.txt" => "if (!((Get-Content -Raw app.txt).Contains('source diverged') -and (Get-Content -Raw agent-result.txt).Contains('fork-only work based on base'))) {exit 1}",
+            "grep -q 'job edit' app.txt && test -f job-output.txt" => "if (!((Get-Content -Raw app.txt).Contains('job edit') -and (Test-Path job-output.txt))) {exit 1}",
+            "false" => "exit 1",
+            _ => panic!("missing native test script: {command}"),
+        };
+        // Encoding avoids cmd.exe reinterpreting nested quotes or metacharacters.
+        let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::new();
+        for chunk in bytes.chunks(3) {
+            let value = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                encoded.push(if i > chunk.len() {
+                    '='
+                } else {
+                    ALPHABET[((value >> (18 - 6 * i)) & 63) as usize] as char
+                });
+            }
+        }
+        format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}")
+    }
+}
 
 struct ChildGuard(std::process::Child);
 
@@ -43,11 +107,13 @@ impl Fixture {
         fs::create_dir(repo.join("cache")).unwrap();
         fs::write(repo.join("cache/dependency.bin"), vec![7_u8; 180_000]).unwrap();
         fs::write(repo.join("notes.txt"), b"untracked notes\n").unwrap();
+        // P2/W4: Unix fixture links require privileges Windows does not guarantee.
+        #[cfg(unix)]
         symlink("app.txt", repo.join("app-link")).unwrap();
-        let mut permissions = fs::metadata(repo.join("app.txt")).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(repo.join("app.txt"), permissions).unwrap();
-        xattr::set(repo.join("app.txt"), "user.furrow-test", b"preserved").unwrap();
+        furrow::platform::set_mode(repo.join("app.txt"), 0o755).unwrap();
+        #[cfg(unix)]
+        furrow::platform::xattr::set(repo.join("app.txt"), "user.furrow-test", b"preserved")
+            .unwrap();
         Self {
             _temp: temp,
             repo,
@@ -100,6 +166,38 @@ fn collect_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+// P2/W2: unchanged-file checks need real file identity on NTFS; the capture
+// stat-cache seam intentionally has no Windows inode and cannot prove this.
+fn file_identity(path: impl AsRef<Path>) -> u64 {
+    #[cfg(unix)]
+    return fs::metadata(path).unwrap().ino();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileInformationByHandleEx(
+                handle: *mut std::ffi::c_void,
+                class: i32,
+                info: *mut std::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let file = fs::File::open(path).unwrap();
+        let mut info = [0u64; 3];
+        // SAFETY: FileIdInfo writes a volume id and 128-bit id into this buffer.
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(file.as_raw_handle(), 18, info.as_mut_ptr().cast(), 24)
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        info[1]
+    }
+}
+
 fn tree_physical_bytes(root: &Path) -> u64 {
     let mut files = Vec::new();
     collect_files(root, &mut files);
@@ -146,7 +244,7 @@ impl FollowProcess {
 }
 
 fn follow_process(repo: &Path, data: &Path) -> FollowProcess {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let mut child = std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", data)
         .env("FURROW_NO_DAEMON", "1")
         .arg("--repo")
@@ -178,7 +276,7 @@ fn follow_process(repo: &Path, data: &Path) -> FollowProcess {
 /// initial ingest. The reader thread also keeps draining stderr so the child
 /// never blocks writing later "sealed ..." lines.
 fn spawn_foreground_watcher(fixture: &Fixture, debounce_ms: &str) -> std::process::Child {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let mut child = std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", &fixture.data)
         .arg("--repo")
         .arg(&fixture.repo)
@@ -217,6 +315,7 @@ fn ndjson(bytes: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn path_rewind_restores_ignored_secret_without_touching_new_work() {
     let fixture = Fixture::new();
@@ -255,6 +354,7 @@ fn path_rewind_restores_ignored_secret_without_touching_new_work() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn status_fidelity_reports_exact_and_known_partial_capture_contracts() {
     let fixture = Fixture::new();
@@ -282,6 +382,7 @@ fn status_fidelity_reports_exact_and_known_partial_capture_contracts() {
     }));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn policy_excluded_subtrees_survive_rewind_and_can_later_be_included() {
     let fixture = Fixture::new();
@@ -354,6 +455,7 @@ fn policy_excluded_subtrees_survive_rewind_and_can_later_be_included() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn estimate_is_read_only_policy_aware_and_accounts_for_existing_cas_chunks() {
     let fixture = Fixture::new();
@@ -390,7 +492,10 @@ fn estimate_is_read_only_policy_aware_and_accounts_for_existing_cas_chunks() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
+#[cfg(unix)]
+// P2: the installed executable POSIX hook scripts assert Unix mode bits.
 fn installed_turn_hooks_seal_attributed_boundaries_from_any_working_directory() {
     let fixture = Fixture::new();
     let installed = fixture
@@ -404,7 +509,7 @@ fn installed_turn_hooks_seal_attributed_boundaries_from_any_working_directory() 
     let installed: Value = serde_json::from_slice(&installed).unwrap();
     assert_eq!(installed["hooks"].as_array().unwrap().len(), 3);
     let pre_turn = fixture.repo.join(".furrow/hooks/pre-turn");
-    assert!(fs::metadata(&pre_turn).unwrap().permissions().mode() & 0o111 != 0);
+    assert!(fs::metadata(&pre_turn).unwrap().mode() & 0o111 != 0);
 
     let outside = fixture._temp.path().join("outside");
     fs::create_dir(&outside).unwrap();
@@ -412,7 +517,7 @@ fn installed_turn_hooks_seal_attributed_boundaries_from_any_working_directory() 
         .current_dir(&outside)
         .env("FURROW_DATA_DIR", &fixture.data)
         .env("FURROW_NO_DAEMON", "1")
-        .env("FURROW_BIN", env!("CARGO_BIN_EXE_furrow"))
+        .env("FURROW_BIN", furrow_bin())
         .env("FURROW_AGENT_ID", "alpha")
         .env("FURROW_TURN_ID", "7")
         .output()
@@ -457,20 +562,16 @@ fn installed_turn_hooks_seal_attributed_boundaries_from_any_working_directory() 
     }));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn try_auto_protects_an_unwatched_workspace_and_preserves_the_command_exit_code() {
     let fixture = Fixture::new();
     let output = fixture
         .furrow()
-        .args([
-            "try",
-            "-m",
-            "risky migration",
-            "--",
-            "/bin/sh",
-            "-c",
+        .args(["try", "-m", "risky migration", "--"])
+        .args(shell_args(
             "rm -f .env; printf 'damaged\\n' > app.txt; exit 17",
-        ])
+        ))
         .assert()
         .code(17)
         .get_output()
@@ -521,6 +622,7 @@ fn try_auto_protects_an_unwatched_workspace_and_preserves_the_command_exit_code(
     }));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn shrink_previews_without_mutation_then_deletes_and_restores_dependency_caches() {
     let fixture = Fixture::new();
@@ -581,6 +683,7 @@ fn shrink_previews_without_mutation_then_deletes_and_restores_dependency_caches(
         .stderr(predicates::str::contains("refusing to shrink"));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn bisect_finds_the_first_bad_snapshot_without_leaking_probe_side_effects() {
     let fixture = Fixture::new();
@@ -615,11 +718,7 @@ fn bisect_finds_the_first_bad_snapshot_without_leaking_probe_side_effects() {
         .args([
             "--json",
             "bisect",
-            "--",
-            "/bin/sh",
-            "-c",
-            "grep -q 'tracked original' app.txt; code=$?; printf 'probe mutation\\n' > app.txt; exit $code",
-        ])
+            "--"]).args(shell_args("grep -q 'tracked original' app.txt; code=$?; printf 'probe mutation\\n' > app.txt; exit $code"))
         .assert()
         .success()
         .get_output()
@@ -651,11 +750,13 @@ fn bisect_finds_the_first_bad_snapshot_without_leaking_probe_side_effects() {
             .starts_with(".furrow-bisect-")));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn full_rewind_restores_git_ignored_untracked_metadata_and_is_reversible() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();
 
+    #[cfg(unix)]
     fs::remove_file(fixture.repo.join("app-link")).unwrap();
     fs::remove_file(fixture.repo.join("app.txt")).unwrap();
     fs::remove_file(fixture.repo.join(".env")).unwrap();
@@ -689,20 +790,21 @@ fn full_rewind_restores_git_ignored_untracked_metadata_and_is_reversible() {
         fs::read(fixture.repo.join("notes.txt")).unwrap(),
         b"untracked notes\n"
     );
+    // P2/W4: this assertion requires POSIX fixture metadata or privileged links.
+    #[cfg(unix)]
     assert_eq!(
         fs::read_link(fixture.repo.join("app-link")).unwrap(),
         Path::new("app.txt")
     );
+    #[cfg(unix)]
     assert_eq!(
-        fs::metadata(fixture.repo.join("app.txt"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
+        fs::metadata(fixture.repo.join("app.txt")).unwrap().mode() & 0o777,
         0o755
     );
+    // P2/W4: this assertion requires POSIX fixture metadata or privileged links.
+    #[cfg(unix)]
     assert_eq!(
-        xattr::get(fixture.repo.join("app.txt"), "user.furrow-test")
+        furrow::platform::xattr::get(fixture.repo.join("app.txt"), "user.furrow-test")
             .unwrap()
             .unwrap(),
         b"preserved"
@@ -727,6 +829,7 @@ fn full_rewind_restores_git_ignored_untracked_metadata_and_is_reversible() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn catalog_is_rebuilt_from_pack_and_authoritative_refs() {
     let fixture = Fixture::new();
@@ -755,6 +858,7 @@ fn catalog_is_rebuilt_from_pack_and_authoritative_refs() {
     assert_eq!(timeline[0]["id"], snapshot);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn incomplete_pack_tail_is_truncated_without_losing_visible_snapshots() {
     let fixture = Fixture::new();
@@ -780,6 +884,7 @@ fn incomplete_pack_tail_is_truncated_without_losing_visible_snapshots() {
     assert_eq!(timeline[0]["id"], snapshot);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn sqlite_consistent_rewind_restores_a_logical_database_snapshot() {
     let fixture = Fixture::new();
@@ -826,6 +931,7 @@ fn sqlite_consistent_rewind_restores_a_logical_database_snapshot() {
     assert_eq!(integrity, "ok");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn path_rewind_refuses_to_follow_a_symlink_parent_outside_workspace() {
     let fixture = Fixture::new();
@@ -836,7 +942,15 @@ fn path_rewind_refuses_to_follow_a_symlink_parent_outside_workspace() {
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("value.txt"), b"outside\n").unwrap();
     fs::remove_dir_all(fixture.repo.join("nested")).unwrap();
-    symlink(&outside, fixture.repo.join("nested")).unwrap();
+    // P2/W4: run the escape refusal wherever the process can create a symlink.
+    if let Err(error) = symlink(&outside, fixture.repo.join("nested")) {
+        #[cfg(windows)]
+        if error.raw_os_error() == Some(1314) {
+            eprintln!("W4: the process lacks the privilege to create this directory symlink");
+            return;
+        }
+        panic!("create escaping symlink: {error}");
+    }
 
     fixture
         .furrow()
@@ -847,6 +961,7 @@ fn path_rewind_refuses_to_follow_a_symlink_parent_outside_workspace() {
     assert_eq!(fs::read(outside.join("value.txt")).unwrap(), b"outside\n");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn watch_seals_and_restores_non_git_directories() {
     let temp = tempfile::tempdir().unwrap();
@@ -872,6 +987,7 @@ fn watch_seals_and_restores_non_git_directories() {
     assert!(!repo.join(".git").exists());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn unchanged_snapshots_reuse_cached_blobs_and_add_only_small_metadata() {
     let fixture = Fixture::new();
@@ -904,6 +1020,7 @@ fn unchanged_snapshots_reuse_cached_blobs_and_add_only_small_metadata() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
     let fixture = Fixture::new();
@@ -1000,7 +1117,8 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
         .furrow()
         .args(["run", "agent-command", "--destination"])
         .arg(&command_destination)
-        .args(["--", "sh", "-c", "printf isolated > command-result.txt"])
+        .args(["--"])
+        .args(shell_args("printf isolated > command-result.txt"))
         .assert()
         .success();
     assert_eq!(
@@ -1028,6 +1146,7 @@ fn warm_fork_is_independent_complete_listed_and_can_run_a_command() {
     assert_eq!(remaining[0]["name"], "agent-command");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn exec_plan_discloses_the_fallback_driver_paths_and_ports() {
     let fixture = Fixture::new();
@@ -1057,6 +1176,7 @@ fn exec_plan_discloses_the_fallback_driver_paths_and_ports() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn exec_runs_multiple_complete_universes_concurrently_and_seals_each_result() {
     let fixture = Fixture::new();
@@ -1069,11 +1189,7 @@ fn exec_runs_multiple_complete_universes_concurrently_and_seals_each_result() {
             "exec",
             "-n",
             "2",
-            "--",
-            "sh",
-            "-c",
-            "printf '%s|%s|%s' \"$FURROW_UNIVERSE_INDEX\" \"$FURROW_WORKDIR\" \"$PORT\" > universe.txt",
-        ])
+            "--"]).args(shell_args("printf '%s|%s|%s' \"$FURROW_UNIVERSE_INDEX\" \"$FURROW_WORKDIR\" \"$PORT\" > universe.txt"))
         .assert()
         .success()
         .get_output()
@@ -1100,6 +1216,7 @@ fn exec_runs_multiple_complete_universes_concurrently_and_seals_each_result() {
     assert_eq!(forks.as_array().unwrap().len(), 2);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn exec_uses_the_disclosed_workdir_and_preserves_failed_results() {
     let fixture = Fixture::new();
@@ -1118,16 +1235,10 @@ fn exec_uses_the_disclosed_workdir_and_preserves_failed_results() {
 
     let output = fixture
         .furrow()
-        .args([
-            "--json",
-            "exec",
-            "--fork",
-            "failed-universe",
-            "--",
-            "sh",
-            "-c",
+        .args(["--json", "exec", "--fork", "failed-universe", "--"])
+        .args(shell_args(
             "pwd > observed-workdir.txt; printf retained > failed-result.txt; exit 7",
-        ])
+        ))
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(7));
@@ -1135,11 +1246,11 @@ fn exec_uses_the_disclosed_workdir_and_preserves_failed_results() {
     assert_eq!(result["universes"][0]["exit_code"], 7);
     assert_eq!(result["universes"][0]["process_workdir"], expected_workdir);
     let fork = PathBuf::from(result["universes"][0]["path"].as_str().unwrap());
+    // P2: Windows shells may omit the verbatim prefix of the same directory.
+    let observed = fs::read_to_string(fork.join("observed-workdir.txt")).unwrap();
     assert_eq!(
-        fs::read_to_string(fork.join("observed-workdir.txt"))
-            .unwrap()
-            .trim(),
-        expected_workdir
+        Path::new(observed.trim()).canonicalize().unwrap(),
+        Path::new(&expected_workdir).canonicalize().unwrap()
     );
     assert_eq!(
         fs::read(fork.join("failed-result.txt")).unwrap(),
@@ -1152,6 +1263,7 @@ fn exec_uses_the_disclosed_workdir_and_preserves_failed_results() {
     assert!(!fixture.repo.join("failed-result.txt").exists());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn conflict_radar_opens_once_resolves_and_replays_from_a_durable_cursor() {
     let fixture = Fixture::new();
@@ -1282,6 +1394,7 @@ fn conflict_radar_opens_once_resolves_and_replays_from_a_durable_cursor() {
     assert_eq!(events[0]["conflict_id"], opened[0]["conflict_id"]);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn conflict_radar_distinguishes_sibling_edits_from_subtree_deletion() {
     let fixture = Fixture::new();
@@ -1340,6 +1453,7 @@ fn conflict_radar_distinguishes_sibling_edits_from_subtree_deletion() {
     }
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn conflict_radar_groups_many_forks_into_one_path_event() {
     let fixture = Fixture::new();
@@ -1413,6 +1527,7 @@ fn conflict_radar_groups_many_forks_into_one_path_event() {
     assert_eq!(remaining[0]["conflicts"], 0);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn conflict_event_follower_observes_seals_without_an_in_memory_queue() {
     let fixture = Fixture::new();
@@ -1433,7 +1548,7 @@ fn conflict_event_follower_observes_seals_without_an_in_memory_queue() {
         .success();
     fixture.furrow().arg("forks").assert().success();
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let mut child = std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", &fixture.data)
         .env("FURROW_NO_DAEMON", "1")
         .arg("--repo")
@@ -1474,6 +1589,7 @@ fn conflict_event_follower_observes_seals_without_an_in_memory_queue() {
     reader.join().unwrap();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn verified_merge_converges_independent_source_and_fork_changes() {
     let fixture = Fixture::new();
@@ -1494,7 +1610,9 @@ fn verified_merge_converges_independent_source_and_fork_changes() {
             "merge",
             "merge-agent",
             "--check",
-            "grep -q 'source-only work' app.txt && grep -q 'fork-only work' agent-result.txt",
+            &native_script(
+                "grep -q 'source-only work' app.txt && grep -q 'fork-only work' agent-result.txt",
+            ),
         ])
         .assert()
         .success();
@@ -1516,6 +1634,7 @@ fn verified_merge_converges_independent_source_and_fork_changes() {
     assert_eq!(timeline[0]["trigger"], "merge");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn advisory_claims_coordinate_sibling_forks_and_are_timeline_recorded() {
     let fixture = Fixture::new();
@@ -1588,6 +1707,7 @@ fn advisory_claims_coordinate_sibling_forks_and_are_timeline_recorded() {
         .success();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn coord_values_propagate_eagerly_and_reconcile_offline_forks_and_tombstones() {
     let fixture = Fixture::new();
@@ -1689,6 +1809,7 @@ fn coord_values_propagate_eagerly_and_reconcile_offline_forks_and_tombstones() {
     assert_eq!(timeline[0]["trigger"], "coord");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn watch_fork_returns_seals_after_an_exact_cursor() {
     let fixture = Fixture::new();
@@ -1744,6 +1865,7 @@ fn watch_fork_returns_seals_after_an_exact_cursor() {
     assert_eq!(updates["snapshots"][0]["label"], "agent completed task");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn merge_conflict_or_failed_check_never_mutates_source() {
     let fixture = Fixture::new();
@@ -1779,7 +1901,7 @@ fn merge_conflict_or_failed_check_never_mutates_source() {
     fs::write(check_fork.join("check-only.txt"), b"candidate\n").unwrap();
     fixture
         .furrow()
-        .args(["merge", "check-agent", "--check", "false"])
+        .args(["merge", "check-agent", "--check", &native_script("false")])
         .assert()
         .failure()
         .stderr(predicates::str::contains("merge check failed"));
@@ -1861,6 +1983,7 @@ fn push_and_expect_divergence(fixture: &Fixture, peer: &Path, peer_data: &Path) 
     divergence["remote_snapshot"].as_str().unwrap().to_owned()
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn merge_by_snapshot_id_converges_independent_changes_synced_through_a_directory_remote() {
     let fixture = Fixture::new();
@@ -1885,7 +2008,9 @@ fn merge_by_snapshot_id_converges_independent_changes_synced_through_a_directory
             "--snapshot",
             &theirs,
             "--check",
-            "grep -q 'peer work' peer-only.txt && grep -q 'source work' source-only.txt",
+            &native_script(
+                "grep -q 'peer work' peer-only.txt && grep -q 'source work' source-only.txt",
+            ),
         ])
         .assert()
         .success();
@@ -1909,6 +2034,7 @@ fn merge_by_snapshot_id_converges_independent_changes_synced_through_a_directory
     assert_eq!(timeline[0]["trigger"], "merge");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn merge_by_snapshot_id_reports_conflicts_identically_to_a_fork_merge() {
     let fixture = Fixture::new();
@@ -1971,6 +2097,7 @@ fn merge_by_snapshot_id_reports_conflicts_identically_to_a_fork_merge() {
     assert_eq!(fork_outcome["conflicts"], snapshot_conflicts);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn paged_flat_directory_snapshot_restores_entries_across_pages() {
     let fixture = Fixture::new();
@@ -2001,6 +2128,7 @@ fn paged_flat_directory_snapshot_restores_entries_across_pages() {
     }
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn interrupted_rewind_rolls_back_to_pre_rewind_state_on_next_command() {
     let fixture = Fixture::new();
@@ -2033,13 +2161,14 @@ fn interrupted_rewind_rolls_back_to_pre_rewind_state_on_next_command() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn live_writer_interference_is_rescued_and_rewind_rolls_back() {
     let fixture = Fixture::new();
     let target = fixture.watch();
     fs::write(fixture.repo.join("app.txt"), b"pre-rewind damage\n").unwrap();
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let mut child = std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", &fixture.data)
         .env("FURROW_NO_DAEMON", "1")
         .env("FURROW_TEST_REWIND_PAUSE_AFTER_APPLY_MS", "750")
@@ -2091,55 +2220,69 @@ fn live_writer_interference_is_rescued_and_rewind_rolls_back() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn precondition_interference_cancels_rewind_without_touching_writer_bytes() {
     let fixture = Fixture::new();
     let target = fixture.watch();
     fs::write(fixture.repo.join("app.txt"), b"pre-rewind damage\n").unwrap();
 
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
-        .env("FURROW_DATA_DIR", &fixture.data)
-        .env("FURROW_NO_DAEMON", "1")
-        .env("FURROW_TEST_REWIND_PAUSE_BEFORE_PRECONDITION_MS", "750")
-        .arg("--repo")
-        .arg(&fixture.repo)
-        .args(["rewind", &target, "--yes"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    // P2/W2/W6: hold the exact precondition boundary until the writer acts;
+    // a transient head sampled during a 750ms sleep can be missed under load.
+    let ready = fixture._temp.path().join("precondition.ready");
+    let release = ready.with_extension("release");
+    let mut child = ChildGuard(
+        std::process::Command::new(furrow_bin())
+            .env("FURROW_DATA_DIR", &fixture.data)
+            .env("FURROW_NO_DAEMON", "1")
+            .env(
+                "FURROW_TEST_REWIND_PAUSE_BEFORE_PRECONDITION_MS_GATE",
+                &ready,
+            )
+            .arg("--repo")
+            .arg(&fixture.repo)
+            .args(["rewind", &target, "--yes"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(
             Instant::now() < deadline,
             "pre-rewind seal was not published"
         );
-        let timeline = fixture
-            .furrow()
-            .args(["--json", "timeline", "--limit", "1"])
-            .output()
-            .unwrap();
-        if timeline.status.success() {
-            let timeline: Value = serde_json::from_slice(&timeline.stdout).unwrap();
-            if timeline[0]["trigger"] == "pre_rewind" {
-                break;
-            }
+        if ready.exists() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    let timeline = fixture
+        .furrow()
+        .args(["--json", "timeline", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(timeline.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&timeline.stdout).unwrap()[0]["trigger"],
+        "pre_rewind"
+    );
     fs::write(fixture.repo.join("app.txt"), b"writer before mutation\n").unwrap();
+    fs::write(&release, b"release").unwrap();
 
-    let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("cancelled before mutation"));
+    let status = child.0.wait().unwrap();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(!status.success());
+    assert!(stderr.contains("cancelled before mutation"));
     assert_eq!(
         fs::read(fixture.repo.join("app.txt")).unwrap(),
         b"writer before mutation\n"
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn foreground_watcher_seals_after_write_quiescence() {
     let fixture = Fixture::new();
@@ -2212,6 +2355,7 @@ fn foreground_watcher_seals_after_write_quiescence() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn watcher_reloads_policy_and_ignores_excluded_subtree_churn() {
     let fixture = Fixture::new();
@@ -2260,10 +2404,11 @@ fn watcher_reloads_policy_and_ignores_excluded_subtree_churn() {
     assert_eq!(after[0]["id"], policy_head);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn default_watch_starts_background_protection_and_forget_stops_it() {
     let fixture = Fixture::new();
-    std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", &fixture.data)
         .arg("--repo")
         .arg(&fixture.repo)
@@ -2293,6 +2438,7 @@ fn default_watch_starts_background_protection_and_forget_stops_it() {
     assert!(pid_files.is_empty());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn recovery_rediscovers_workspace_after_git_clean_removes_pointer() {
     let fixture = Fixture::new();
@@ -2313,6 +2459,7 @@ fn recovery_rediscovers_workspace_after_git_clean_removes_pointer() {
     assert!(fixture.repo.join(".furrow/workspace-id").exists());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn plain_forget_stays_detached_instead_of_being_rediscovered() {
     let fixture = Fixture::new();
@@ -2347,6 +2494,7 @@ fn plain_forget_stays_detached_instead_of_being_rediscovered() {
     assert_ne!(workspace_id, new_workspace_id);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn purge_then_gc_reclaims_only_unshared_history() {
     let fixture = Fixture::new();
@@ -2418,6 +2566,7 @@ fn purge_then_gc_reclaims_only_unshared_history() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
     let fixture = Fixture::new();
@@ -2477,9 +2626,7 @@ fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
         fs::read(peer.join("cache/dependency.bin")).unwrap(),
         vec![7_u8; 180_000]
     );
-    let unchanged_inode = fs::metadata(peer.join("cache/dependency.bin"))
-        .unwrap()
-        .ino();
+    let unchanged_inode = file_identity(peer.join("cache/dependency.bin"));
 
     fs::write(fixture.repo.join("app.txt"), b"remote delta\n").unwrap();
     let second_push = fixture
@@ -2524,9 +2671,7 @@ fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
     );
     assert_eq!(fs::read(peer.join("app.txt")).unwrap(), b"remote delta\n");
     assert_eq!(
-        fs::metadata(peer.join("cache/dependency.bin"))
-            .unwrap()
-            .ino(),
+        file_identity(peer.join("cache/dependency.bin")),
         unchanged_inode,
         "delta materialization must not replace an unchanged repository path"
     );
@@ -2592,6 +2737,7 @@ fn encrypted_two_store_sync_fast_forwards_and_preserves_divergence() {
     }
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn sync_ref_flag_publishes_and_pulls_an_independent_named_head() {
     let fixture = Fixture::new();
@@ -2680,6 +2826,7 @@ fn sync_ref_flag_publishes_and_pulls_an_independent_named_head() {
     assert!(namespace_root.join("refs/team-a/LEASE").is_file());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_deltas() {
     let fixture = Fixture::new();
@@ -2773,20 +2920,25 @@ fn remote_add_and_follow_keep_two_directory_backed_machines_current_with_small_d
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn network_clone_materializes_exact_state_and_removes_failed_destinations() {
     let fixture = Fixture::new();
     let remote_data = fixture.repo.parent().unwrap().join("clone-remote-data");
     let clone_data = fixture.repo.parent().unwrap().join("clone-client-data");
-    let wrapper = fixture.repo.parent().unwrap().join("clone-fake-ssh.sh");
+    let wrapper = fixture.repo.parent().unwrap().join(if cfg!(windows) {
+        "clone-fake-ssh.cmd"
+    } else {
+        "clone-fake-ssh.sh"
+    });
     fs::write(
         &wrapper,
         b"#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nshift\nshift\nexec \"$FURROW_TEST_BIN\" \"$@\"\n",
     )
     .unwrap();
-    let mut mode = fs::metadata(&wrapper).unwrap().permissions();
-    mode.set_mode(0o755);
-    fs::set_permissions(&wrapper, mode).unwrap();
+    #[cfg(windows)]
+    fs::write(&wrapper, b"@echo off\r\nif defined FURROW_SSH_START_LOG echo start>> \"%FURROW_SSH_START_LOG%\"\r\n\"%FURROW_TEST_BIN%\" %7 %8\r\n").unwrap();
+    furrow::platform::set_mode(&wrapper, 0o755).unwrap();
     fixture.watch();
 
     let ssh_furrow = |repo: &Path, data: &Path| {
@@ -2794,7 +2946,7 @@ fn network_clone_materializes_exact_state_and_removes_failed_destinations() {
         command
             .env("FURROW_SSH_COMMAND", &wrapper)
             .env("FURROW_REMOTE_DATA_DIR", &remote_data)
-            .env("FURROW_TEST_BIN", env!("CARGO_BIN_EXE_furrow"));
+            .env("FURROW_TEST_BIN", furrow_bin());
         command
     };
     let add = ssh_furrow(&fixture.repo, &fixture.data)
@@ -2861,19 +3013,26 @@ fn network_clone_materializes_exact_state_and_removes_failed_destinations() {
         fs::read(destination.join("cache/dependency.bin")).unwrap(),
         vec![7_u8; 180_000]
     );
+    // P2/W4: this assertion requires POSIX fixture metadata or privileged links.
+    #[cfg(unix)]
     assert_eq!(
         fs::read_link(destination.join("app-link")).unwrap(),
         PathBuf::from("app.txt")
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn persistent_ssh_helper_syncs_independent_stores_over_framed_stdio() {
     let fixture = Fixture::new();
     let peer = fixture.repo.parent().unwrap().join("ssh-peer");
     let peer_data = fixture.repo.parent().unwrap().join("ssh-peer-data");
     let remote_data = fixture.repo.parent().unwrap().join("ssh-remote-data");
-    let wrapper = fixture.repo.parent().unwrap().join("fake-ssh.sh");
+    let wrapper = fixture.repo.parent().unwrap().join(if cfg!(windows) {
+        "fake-ssh.cmd"
+    } else {
+        "fake-ssh.sh"
+    });
     git(
         fixture.repo.parent().unwrap(),
         &["clone", fixture.repo.to_str().unwrap(), "ssh-peer"],
@@ -2883,9 +3042,9 @@ fn persistent_ssh_helper_syncs_independent_stores_over_framed_stdio() {
         b"#!/bin/sh\ntest -z \"${FURROW_SSH_START_LOG:-}\" || printf 'start\\n' >> \"$FURROW_SSH_START_LOG\"\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nshift\nshift\nexec \"$FURROW_TEST_BIN\" \"$@\"\n",
     )
     .unwrap();
-    let mut mode = fs::metadata(&wrapper).unwrap().permissions();
-    mode.set_mode(0o755);
-    fs::set_permissions(&wrapper, mode).unwrap();
+    #[cfg(windows)]
+    fs::write(&wrapper, b"@echo off\r\nif defined FURROW_SSH_START_LOG echo start>> \"%FURROW_SSH_START_LOG%\"\r\n\"%FURROW_TEST_BIN%\" %7 %8\r\n").unwrap();
+    furrow::platform::set_mode(&wrapper, 0o755).unwrap();
 
     fixture.watch();
     furrow_at(&peer, &peer_data)
@@ -2897,7 +3056,7 @@ fn persistent_ssh_helper_syncs_independent_stores_over_framed_stdio() {
         command
             .env("FURROW_SSH_COMMAND", &wrapper)
             .env("FURROW_REMOTE_DATA_DIR", &remote_data)
-            .env("FURROW_TEST_BIN", env!("CARGO_BIN_EXE_furrow"));
+            .env("FURROW_TEST_BIN", furrow_bin());
         command
     };
 
@@ -2970,12 +3129,12 @@ fn persistent_ssh_helper_syncs_independent_stores_over_framed_stdio() {
 
     let start_log = fixture.repo.parent().unwrap().join("ssh-starts.log");
     let timing_log = fixture.repo.parent().unwrap().join("follow-timings.log");
-    let follower = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let follower = std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", &fixture.data)
         .env("FURROW_NO_DAEMON", "1")
         .env("FURROW_SSH_COMMAND", &wrapper)
         .env("FURROW_REMOTE_DATA_DIR", &remote_data)
-        .env("FURROW_TEST_BIN", env!("CARGO_BIN_EXE_furrow"))
+        .env("FURROW_TEST_BIN", furrow_bin())
         .env("FURROW_SSH_START_LOG", &start_log)
         .arg("--repo")
         .arg(&fixture.repo)
@@ -3039,13 +3198,14 @@ fn persistent_ssh_helper_syncs_independent_stores_over_framed_stdio() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
     let fixture = Fixture::new();
     let snapshot = fixture.watch();
     fs::write(fixture.repo.join(".env"), b"TOKEN=changed\n").unwrap();
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let mut child = std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", &fixture.data)
         .env("FURROW_NO_DAEMON", "1")
         .arg("--repo")
@@ -3152,6 +3312,7 @@ fn mcp_stdio_negotiates_lifecycle_lists_tools_and_keeps_errors_in_protocol() {
     assert_eq!(responses[8]["error"]["code"], -32602);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn snapshots_can_be_pinned_and_unpinned_idempotently() {
     let fixture = Fixture::new();
@@ -3197,6 +3358,7 @@ fn snapshots_can_be_pinned_and_unpinned_idempotently() {
     assert_eq!(unpin["changed"], true);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn global_budget_is_persistent_visible_and_never_deletes_the_head_to_fit() {
     let fixture = Fixture::new();
@@ -3281,7 +3443,7 @@ fn directory_manifest(root: &Path) -> Vec<(PathBuf, ManifestEntry)> {
                 entries.push((
                     relative,
                     ManifestEntry::Directory {
-                        mode: metadata.permissions().mode() & 0o777,
+                        mode: metadata.mode() & 0o777,
                     },
                 ));
                 walk(root, &path, entries);
@@ -3291,7 +3453,7 @@ fn directory_manifest(root: &Path) -> Vec<(PathBuf, ManifestEntry)> {
                     relative,
                     ManifestEntry::File {
                         content_hash,
-                        mode: metadata.permissions().mode() & 0o777,
+                        mode: metadata.mode() & 0o777,
                         mtime: (metadata.mtime(), metadata.mtime_nsec()),
                     },
                 ));
@@ -3304,6 +3466,7 @@ fn directory_manifest(root: &Path) -> Vec<(PathBuf, ManifestEntry)> {
     entries
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn fork_at_snapshot_matches_rewind_and_does_not_touch_the_source() {
     let fixture = Fixture::new();
@@ -3371,6 +3534,7 @@ fn fork_at_snapshot_matches_rewind_and_does_not_touch_the_source() {
     assert_eq!(snap_fork["base_snapshot"], base);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn merge_of_a_snapshot_fork_uses_the_specified_base_despite_source_divergence() {
     let fixture = Fixture::new();
@@ -3404,7 +3568,7 @@ fn merge_of_a_snapshot_fork_uses_the_specified_base_despite_source_divergence() 
             "merge",
             "at-merge",
             "--check",
-            "grep -q 'source diverged' app.txt && grep -q 'fork-only work based on base' agent-result.txt",
+            &native_script("grep -q 'source diverged' app.txt && grep -q 'fork-only work based on base' agent-result.txt"),
         ])
         .assert()
         .success();
@@ -3422,6 +3586,7 @@ fn merge_of_a_snapshot_fork_uses_the_specified_base_despite_source_divergence() 
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn fork_at_rejects_an_unresolvable_snapshot_without_creating_the_destination() {
     let fixture = Fixture::new();
@@ -3439,6 +3604,7 @@ fn fork_at_rejects_an_unresolvable_snapshot_without_creating_the_destination() {
 
 fn git(repo: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
+        .args(["-c", "core.autocrlf=false"])
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -3508,25 +3674,30 @@ fn assert_workspace_matches_source(fixture: &Fixture, peer: &Path, context: &str
             "{context}: byte mismatch for {relative}"
         );
     }
-    assert_eq!(
-        fs::read_link(peer.join("app-link")).unwrap(),
-        fs::read_link(fixture.repo.join("app-link")).unwrap(),
-        "{context}: symlink mismatch"
-    );
+    // P2/W4: fixture links and xattrs require Unix support or Windows privileges.
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::read_link(peer.join("app-link")).unwrap(),
+            fs::read_link(fixture.repo.join("app-link")).unwrap(),
+            "{context}: symlink mismatch"
+        );
+        assert_eq!(
+            furrow::platform::xattr::get(peer.join("app.txt"), "user.furrow-test")
+                .unwrap()
+                .as_deref(),
+            Some(&b"preserved"[..]),
+            "{context}: xattr mismatch"
+        );
+    }
     assert_eq!(
         fs::metadata(peer.join("app.txt")).unwrap().mode() & 0o777,
         fs::metadata(fixture.repo.join("app.txt")).unwrap().mode() & 0o777,
         "{context}: mode mismatch"
     );
-    assert_eq!(
-        xattr::get(peer.join("app.txt"), "user.furrow-test")
-            .unwrap()
-            .as_deref(),
-        Some(&b"preserved"[..]),
-        "{context}: xattr mismatch"
-    );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn streamed_clone_is_byte_identical_and_reports_materialized_progress() {
     let fixture = Fixture::new();
@@ -3561,6 +3732,7 @@ fn streamed_clone_is_byte_identical_and_reports_materialized_progress() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn interrupted_streamed_pull_recovers_and_completes_byte_identical() {
     let fixture = Fixture::new();
@@ -3634,7 +3806,7 @@ fn spawn_work(
     result_ref: &str,
     shell: &str,
 ) -> std::process::Child {
-    std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    std::process::Command::new(furrow_bin())
         .env("FURROW_DATA_DIR", data)
         .env("FURROW_NO_DAEMON", "1")
         .env("FURROW_RECOVERY_KEY", key)
@@ -3650,10 +3822,8 @@ fn spawn_work(
             "--result-ref",
             result_ref,
             "--",
-            "sh",
-            "-c",
-            shell,
         ])
+        .args(shell_args(shell))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -3698,6 +3868,7 @@ fn materialize_result(
     repo
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn work_runs_a_headless_job_at_a_remote_snapshot_and_publishes_a_mergeable_result() {
     let fixture = Fixture::new();
@@ -3741,10 +3912,10 @@ fn work_runs_a_headless_job_at_a_remote_snapshot_and_publishes_a_mergeable_resul
             "--result-ref",
             "results/1",
             "--",
-            "sh",
-            "-c",
-            "printf 'job edit\\n' >> app.txt && printf 'created by job\\n' > job-output.txt",
         ])
+        .args(shell_args(
+            "printf 'job edit\\n' >> app.txt && printf 'created by job\\n' > job-output.txt",
+        ))
         .assert()
         .success();
     let work_json = work_output.get_output().stdout.clone();
@@ -3782,7 +3953,7 @@ fn work_runs_a_headless_job_at_a_remote_snapshot_and_publishes_a_mergeable_resul
             "--snapshot",
             &result_snapshot,
             "--check",
-            "grep -q 'job edit' app.txt && test -f job-output.txt",
+            &native_script("grep -q 'job edit' app.txt && test -f job-output.txt"),
         ])
         .assert()
         .success();
@@ -3795,6 +3966,7 @@ fn work_runs_a_headless_job_at_a_remote_snapshot_and_publishes_a_mergeable_resul
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn concurrent_work_runs_on_one_input_ref_publish_independent_results() {
     let fixture = Fixture::new();

@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 //! A warm `materialize` restores a head over a tree that already holds an
 //! older one, and writes only what differs between the two. The staging folder
 //! of a take is such a tree: it starts as a copy of the root made of hard
@@ -10,9 +8,12 @@ mod common;
 use common::*;
 use furrow::exchange::materialize::materialize;
 use furrow::model::{ObjectId, SnapshotTrigger};
+#[cfg(unix)]
+use furrow::platform::symlink;
+#[cfg(unix)]
+use furrow::platform::MetadataExt;
 use furrow::repository::FurrowRepository;
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Seals the source tree as it is now.
@@ -62,6 +63,7 @@ fn warm(change: impl FnOnce(&Path)) -> (Source, Receiver, ObjectId) {
 }
 
 /// The staging folder of a take: directories made anew, files hard-linked.
+#[cfg(unix)]
 fn linked_copy(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
@@ -79,7 +81,10 @@ fn linked_copy(from: &Path, to: &Path) {
 }
 
 fn inode(path: impl AsRef<Path>) -> u64 {
-    fs::symlink_metadata(path).unwrap().ino()
+    #[cfg(unix)]
+    return fs::symlink_metadata(path).unwrap().ino();
+    #[cfg(windows)]
+    file_identity(path.as_ref())
 }
 
 fn without_root(
@@ -89,6 +94,7 @@ fn without_root(
     nodes
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_one_file_change_writes_one_file() {
     let (_src, dst, second) =
@@ -114,6 +120,7 @@ fn a_one_file_change_writes_one_file() {
     assert_eq!(rewritten, ["src/main.rs"]);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_take_of_the_head_already_held_writes_nothing() {
     let (_src, dst, _) = warm(|_| {});
@@ -133,12 +140,15 @@ fn a_take_of_the_head_already_held_writes_nothing() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
+#[cfg(unix)]
+// P2/W3: this test specifically requires a POSIX mode-only change.
 fn deletes_renames_and_mode_only_changes_reach_a_linked_copy_and_spare_the_original() {
     let (src, dst, second) = warm(|tree| {
         fs::remove_file(tree.join("src/deep/notes.txt")).unwrap();
         fs::rename(tree.join("big.bin"), tree.join("moved.bin")).unwrap();
-        fs::set_permissions(tree.join("run.sh"), fs::Permissions::from_mode(0o700)).unwrap();
+        furrow::platform::set_mode(tree.join("run.sh"), 0o700).unwrap();
     });
     let original = without_root(dump(&dst.tree));
     let stage = dst._temp.path().join("tree-b.taking");
@@ -172,6 +182,7 @@ fn deletes_renames_and_mode_only_changes_reach_a_linked_copy_and_spare_the_origi
 /// every file a process creates, quarantine on downloads). A tree sealed on
 /// another machine lacks them, so counting them as content made every file of
 /// a stamped tree differ from the head and rewrote the whole tree.
+// P2/W6: system-managed macOS attributes must not force a rewrite.
 #[cfg(target_os = "macos")]
 #[test]
 fn files_the_system_stamped_are_not_rewritten_by_a_take() {
@@ -179,7 +190,7 @@ fn files_the_system_stamped_are_not_rewritten_by_a_take() {
         warm(|tree| fs::write(tree.join("src/main.rs"), b"fn main() { 1 }\n").unwrap());
     let files = all_files(&dst.tree);
     for file in &files {
-        xattr::set(file, "com.apple.quarantine", b"0083;00000000;test;").unwrap();
+        furrow::platform::xattr::set(file, "com.apple.quarantine", b"0083;00000000;test;").unwrap();
     }
     let before: Vec<u64> = files.iter().map(inode).collect();
 
