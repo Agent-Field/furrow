@@ -350,3 +350,37 @@ Every original and extension observation remains in the pooled table above. Ther
 | radar | 575.855 | 726.226 | 1.261× |
 
 The lane also retains `trace_sessions.py` and its raw syscall traces for the before/after store-open proof, crash-injection and torn-record test logs, native Windows summaries, and compatibility runs using the actual v0.1.0 and earlier v0.2.0 writers. See the lane NOTES for exact commands and gate outcomes.
+
+## Default-on F6: unknown-change capture (2026-10-23)
+
+The retained daemon caches folder stat rows, invalidates them on external catalog commits/rollback/recovery, and leaves stable non-racy rows untouched. One-shot callers retain bounded-memory lookup. Linux uses pruned directory and included-file inode watches with an ordered inotify cookie in the private store. Inode coverage includes writes through outside hard links. Capture plans retain exact explicit hints; unlisted events stay pending for a later unknown capture. Overflow, watcher death, startup gaps, topology changes, unsupported filesystems, changed mount tables and uncertain Git-control dependencies widen plans.
+
+Q3 is incomplete as an unrestricted guarantee: still-live writable mappings can change bytes without notifications or new timestamps. Writable close covers completed mapped commands. Windows/macOS use full unknown-change walks because their notify backends lack the required ordered fence across pruned registrations. Native Windows tests prove real ReadDirectoryChangesW events and correct fallbacks; they do not prove narrowed captures.
+
+The latest untraced head measurement attempt ran alone after builds/tests/native execution; diagnostic tracing followed the numeric misses. Fixture setup ages metadata, explicitly syncs, and waits a fixed 45 seconds after global sync of fixture writeback outside timers. There are nine samples per operation; all samples, pressure readings, binary hashes and daemon RSS are retained in F6's measurements-final.jsonl. The 10k fixture is 100 directories × 100 files; 100k is 1,000 × 100, with additional Git/control files. Flat-directory latency is not established. The separate preliminary F5 before run was loaded and its shutdown exceeded 60 seconds after all 90 samples were recorded; its numbers are not a matched idle speedup claim.
+
+| Contract | Data files | Operation | Before p50 ms | Head p50 ms | Target ms | Head I/O some avg10 | Numeric result |
+|---|---:|---|---:|---:|---:|---|---|
+| Q1 | 0 | catalog-release | 202.638 | 202.864 | 400 | 0.29–1.32% | PASS |
+| Q1 | 0 | pack-release | 202.834 | 203.062 | 400 | 1.32–3.80% | PASS |
+| Q2 | 10,000 | unchanged-seal | 170.029 | 55.047 | 40 | 0.91–3.28% | FAIL |
+| Q2 | 10,000 | capture-plan | 72.496 | 0.974 | 40 | 3.28–3.28% | PASS |
+| Q2 | 10,000 | one-edit-seal | 327.374 | 84.207 | 50 | 3.28–3.28% | FAIL |
+| Q3 | 100,000 | one-edit-seal | 8617.003 | 6.822 | 30 | 76.40–76.40% | PASS |
+
+The Q1 numeric result requires every short-release sample below 400 ms; Q2/Q3 numeric results use medians. These numbers do not establish the unrestricted Q3 correctness contract. The original F5 30-second short-release regression was not reproduced: baseline waiters also resumed promptly. The inherited real stacked-wait test remains bounded to one 30-second operation.
+
+The earlier alone phase is preserved separately, including its 2,495.905 ms 10k unchanged-seal outlier. The final quiet follow-up uses the stronger declared sync/settling protocol; no earlier sample is discarded or pooled. Tail latency and pressure are in the raw table.
+
+Release profile measurements retained Git/index/sparse/config behavior: s+thin gzip 3,442,573 bytes; s+fat intermediate 3,358,184 bytes. Final binaries use size optimization, fat LTO, one codegen unit, aborting release panics and stripped symbols.
+
+| Platform | Raw bytes | gzip -9 bytes |
+|---|---:|---:|
+| Linux amd64 | 6,858,936 | 3,356,864 |
+| Linux arm64 (glibc 2.17) | 6,200,664 | 3,255,601 |
+| Windows amd64 | 6,390,784 | 3,254,582 |
+| Windows arm64 | 5,685,760 | 3,064,023 |
+| macOS arm64 | SDK link blocked | unavailable |
+| macOS amd64 | SDK link blocked | unavailable |
+
+Both macOS cross-builds reached linking but require missing CoreFoundation/CoreServices framework SDK definitions. No stub or unresolved-symbol artifact substitutes for a working binary.
