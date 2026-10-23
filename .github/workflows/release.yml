@@ -1,10 +1,6 @@
 name: release
 
-# Publishes per-platform `furrow` binaries so callers can install it without a
-# Rust toolchain. Windows is absent on purpose: the workspace uses Unix-only
-# filesystem APIs and Unix sockets, so a native Windows build needs
-# a source port, not a build target. Windows users reach furrow through WSL,
-# which uses the linux asset.
+# Publishes native binaries for Linux, macOS and Windows.
 
 on:
   push:
@@ -30,6 +26,7 @@ jobs:
     name: ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
     env:
+      BINARY_SUFFIX: ${{ startsWith(matrix.os, 'windows-') && '.exe' || '' }}
       BUILD_ROOT: ${{ startsWith(matrix.os, 'ubuntu-') && 'target/zig' || 'target' }}
     strategy:
       fail-fast: false
@@ -57,6 +54,14 @@ jobs:
           - asset: furrow-darwin-amd64
             target: x86_64-apple-darwin
             os: macos-14
+            native: false
+          - asset: furrow-windows-amd64.exe
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            native: true
+          - asset: furrow-windows-arm64.exe
+            target: aarch64-pc-windows-msvc
+            os: windows-latest
             native: false
     steps:
       - uses: actions/checkout@v4
@@ -118,24 +123,29 @@ jobs:
 
       - name: Build
         if: runner.os != 'Linux'
-        run: cargo build --release --locked -p furrow-cli --bin furrow --target ${{ matrix.target }}
+        # Include the Windows C runtime so a fresh machine needs no runtime installer.
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --locked -p furrow-cli --bin furrow --target ${{ matrix.target }} -j 4
 
       - name: Check Linux glibc floor
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          max_glibc=$(objdump -T "$BUILD_ROOT/${{ matrix.target }}/release/furrow" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+          max_glibc=$(objdump -T "$BUILD_ROOT/${{ matrix.target }}/release/furrow$BINARY_SUFFIX" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
           echo "${{ matrix.asset }}: $max_glibc (maximum allowed: GLIBC_2.17)"
           test "$(printf '%s\n' GLIBC_2.17 "$max_glibc" | sort -V | tail -1)" = GLIBC_2.17
 
       - name: Smoke test
+        shell: bash
         if: matrix.native
-        run: ./$BUILD_ROOT/${{ matrix.target }}/release/furrow --version
+        run: ./$BUILD_ROOT/${{ matrix.target }}/release/furrow$BINARY_SUFFIX --version
 
       - name: Stage asset
+        shell: bash
         run: |
           mkdir -p dist
-          install -m 755 "$BUILD_ROOT/${{ matrix.target }}/release/furrow" "dist/${{ matrix.asset }}"
+          install -m 755 "$BUILD_ROOT/${{ matrix.target }}/release/furrow$BINARY_SUFFIX" "dist/${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v4
         with:

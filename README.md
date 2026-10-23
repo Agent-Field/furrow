@@ -181,9 +181,24 @@ cargo install --locked --path furrow-cli -j 2
 ```
 
 Build output lives in the ignored root `target/` directory. Release tags build
-`furrow-cli` for Linux and macOS on amd64 and arm64; their assets are named
-`furrow-linux-amd64`, `furrow-linux-arm64`, `furrow-darwin-amd64`, and
-`furrow-darwin-arm64`.
+`furrow-cli` for Linux, macOS and Windows on amd64 and arm64. Assets are named
+`furrow-linux-amd64`, `furrow-linux-arm64`, `furrow-darwin-amd64`,
+`furrow-darwin-arm64`, `furrow-windows-amd64.exe`, and `furrow-windows-arm64.exe`.
+`SHA256SUMS` covers every asset.
+
+Native Windows requires Windows 10 1803 or newer for the daemon's AF_UNIX
+socket. `serve --socket <path>` uses the same newline-delimited JSON protocol
+as Unix, exits when idle, and drains requests on Ctrl-C, Ctrl-Break or console
+close. Keep the socket path short (the AF_UNIX limit is 108 bytes).
+Snapshots store `/` paths and untouched bytes; Windows preserves a recorded
+POSIX mode when sealing again and gives new files mode 0644. Names Windows
+refuses, case collisions, FIFOs, and symlinks without permission are left out
+of restoration and reported with reasons in JSON `held`. The snapshot retains
+those entries. Long workspace paths use Windows verbatim absolute paths.
+File replacement retries sharing violations for at most 1.27 seconds before
+reporting a blocked-file error. File durability uses FlushFileBuffers;
+directory syncing is a no-op on Windows. POSIX extended attributes and native
+CoW are unavailable there; forks use independent streaming copies.
 
 Engine integrations can use `furrow exchange <verb> --help` and
 `furrow serve --help` to discover their runtime contract. Exchange encryption
