@@ -17,6 +17,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct DurableFrontier {
+    packs: std::collections::BTreeMap<String, u64>,
+    refs: std::collections::BTreeMap<String, u64>,
+}
+
 const INITIAL_PACK_NAME: &str = "pack-000001.agp";
 const CURRENT_FILE: &str = "CURRENT";
 const OBJECT_MAGIC: &[u8; 4] = b"AGOB";
@@ -25,16 +31,138 @@ const OBJECT_VERSION: u8 = 1;
 const HEADER_LEN: u64 = 4 + 1 + 1 + 8 + 32 + 32;
 const MAX_OBJECT_LEN: u64 = 256 * 1024 * 1024;
 
+#[derive(Clone)]
 pub struct ObjectStore {
     root: PathBuf,
-    catalog: Catalog,
-    active_pack: RefCell<String>,
-    /// The run of records this process appended since the last pack sync.
-    unsynced: RefCell<Option<AppendRun>>,
+    catalog: Rc<Catalog>,
+    active_pack: Rc<RefCell<String>>,
+    /// Written records awaiting a verification checkpoint; absence does not imply durability.
+    unsynced: Rc<RefCell<Option<AppendRun>>>,
     maintenance: Rc<MaintenanceState>,
+    cache_folders: Rc<RefCell<HashMap<String, String>>>,
+    deferred: Cell<bool>,
+    append_pack: Rc<RefCell<Option<(String, File)>>>,
+    known_end: Rc<Cell<u64>>,
+    group: Rc<RefCell<Option<GroupCommit>>>,
 }
 
-/// Contiguous pack records appended by this process and not yet synced.
+/// A retained read-only view selects complete records without waiting for a capture's write transaction.
+pub struct GroupCommit {
+    root: PathBuf,
+    catalog: rusqlite::Connection,
+}
+
+impl GroupCommit {
+    pub fn open(root: &Path) -> anyhow::Result<Self> {
+        let catalog = rusqlite::Connection::open_with_flags(
+            root.join("catalog.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        catalog.busy_timeout(crate::catalog::WRITER_WAIT)?;
+        Ok(Self {
+            root: root.to_owned(),
+            catalog,
+        })
+    }
+
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        let maintenance = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("locks/maintenance.lock"))?;
+        wait_lock(&maintenance, false)?;
+        self.sync_locked()
+    }
+
+    fn sync_locked(&mut self) -> anyhow::Result<()> {
+        let root = &self.root;
+        let initial = !root.join("group-commit.json").exists();
+        let group = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("locks/group.lock"))?;
+        wait_lock(&group, true)?;
+        let mut frontier = DurableFrontier::default();
+        // Snapshot complete references FIRST. Later appends may reach disk, but the frontier never claims them.
+        for entry in fs::read_dir(root.join("workspaces"))? {
+            let entry = entry?;
+            if entry.path().join("refs.log").exists() {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                frontier
+                    .refs
+                    .insert(id.clone(), RefLog::open(root, &id)?.complete_len()?);
+            }
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("locks/pack.lock"))?;
+        wait_lock(&lock, true)?;
+        let mut packs = Vec::new();
+        for entry in fs::read_dir(root.join("packs"))? {
+            let entry = entry?;
+            if entry.path().extension() == Some(std::ffi::OsStr::new("agp")) {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(entry.path())?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let written: i64 = self.catalog.query_row(
+                    "SELECT COALESCE(MAX(offset + len + 4), 0) FROM objects WHERE pack = ?1",
+                    [&name],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    file.metadata()?.len() >= written as u64,
+                    "object pack needs recovery before group commit"
+                );
+                frontier.packs.insert(name, written as u64);
+                packs.push(file);
+            }
+        }
+        FileExt::unlock(&lock)?;
+        for file in packs {
+            file.sync_data()?;
+        }
+        crate::platform::sync_path(root.join("packs"))?;
+        fault::point("group.packs");
+        for id in frontier.refs.keys() {
+            RefLog::open(root, id)?.sync()?;
+        }
+        for entry in fs::read_dir(root.join("workspaces"))? {
+            crate::platform::sync_path(entry?.path())?;
+        }
+        crate::platform::sync_path(root.join("workspaces"))?;
+        fault::point("group.refs");
+        let mut temp = tempfile::NamedTempFile::new_in(root)?;
+        temp.write_all(&serde_json::to_vec(&frontier)?)?;
+        fault::point("group.frontier-written");
+        temp.as_file().sync_all()?;
+        fault::point("group.frontier-synced");
+        crate::platform::rename(temp.path(), root.join("group-commit.json"))?;
+        fault::point("group.frontier-renamed");
+        crate::platform::sync_path(root)?;
+        if initial {
+            for ancestor in root
+                .ancestors()
+                .skip(1)
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                crate::platform::sync_path(ancestor)?;
+            }
+        }
+        fault::point("group.frontier");
+        Ok(())
+    }
+}
+
+/// Contiguous records appended by this process and not yet checkpointed.
 struct AppendRun {
     pack: String,
     start: u64,
@@ -84,9 +212,9 @@ struct MaintenanceState {
     exclusive: Cell<bool>,
     file: RefCell<Option<File>>,
     /// The pack files opened during the current section, so a walk over many
-    /// objects opens each pack once instead of once per object. A section
-    /// holds the maintenance lock, so no pack is removed while a handle is
-    /// kept, and the handles are dropped when the section ends.
+    /// objects opens each pack once instead of once per object. Handles
+    /// survive ordinary sections; a generation change or exclusive
+    /// maintenance invalidates them before packs can be replaced.
     packs: RefCell<HashMap<String, Rc<File>>>,
 }
 
@@ -104,7 +232,6 @@ impl Drop for MaintenanceGuard {
                 let _ = FileExt::unlock(&file);
             }
             self.state.exclusive.set(false);
-            self.state.packs.borrow_mut().clear();
         }
     }
 }
@@ -145,10 +272,15 @@ impl ObjectStore {
         });
         let store = Self {
             root,
-            catalog,
-            active_pack: RefCell::new(active_pack),
-            unsynced: RefCell::new(None),
+            catalog: Rc::new(catalog),
+            active_pack: Rc::new(RefCell::new(active_pack)),
+            unsynced: Rc::new(RefCell::new(None)),
             maintenance,
+            cache_folders: Default::default(),
+            deferred: Cell::new(false),
+            append_pack: Default::default(),
+            known_end: Rc::new(Cell::new(0)),
+            group: Default::default(),
         };
         let startup_guard = MaintenanceGuard {
             state: Rc::clone(&store.maintenance),
@@ -156,6 +288,17 @@ impl ObjectStore {
         let recovered = store.recover_pack();
         drop(startup_guard);
         recovered?;
+        store.repair_deferred_refs()?;
+        store.share_legacy_file_rows()?;
+        store.known_end.set(
+            fs::metadata(
+                store
+                    .root
+                    .join("packs")
+                    .join(store.active_pack.borrow().as_str()),
+            )
+            .map_or(0, |m| m.len()),
+        );
         Ok(store)
     }
 
@@ -175,6 +318,17 @@ impl ObjectStore {
             return Ok(id);
         }
 
+        let pack_path = self
+            .root
+            .join("packs")
+            .join(self.active_pack.borrow().as_str());
+        let length = fs::metadata(&pack_path).map_or(0, |m| m.len());
+        if length != self.known_end.get() {
+            self.recover_pack_under_catalog_lock()?;
+            self.known_end
+                .set(fs::metadata(&pack_path).map_or(0, |m| m.len()));
+        }
+
         let lock_path = self.root.join("locks").join("pack.lock");
         let lock = OpenOptions::new()
             .create(true)
@@ -187,11 +341,21 @@ impl ObjectStore {
         if self.catalog.object(&id)?.is_none() {
             let active_pack = self.active_pack.borrow().clone();
             let pack_path = self.root.join("packs").join(&active_pack);
-            let mut pack = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&pack_path)?;
+            let mut retained = self.append_pack.borrow_mut();
+            if retained
+                .as_ref()
+                .is_none_or(|(name, _)| name != &active_pack)
+            {
+                *retained = Some((
+                    active_pack.clone(),
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .read(true)
+                        .open(&pack_path)?,
+                ));
+            }
+            let (_, pack) = retained.as_mut().expect("opened above");
             let record_start = pack.seek(SeekFrom::End(0))?;
             let checksum = blake3::hash(bytes);
             pack.write_all(OBJECT_MAGIC)?;
@@ -199,10 +363,14 @@ impl ObjectStore {
             pack.write_all(&(bytes.len() as u64).to_le_bytes())?;
             pack.write_all(&id)?;
             pack.write_all(checksum.as_bytes())?;
+            fault::point("seal.pack-header");
             let payload_offset = record_start + HEADER_LEN;
             pack.write_all(bytes)?;
+            fault::point("seal.pack-payload");
             pack.write_all(OBJECT_END)?;
+            fault::point("seal.pack-record");
             let end = pack.stream_position()?;
+            self.known_end.set(end);
             let run = self.unsynced.take();
             self.unsynced.replace(Some(AppendRun::then(
                 run,
@@ -228,6 +396,9 @@ impl ObjectStore {
     }
 
     pub(crate) fn acquire_maintenance_exclusive(&self) -> anyhow::Result<MaintenanceGuard> {
+        if self.maintenance.depth.get() == 0 && self.root.join("group-commit.json").exists() {
+            self.sync()?;
+        }
         self.acquire_maintenance(true)
     }
 
@@ -250,11 +421,19 @@ impl ObjectStore {
             .write(true)
             .open(&self.maintenance.path)?;
         if exclusive {
+            self.maintenance.packs.borrow_mut().clear();
+            self.append_pack.borrow_mut().take();
             wait_lock(&file, true)?;
         } else {
             wait_lock(&file, false)?;
         }
-        *self.active_pack.borrow_mut() = read_or_initialize_current(&self.root)?;
+        let current = read_or_initialize_current(&self.root)?;
+        if current != *self.active_pack.borrow() {
+            self.known_end.set(u64::MAX);
+            self.maintenance.packs.borrow_mut().clear();
+            self.append_pack.borrow_mut().take();
+        }
+        *self.active_pack.borrow_mut() = current;
         self.maintenance.depth.set(1);
         self.maintenance.exclusive.set(exclusive);
         *self.maintenance.file.borrow_mut() = Some(file);
@@ -342,6 +521,10 @@ impl ObjectStore {
             root.to_vec()
         };
         self.catalog.ensure_workspace(id, &catalog_root)?;
+        self.cache_folders.borrow_mut().insert(
+            id.to_owned(),
+            format!("folder:{}", blake3::hash(root).to_hex()),
+        );
         let detached = workspace_dir.join("detached");
         if detached.exists() {
             fs::remove_file(detached)?;
@@ -502,7 +685,12 @@ impl ObjectStore {
         workspace_id: &str,
         path: &[u8],
     ) -> anyhow::Result<Option<CachedFile>> {
-        self.catalog.cached_file(workspace_id, path)
+        let folder = self.cache_namespace(workspace_id, path)?;
+        match self.catalog.cached_file(&folder, path)? {
+            Some(row) => Ok(Some(row)),
+            None if folder != workspace_id => self.catalog.cached_file(workspace_id, path),
+            None => Ok(None),
+        }
     }
 
     pub fn cached_files(
@@ -510,7 +698,10 @@ impl ObjectStore {
         workspace_id: &str,
         paths: &[Vec<u8>],
     ) -> anyhow::Result<Vec<Option<CachedFile>>> {
-        self.catalog.cached_files(workspace_id, paths)
+        paths
+            .iter()
+            .map(|path| self.cached_file(workspace_id, path))
+            .collect()
     }
 
     pub fn cache_file(
@@ -519,23 +710,71 @@ impl ObjectStore {
         path: &[u8],
         file: &CachedFile,
     ) -> anyhow::Result<()> {
-        self.catalog.cache_file(workspace_id, path, file)
+        self.catalog
+            .cache_file(&self.cache_namespace(workspace_id, path)?, path, file)
     }
 
     pub fn sqlite_paths(&self, workspace_id: &str) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.catalog.sqlite_paths(workspace_id)
+        let mut paths = self
+            .catalog
+            .sqlite_paths(&self.cache_namespace(workspace_id, b"")?)?;
+        paths.extend(self.catalog.sqlite_paths(workspace_id)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Old timeline-scoped rows are advisory and can move to their folder without reading content again.
+    fn share_legacy_file_rows(&self) -> anyhow::Result<()> {
+        self.catalog.batch(|| {
+            for entry in fs::read_dir(self.root.join("workspaces"))? {
+                let entry = entry?;
+                let path = entry.path().join("root.path");
+                if !path.is_file() {
+                    continue;
+                }
+                let id = entry.file_name().to_string_lossy().into_owned();
+                let root = fs::read(path)?;
+                self.catalog.share_legacy_file_rows(
+                    &id,
+                    &format!("folder:{}", blake3::hash(&root).to_hex()),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// File identity belongs to a folder; composed private state belongs to its timeline.
+    fn cache_namespace(&self, workspace_id: &str, path: &[u8]) -> anyhow::Result<String> {
+        if path == b".cell" || path.starts_with(b".cell/") {
+            return Ok(workspace_id.to_owned());
+        }
+        if let Some(folder) = self.cache_folders.borrow().get(workspace_id) {
+            return Ok(folder.clone());
+        }
+        let root = fs::read(self.workspace_data_dir(workspace_id).join("root.path"))?;
+        let folder = format!("folder:{}", blake3::hash(&root).to_hex());
+        self.cache_folders
+            .borrow_mut()
+            .insert(workspace_id.to_owned(), folder.clone());
+        Ok(folder)
     }
 
     /// Runs `write` as one catalog transaction: the many small cache and index
-    /// writes of a capture become a single commit. The pack is made durable
-    /// before that commit, so the catalog never names bytes the pack could
-    /// lose; the commit itself needs no sync of its own, because the catalog
-    /// is an index rebuilt from the pack and the reference log.
+    /// writes of a capture become a single commit. Synchronous batches flush
+    /// the pack first; deferred batches checkpoint only the written prefix.
+    /// Recovery trusts that checkpoint only up to the independent durable
+    /// frontier and rebuilds the advisory catalog from packs and references.
     pub fn batched<T>(&self, write: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
         self.catalog.batch(|| {
             let value = write()?;
             fault::point("seal.captured");
-            self.sync_active_pack()?;
+            if !self.deferred.get() {
+                self.sync_active_pack()?;
+            } else if let Some(run) = self.unsynced.take() {
+                // The independent frontier limits which verified bytes recovery may trust after power loss.
+                self.advance_checkpoint(&run)?;
+            }
             fault::point("seal.packed");
             Ok(value)
         })
@@ -566,22 +805,92 @@ impl ObjectStore {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<()> {
-        // The append is the visibility boundary. Every referenced object was
-        // sync'd before this call; SQLite is an advisory index rebuilt from it.
-        self.sync_active_pack()?;
+        // The append is the visibility boundary. Synchronous calls flush the pack;
+        // deferred calls leave complete written records for the independent group commit.
+        if !self.deferred.get() {
+            self.sync_active_pack()?;
+        }
         fault::point("seal.committed");
-        let record = RefLog::open(&self.root, workspace_id)?.append(
+        let record = RefLog::open(&self.root, workspace_id)?.append_ordered(
             snapshot_id,
             sealed_at,
             label,
             trigger,
+            !self.deferred.get(),
         )?;
         fault::point("seal.logged");
         self.index_ref_record(workspace_id, &record)?;
+        fault::point("seal.indexed");
         if let Err(error) = self.enforce_budget(false) {
             eprintln!("warning: automatic store-budget enforcement failed: {error:#}");
         }
         Ok(())
+    }
+
+    /// A deferred capture is complete in the kernel before it becomes visible.
+    pub fn defer_durability(&self) -> anyhow::Result<()> {
+        if !self.root.join("group-commit.json").exists() {
+            self.sync()?;
+        }
+        self.deferred.set(true);
+        Ok(())
+    }
+
+    /// Restores the synchronous default for operations that follow a deferred capture.
+    pub fn resume_durability(&self) {
+        self.deferred.set(false);
+    }
+
+    pub(crate) fn checkpoint_catalog(&self) -> anyhow::Result<()> {
+        self.catalog.checkpoint()
+    }
+
+    /// Packs precede references; the durable frontier is published last.
+    pub fn sync(&self) -> anyhow::Result<()> {
+        let _maintenance = self.acquire_maintenance_shared()?;
+        self.sync_files_locked()?;
+        if let Some(run) = self.unsynced.take() {
+            self.catalog.batch(|| self.advance_checkpoint(&run))?;
+        }
+        self.catalog.checkpoint()
+    }
+
+    fn sync_files_locked(&self) -> anyhow::Result<()> {
+        let mut group = self.group.borrow_mut();
+        if group.is_none() {
+            *group = Some(GroupCommit::open(&self.root)?);
+        }
+        group.as_mut().expect("opened above").sync_locked()
+    }
+
+    fn frontier(&self) -> anyhow::Result<Option<DurableFrontier>> {
+        let path = self.root.join("group-commit.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    }
+
+    fn repair_deferred_refs(&self) -> anyhow::Result<()> {
+        let Some(frontier) = self.frontier()? else {
+            return Ok(());
+        };
+        self.catalog.batch(|| {
+            for entry in fs::read_dir(self.root.join("workspaces"))? {
+                let entry = entry?;
+                if !entry.path().join("refs.log").exists() {
+                    continue;
+                }
+                let id = entry.file_name().to_string_lossy().into_owned();
+                let log = RefLog::open(&self.root, &id)?;
+                if log.repair_suffix(*frontier.refs.get(&id).unwrap_or(&0), |id| {
+                    self.contains_object(id)
+                })? {
+                    self.catalog.forget_workspace_refs(&id)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     pub fn budget_status(&self) -> anyhow::Result<BudgetStatus> {
@@ -712,6 +1021,17 @@ impl ObjectStore {
         crate::platform::rename(temporary, packs.join(CURRENT_FILE))?;
         crate::platform::sync_path(&packs)?;
         *self.active_pack.borrow_mut() = pack.to_owned();
+        // An empty replacement pack is created lazily by the first append.
+        self.known_end.set(match fs::metadata(packs.join(pack)) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        });
+        self.maintenance.packs.borrow_mut().clear();
+        self.append_pack.borrow_mut().take();
+        if self.root.join("group-commit.json").exists() {
+            self.sync_files_locked()?;
+        }
         Ok(())
     }
 
@@ -761,12 +1081,27 @@ impl ObjectStore {
     /// hold one lock and wait on the other until SQLite's busy timeout gave up
     /// with "database is locked".
     fn recover_pack(&self) -> anyhow::Result<()> {
-        if !self
-            .root
-            .join("packs")
-            .join(&*self.active_pack.borrow())
-            .exists()
-        {
+        let name = self.active_pack.borrow().clone();
+        if !self.root.join("packs").join(&name).exists() {
+            let frontier = self.frontier()?;
+            let durable = frontier
+                .as_ref()
+                .and_then(|f| f.packs.get(&name))
+                .copied()
+                .unwrap_or(0);
+            anyhow::ensure!(durable == 0, "durable object pack is missing");
+            if self.catalog.pack_high_water(&name)? > 0 {
+                anyhow::ensure!(frontier.is_some(), "durable object pack is missing");
+                self.catalog.batch(|| {
+                    self.catalog.reset_pack_index(&name)?;
+                    self.catalog.forget_capture_caches()?;
+                    fs::write(
+                        self.root.join("capture-generation"),
+                        format!("{:?}", std::time::SystemTime::now()),
+                    )?;
+                    Ok(())
+                })?;
+            }
             return Ok(());
         }
         self.catalog
@@ -788,7 +1123,23 @@ impl ObjectStore {
         wait_lock(&lock, true)?;
         let mut pack = OpenOptions::new().read(true).write(true).open(&pack_path)?;
         let file_len = pack.metadata()?.len();
+        if self.catalog.pack_high_water(&pack_name)? > file_len {
+            self.catalog.forget_capture_caches()?;
+            fs::write(
+                self.root.join("capture-generation"),
+                format!("{:?}", std::time::SystemTime::now()),
+            )?;
+        }
         let checkpoint = self.catalog.pack_checkpoint(&pack_name)?;
+        let frontier = self.frontier()?;
+        let durable_len = frontier
+            .as_ref()
+            .map(|f| f.packs.get(&pack_name).copied().unwrap_or(0));
+        anyhow::ensure!(
+            durable_len.is_none_or(|len| file_len >= len),
+            "durable object pack prefix was lost"
+        );
+        let checkpoint = checkpoint.filter(|c| durable_len.is_none_or(|len| c.verified_len <= len));
         let checkpoint_valid = checkpoint
             .as_ref()
             .map(|checkpoint| self.validate_checkpoint(&mut pack, file_len, checkpoint))
@@ -815,6 +1166,10 @@ impl ObjectStore {
             .filter(|_| checkpoint_valid)
             .map_or(0, |checkpoint| checkpoint.last_record_start);
         let scanned_from = offset;
+        // The catalog can survive a power loss that drops a whole pack suffix.
+        // Remove its claims beyond the verified boundary before rebuilding them.
+        self.catalog
+            .delete_pack_objects_from(&pack_name, offset.saturating_add(HEADER_LEN))?;
         self.catalog.batch(|| {
             pack.seek(SeekFrom::Start(offset))?;
             let mut buffer = vec![0_u8; 1024 * 1024];
@@ -825,27 +1180,42 @@ impl ObjectStore {
                     self.truncate_pack_tail(&pack, record_start)?;
                     break;
                 }
-                anyhow::ensure!(
-                    &magic == OBJECT_MAGIC,
-                    "object pack corruption at byte {record_start}"
-                );
+                if &magic != OBJECT_MAGIC {
+                    anyhow::ensure!(
+                        frontier.is_some() && record_start >= durable_len.unwrap_or(0),
+                        "object pack corruption at byte {record_start}"
+                    );
+                    self.truncate_pack_tail(&pack, record_start)?;
+                    break;
+                }
                 let mut meta = [0_u8; 2];
                 if pack.read_exact(&mut meta).is_err() {
                     self.truncate_pack_tail(&pack, record_start)?;
                     break;
                 }
-                anyhow::ensure!(meta[0] == OBJECT_VERSION, "unsupported object pack version");
-                let kind = ObjectKind::from_u8(meta[1]).context("invalid object kind in pack")?;
+                if meta[0] != OBJECT_VERSION || ObjectKind::from_u8(meta[1]).is_none() {
+                    anyhow::ensure!(
+                        frontier.is_some() && record_start >= durable_len.unwrap_or(0),
+                        "invalid object pack version or kind"
+                    );
+                    self.truncate_pack_tail(&pack, record_start)?;
+                    break;
+                }
+                let kind = ObjectKind::from_u8(meta[1]).expect("validated above");
                 let mut len_bytes = [0_u8; 8];
                 if pack.read_exact(&mut len_bytes).is_err() {
                     self.truncate_pack_tail(&pack, record_start)?;
                     break;
                 }
                 let len = u64::from_le_bytes(len_bytes);
-                anyhow::ensure!(
-                    len <= MAX_OBJECT_LEN,
-                    "object pack record exceeds size limit"
-                );
+                if len > MAX_OBJECT_LEN {
+                    anyhow::ensure!(
+                        frontier.is_some() && record_start >= durable_len.unwrap_or(0),
+                        "object pack record exceeds size limit"
+                    );
+                    self.truncate_pack_tail(&pack, record_start)?;
+                    break;
+                }
                 let mut id = [0_u8; 32];
                 let mut checksum = [0_u8; 32];
                 if pack.read_exact(&mut id).is_err() || pack.read_exact(&mut checksum).is_err() {
@@ -870,15 +1240,17 @@ impl ObjectStore {
                 }
                 let mut end = [0_u8; 4];
                 pack.read_exact(&mut end)?;
-                anyhow::ensure!(&end == OBJECT_END, "object pack trailer mismatch");
-                anyhow::ensure!(
-                    checksum_hasher.finalize().as_bytes() == &checksum,
-                    "object payload checksum mismatch"
-                );
-                anyhow::ensure!(
-                    content_hasher.finalize().as_bytes() == &id,
-                    "object ID mismatch"
-                );
+                if &end != OBJECT_END
+                    || checksum_hasher.finalize().as_bytes() != &checksum
+                    || content_hasher.finalize().as_bytes() != &id
+                {
+                    anyhow::ensure!(
+                        frontier.is_some() && record_start >= durable_len.unwrap_or(0),
+                        "object pack checksum or trailer mismatch"
+                    );
+                    self.truncate_pack_tail(&pack, record_start)?;
+                    break;
+                }
                 self.catalog
                     .insert_object(&id, kind, &pack_name, payload_offset, len)?;
                 offset = pack.stream_position()?;
@@ -959,7 +1331,23 @@ impl ObjectStore {
     }
 
     fn truncate_pack_tail(&self, pack: &File, record_start: u64) -> anyhow::Result<()> {
+        if let Some(frontier) = self.frontier()? {
+            let durable_len = frontier
+                .packs
+                .get(self.active_pack.borrow().as_str())
+                .copied()
+                .unwrap_or(0);
+            anyhow::ensure!(
+                record_start >= durable_len,
+                "durable object pack prefix is corrupt"
+            );
+        }
         pack.set_len(record_start)?;
+        self.catalog.forget_capture_caches()?;
+        fs::write(
+            self.root.join("capture-generation"),
+            format!("{:?}", std::time::SystemTime::now()),
+        )?;
         self.catalog.delete_pack_objects_from(
             self.active_pack.borrow().as_str(),
             record_start.saturating_add(HEADER_LEN),

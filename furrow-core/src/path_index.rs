@@ -77,6 +77,12 @@ impl PathIndex {
         })
     }
 
+    pub fn checkpoint(&self) -> anyhow::Result<()> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok(())
+    }
+
     pub fn begin(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.transaction_active, "path-index transaction is active");
         self.connection.execute_batch("BEGIN IMMEDIATE")?;

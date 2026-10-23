@@ -18,8 +18,10 @@ pub trait Verb: Sync {
 
 /// Every verb that works on a store.
 pub fn lookup(name: &str) -> Option<&'static dyn Verb> {
-    const VERBS: [&dyn Verb; 9] = [
+    const VERBS: [&dyn Verb; 11] = [
         &Seal,
+        &CapturePlan,
+        &SyncStore,
         &Snap,
         &Restore,
         &Log,
@@ -58,6 +60,10 @@ struct SealArgs {
     /// Null walks the tree; a list visits only those paths.
     #[serde(default)]
     changed: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    durable: bool,
 }
 
 fn default_agent() -> String {
@@ -72,11 +78,39 @@ impl Verb for Seal {
     fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
         let a: SealArgs = args(value)?;
         let label = hook_label("turn-end", &a.agent, a.turn.as_deref(), None);
-        let id = handle.seal(label.clone(), a.changed)?;
+        let id = handle.seal(label.clone(), a.changed, a.plan, a.durable)?;
         let mut answer = handle.repo()?.snapshot_json(&id)?;
+        answer["durable"] = json!(a.durable);
         answer["event"] = json!("turn-end");
         answer["label"] = json!(label);
         Ok(answer)
+    }
+}
+
+struct CapturePlan;
+
+impl Verb for CapturePlan {
+    fn name(&self) -> &'static str {
+        "capture-plan"
+    }
+    fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
+        let a: SealArgs = args(value)?;
+        Ok(serde_json::to_value(
+            handle.attach()?.capture_plan(a.changed.as_deref())?,
+        )?)
+    }
+}
+
+struct SyncStore;
+
+impl Verb for SyncStore {
+    fn name(&self) -> &'static str {
+        "sync"
+    }
+    fn run(&self, handle: &mut Handle, _value: Value) -> anyhow::Result<Value> {
+        handle.store()?;
+        handle.sync()?;
+        Ok(json!({"durable": true}))
     }
 }
 
@@ -213,9 +247,12 @@ impl Verb for Export {
 
     fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
         let a: ExportArgs = secret_args(value)?;
-        let data_dir = &handle.target().data_dir;
-        ops::export(
-            data_dir,
+        handle.sync()?;
+        let data_dir = handle.target().data_dir.clone();
+        let store = handle.store()?.clone();
+        ops::export_from_store(
+            &store,
+            &data_dir,
             &a.keys.keys()?,
             &a.head,
             &a.ledger,
@@ -260,7 +297,7 @@ impl Verb for Want {
 
     fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
         let a: WantArgs = secret_args(value)?;
-        ops::wanted(&handle.target().data_dir, &a.keys.keys()?, &a.head)
+        ops::wanted_from_store(handle.store()?, &a.keys.keys()?, &a.head)
     }
 }
 
@@ -288,8 +325,11 @@ impl Verb for Import {
 
     fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
         let a: ImportArgs = secret_args(value)?;
-        ops::import(
-            &handle.target().data_dir,
+        let data_dir = handle.target().data_dir.clone();
+        let store = handle.store()?.clone();
+        ops::import_from_store(
+            &store,
+            &data_dir,
             &a.keys.keys()?,
             &a.head,
             &a.ledger,
@@ -311,18 +351,17 @@ impl Verb for Materialize {
         "materialize"
     }
 
-    /// Materializing moves the workspace head on disk, so the cached
-    /// repository is dropped and the next verb reopens the store.
+    /// Materializing through the retained repository keeps its head and path index in step.
     fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
         let a: MaterializeArgs = args(value)?;
-        handle.release();
-        let target = handle.target();
-        ops::restore_timeline_head(
-            &target.data_dir,
-            &target.tree,
-            target.cell_dir.clone(),
-            &a.head,
-            target.timeline.as_deref(),
-        )
+        handle.sync()?;
+        let head = furrow::model::parse_id(&a.head)?;
+        let (head, held) =
+            furrow::exchange::materialize::materialize_repository_holding(handle.attach()?, head)?;
+        let mut answer = json!({"snapshot": id_hex(&head)});
+        if !held.is_empty() {
+            answer["held"] = serde_json::to_value(held)?;
+        }
+        Ok(answer)
     }
 }

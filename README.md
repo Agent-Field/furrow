@@ -143,7 +143,7 @@ The CLI is the agent API: `--json` provides command results with stable snapshot
 
 The load-bearing decisions, for readers who want them:
 
-- **Immutable Merkle DAG over content-defined chunks.** A snapshot is published only after its referenced bytes are durable. Changed-path sealing visits supplied paths and their ancestors; full capture walks the tree and reuses a stat cache. New hard links or policy changes can require a full walk.
+- **Immutable Merkle DAG over content-defined chunks.** A snapshot is published after its referenced bytes are completely written. Daemon turn-end captures use group durability; `--durable` and `sync` wait for storage flushes. Changed-path sealing visits supplied paths and their ancestors; full capture walks the tree and reuses a stat cache. New hard links or policy changes can require a full walk.
 - **Crash-safe by construction.** Hash-verified append-only packs, an fsynced hash-chained publication log, recovery from truncated pack tails and deleted indexes — SQLite is an advisory index, never the truth.
 - **Warm forks via native CoW** — APFS `clonefile`, Linux `FICLONE` — with a streaming-copy fallback whose cost is disclosed before the fork runs.
 - **Retention with honest grades.** Timelines thin under hard disk budgets; every snapshot knows whether it's byte-exact or partial, and every missing path knows its recovery route. Pins override everything. `furrow estimate` projects store cost before you ever attach.
@@ -315,3 +315,44 @@ walk; `more` is the number of remaining groups. Explicit `exclude` subtrees are
 absent from this report. Reporting never looks inside an ignored directory.
 Delta seals may repeat the last full seal's report. Older snapshots and captures
 without the directive omit the field and retain their existing serialization.
+
+### Screened captures and group durability
+
+`hook turn-end` writes the complete capture before returning. The local daemon
+keeps the store, catalog, pack and timeline path indexes open and flushes pending
+captures in a group every 250 ms. A terminated caller or daemon leaves completed
+captures recoverable. A power failure can lose the pending group; checksummed
+pack records and a durable frontier let recovery remove an incomplete suffix
+without changing the last durable capture.
+
+```sh
+furrow --repo ./project --timeline chat-1 --json capture-plan --changed src/main.rs
+furrow --repo ./project --timeline chat-1 --json hook turn-end --plan TOKEN
+furrow --repo ./project --timeline chat-1 hook turn-end --changed src/main.rs --durable
+furrow --repo ./project --timeline chat-1 --json sync
+```
+
+The plan returns `token`, `full`, and `paths` (absolute physical candidate paths,
+including the external composed directory). Screen all candidates before passing
+the token to capture. An uninitialized or invalidated delta index, or a policy
+change, produces a full plan. Changes to file identity, timeline head, policy,
+or index generation invalidate the token; additional paths or a new hard-link
+walk are refused before their contents are read. Re-plan after a refusal.
+Plans enumerate metadata; policy and Git control files are read to determine
+eligibility. Known SQLite databases and their existing sidecars are included
+because consistent backups may read them even on a delta. Tokens are scoped to
+one timeline, folder, composed directory, and head, and are consumed by capture.
+
+The daemon verbs are `capture-plan` (`args.changed`, absent/null for a full walk),
+`seal` (`args.changed`, optional `args.plan`, optional `args.durable`), and `sync`
+(no arguments). `seal` adds `durable: false` until an explicitly requested flush
+completes; `durable: true` acknowledges a completed flush. `sync` returns
+`{"durable":true}` and covers all timelines in the data directory. Export flushes
+pending captures before handing back frames. The existing `sync --push`,
+`sync --pull`, and `sync --follow` operations keep their remote meanings.
+
+A spawned turn-end CLI connects to the local daemon, starting it when needed.
+`FURROW_SOCKET` can select an existing socket. `FURROW_NO_DAEMON=1` retains direct,
+synchronous operation. Shared-folder stat rows require no new option: timelines
+with the same canonical folder reuse file identities, while `.cell/` rows and
+heads remain private to each timeline. Old stores open without migration.

@@ -260,6 +260,15 @@ fn git_dir(root: &Path) -> Option<PathBuf> {
     (directory.join("HEAD").is_file() && common.join("objects").is_dir()).then_some(directory)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ConfigKey {
+    environment: Vec<(OsString, OsString)>,
+    files: Vec<(PathBuf, Option<Identity>)>,
+}
+
+type ConfigCache = HashMap<PathBuf, (ConfigKey, gix_config::File<'static>)>;
+thread_local! { static CONFIGS: std::cell::RefCell<ConfigCache> = Default::default(); }
+
 fn config(common: &Path, gitdir: &Path) -> anyhow::Result<gix_config::File<'static>> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -287,6 +296,36 @@ fn config(common: &Path, gitdir: &Path) -> anyhow::Result<gix_config::File<'stat
         }
     }
     paths.push((common.join("config"), gix_config::Source::Local));
+    let mut environment: Vec<_> = std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            name.starts_with("GIT_CONFIG")
+                || matches!(name.as_ref(), "HOME" | "USERPROFILE" | "XDG_CONFIG_HOME")
+        })
+        .collect();
+    environment.sort();
+    let mut dependencies: Vec<_> = paths.iter().map(|(path, _)| path.clone()).collect();
+    dependencies.push(gitdir.join("config.worktree"));
+    let key = ConfigKey {
+        environment,
+        files: dependencies
+            .into_iter()
+            .map(|p| {
+                let stamp = identity(&p);
+                (p, stamp)
+            })
+            .collect(),
+    };
+    let cached = CONFIGS.with(|cache| {
+        cache
+            .borrow()
+            .get(gitdir)
+            .filter(|(old, _)| old == &key)
+            .map(|(_, file)| file.clone())
+    });
+    if let Some(file) = cached {
+        return Ok(file);
+    }
     let head = fs::read_to_string(gitdir.join("HEAD")).unwrap_or_default();
     let branch = head
         .trim()
@@ -334,6 +373,17 @@ fn config(common: &Path, gitdir: &Path) -> anyhow::Result<gix_config::File<'stat
     }
     if let Some(env) = gix_config::File::from_env(options)? {
         result.append(env);
+    }
+    // Includes may name missing files or depend on a branch; preserve their full evaluation.
+    if !result.sections().any(|s| {
+        s.header().name().eq_ignore_ascii_case(b"include")
+            || s.header().name().eq_ignore_ascii_case(b"includeIf")
+    }) {
+        CONFIGS.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(gitdir.to_owned(), (key, result.clone()));
+        });
     }
     Ok(result)
 }

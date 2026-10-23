@@ -83,6 +83,9 @@ fn main() -> anyhow::Result<()> {
         "refs",
         "cold-seal",
         "delta-seal",
+        "capture-delta",
+        "capture-plan-delta",
+        "second-timeline",
         "fork",
         "universes",
         "radar",
@@ -192,6 +195,9 @@ fn run_scenario(name: &str, profile: Profile) -> anyhow::Result<Sample> {
         "refs" => benchmark_refs(profile),
         "cold-seal" => benchmark_cold_seal(profile),
         "delta-seal" => benchmark_delta_seal(profile),
+        "capture-delta" => benchmark_capture_delta(profile, false),
+        "capture-plan-delta" => benchmark_capture_delta(profile, true),
+        "second-timeline" => benchmark_second_timeline(profile),
         "unchanged-seal" => benchmark_unchanged_seal(profile),
         "fork" => benchmark_fork(profile),
         "universes" => benchmark_universes(profile),
@@ -334,6 +340,63 @@ fn benchmark_delta_seal(profile: Profile) -> anyhow::Result<Sample> {
         changed.len() as u64 * Workspace::FILE_BYTES as u64,
         None,
     )
+}
+
+// P1/P3: measure one ordered changed-file capture, with the durability barrier outside the timer.
+fn benchmark_capture_delta(profile: Profile, planned: bool) -> anyhow::Result<Sample> {
+    let workspace = Workspace::new(profile, false)?;
+    let (mut repository, _) =
+        FurrowRepository::attach_and_snapshot(&workspace.repo, None, SnapshotTrigger::AgentRun)?;
+    repository.defer_durability()?;
+    let changed = workspace.change_files(1)?;
+    let before = usage()?;
+    let started = Instant::now();
+    if planned {
+        let plan = repository.capture_plan(Some(&changed))?;
+        repository.seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)?;
+    } else {
+        repository.seal(None, SnapshotTrigger::AgentRun, Some(&changed))?;
+    }
+    let result = sample(
+        if planned {
+            "capture-plan-delta"
+        } else {
+            "capture-delta"
+        },
+        started,
+        before,
+        1,
+        Workspace::FILE_BYTES as u64,
+        None,
+    );
+    repository.sync()?;
+    result
+}
+
+// P4: the first capture of a sibling timeline walks metadata and reuses the folder's content identities.
+fn benchmark_second_timeline(profile: Profile) -> anyhow::Result<Sample> {
+    let workspace = Workspace::new(profile, false)?;
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let data = workspace.root.path().join("data");
+    let mut first =
+        FurrowRepository::attach_timeline_in(&data, &workspace.repo, Some("first"), None)?;
+    first.seal(None, SnapshotTrigger::AgentRun, None)?;
+    let before = usage()?;
+    let started = Instant::now();
+    let mut second =
+        FurrowRepository::attach_timeline_in(&data, &workspace.repo, Some("second"), None)?;
+    second.defer_durability()?;
+    second.seal(None, SnapshotTrigger::AgentRun, None)?;
+    let result = sample(
+        "second-timeline",
+        started,
+        before,
+        profile.files as u64,
+        0,
+        None,
+    );
+    second.sync()?;
+    result
 }
 
 // S9 measures a full unchanged capture, so ignored-content savings cannot hide stat-walk regressions.

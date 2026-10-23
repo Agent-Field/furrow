@@ -78,6 +78,7 @@ impl Catalog {
                 offset INTEGER NOT NULL,
                 len INTEGER NOT NULL
             ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS objects_pack_end ON objects(pack, (offset + len + 4));
             CREATE TABLE IF NOT EXISTS workspaces (
                 id TEXT PRIMARY KEY,
                 root BLOB NOT NULL UNIQUE,
@@ -111,6 +112,7 @@ impl Catalog {
                 cached_at_nanos INTEGER NOT NULL,
                 PRIMARY KEY(workspace_id, path)
             ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS stat_cache_sqlite ON stat_cache(workspace_id, path) WHERE sqlite = 1;
             CREATE TABLE IF NOT EXISTS directory_cache (
                 workspace_id TEXT NOT NULL,
                 path BLOB NOT NULL,
@@ -127,6 +129,47 @@ impl Catalog {
             ",
         )?;
         Ok(Self { conn })
+    }
+
+    pub(crate) fn forget_workspace_refs(&self, id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM timeline WHERE workspace_id = ?1", [id])?;
+        self.conn
+            .execute("UPDATE workspaces SET head = NULL WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub(crate) fn forget_capture_caches(&self) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch("DELETE FROM stat_cache; DELETE FROM directory_cache;")?;
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint(&self) -> anyhow::Result<()> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok(())
+    }
+
+    pub(crate) fn share_legacy_file_rows(
+        &self,
+        workspace: &str,
+        folder: &str,
+    ) -> anyhow::Result<()> {
+        let update = &UPSERT_STAT[UPSERT_STAT
+            .find("ON CONFLICT")
+            .expect("stat upsert has a conflict clause")..];
+        self.conn.execute(
+            &format!("INSERT INTO stat_cache SELECT ?2, path, device, inode, size, mtime_secs, mtime_nanos,
+             ctime_secs, ctime_nanos, mode, blob_id, xattrs, sqlite, cached_at_nanos
+             FROM stat_cache WHERE workspace_id = ?1 AND path != ?3 AND substr(path, 1, 6) != ?4
+             {update} WHERE excluded.cached_at_nanos > stat_cache.cached_at_nanos"),
+            params![workspace, folder, b".cell".as_slice(), b".cell/".as_slice()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM stat_cache WHERE workspace_id = ?1 AND path != ?2 AND substr(path, 1, 6) != ?3",
+            params![workspace, b".cell".as_slice(), b".cell/".as_slice()],
+        )?;
+        Ok(())
     }
 
     pub fn cached_file(
@@ -241,26 +284,23 @@ impl Catalog {
 
     pub fn object(&self, id: &ObjectId) -> anyhow::Result<Option<ObjectLocation>> {
         self.conn
-            .query_row(
-                "SELECT kind, pack, offset, len FROM objects WHERE id = ?1",
-                params![id.as_slice()],
-                |row| {
-                    let kind_value: u8 = row.get(0)?;
-                    let kind = ObjectKind::from_u8(kind_value).ok_or_else(|| {
-                        rusqlite::Error::InvalidColumnType(
-                            0,
-                            "kind".into(),
-                            rusqlite::types::Type::Integer,
-                        )
-                    })?;
-                    Ok(ObjectLocation {
-                        kind,
-                        pack: row.get(1)?,
-                        offset: row.get::<_, i64>(2)? as u64,
-                        len: row.get::<_, i64>(3)? as u64,
-                    })
-                },
-            )
+            .prepare_cached("SELECT kind, pack, offset, len FROM objects WHERE id = ?1")?
+            .query_row(params![id.as_slice()], |row| {
+                let kind_value: u8 = row.get(0)?;
+                let kind = ObjectKind::from_u8(kind_value).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "kind".into(),
+                        rusqlite::types::Type::Integer,
+                    )
+                })?;
+                Ok(ObjectLocation {
+                    kind,
+                    pack: row.get(1)?,
+                    offset: row.get::<_, i64>(2)? as u64,
+                    len: row.get::<_, i64>(3)? as u64,
+                })
+            })
             .optional()
             .map_err(Into::into)
     }
@@ -281,8 +321,8 @@ impl Catalog {
             })? as u64)
     }
 
-    pub fn remove_workspace(&mut self, workspace_id: &str) -> anyhow::Result<()> {
-        let tx = self.conn.transaction()?;
+    pub fn remove_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM stat_cache WHERE workspace_id = ?1",
             params![workspace_id],
@@ -303,8 +343,8 @@ impl Catalog {
         Ok(())
     }
 
-    pub fn detach_workspace(&mut self, workspace_id: &str) -> anyhow::Result<()> {
-        let tx = self.conn.transaction()?;
+    pub fn detach_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM stat_cache WHERE workspace_id = ?1",
             params![workspace_id],
@@ -322,7 +362,7 @@ impl Catalog {
     }
 
     pub fn replace_objects_from_gc(
-        &mut self,
+        &self,
         mark_database: &Path,
         pack: &str,
         checkpoint: &PackCheckpoint,
@@ -332,12 +372,17 @@ impl Catalog {
             params![mark_database.as_os_str().to_string_lossy().as_ref()],
         )?;
         let result = (|| {
-            let tx = self.conn.transaction()?;
+            let tx = self.conn.unchecked_transaction()?;
             tx.execute("DELETE FROM objects", [])?;
             tx.execute(
                 "INSERT INTO objects(id, kind, pack, offset, len)
                  SELECT id, kind, ?1, offset, len FROM gcmark.locations",
                 params![pack],
+            )?;
+            tx.execute("DELETE FROM stat_cache WHERE blob_id NOT IN (SELECT id FROM objects) OR (xattrs IS NOT NULL AND xattrs NOT IN (SELECT id FROM objects))", [])?;
+            tx.execute(
+                "DELETE FROM directory_cache WHERE tree_id NOT IN (SELECT id FROM objects)",
+                [],
             )?;
             tx.execute("DELETE FROM pack_checkpoints", [])?;
             tx.execute(
@@ -434,6 +479,14 @@ impl Catalog {
         )? as u64)
     }
 
+    pub(crate) fn pack_high_water(&self, pack: &str) -> anyhow::Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(offset + len + 4), 0) FROM objects WHERE pack = ?1",
+            [pack],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
     pub fn reset_pack_index(&self, pack: &str) -> anyhow::Result<()> {
         self.batch(|| {
             self.conn
@@ -499,14 +552,14 @@ impl Catalog {
     }
 
     pub fn commit_snapshot(
-        &mut self,
+        &self,
         workspace_id: &str,
         snapshot_id: &ObjectId,
         sealed_at: i64,
         label: Option<&str>,
         trigger: &str,
     ) -> anyhow::Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO timeline(workspace_id, snapshot_id, sealed_at, label, trigger)
              VALUES(?1, ?2, ?3, ?4, ?5)",

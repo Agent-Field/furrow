@@ -8,6 +8,7 @@ use super::ledger::Ledger;
 use super::open_store;
 use crate::model::{id_hex, parse_id};
 use crate::sealer::{CellSealer, Keys};
+use crate::store::ObjectStore;
 use anyhow::Context;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -20,10 +21,29 @@ pub fn export(
     outbox: &Path,
     max_frame: usize,
 ) -> anyhow::Result<Value> {
-    let store = open_store(data_dir)?;
+    export_from_store(
+        &open_store(data_dir)?,
+        data_dir,
+        keys,
+        head,
+        ledger,
+        outbox,
+        max_frame,
+    )
+}
+
+pub fn export_from_store(
+    store: &ObjectStore,
+    data_dir: &Path,
+    keys: &Keys,
+    head: &str,
+    ledger: &str,
+    outbox: &Path,
+    max_frame: usize,
+) -> anyhow::Result<Value> {
     let ledger = Ledger::named(data_dir, ledger)?;
     let job = ExportJob {
-        store: &store,
+        store,
         keys,
         head: parse_id(head)?,
         ledger: &ledger,
@@ -43,11 +63,11 @@ pub fn record_published(
 }
 
 pub fn wanted(data_dir: &Path, keys: &Keys, head: &str) -> anyhow::Result<Value> {
-    let rids = want(
-        &open_store(data_dir)?,
-        &CellSealer::new(keys),
-        parse_id(head)?,
-    )?;
+    wanted_from_store(&open_store(data_dir)?, keys, head)
+}
+
+pub fn wanted_from_store(store: &ObjectStore, keys: &Keys, head: &str) -> anyhow::Result<Value> {
+    let rids = want(store, &CellSealer::new(keys), parse_id(head)?)?;
     Ok(json!({"want": rids.iter().map(id_hex).collect::<Vec<_>>()}))
 }
 
@@ -59,11 +79,30 @@ pub fn import(
     inbox: &Path,
     mode: ImportMode,
 ) -> anyhow::Result<Value> {
+    import_from_store(
+        &open_store(data_dir)?,
+        data_dir,
+        keys,
+        head,
+        ledger,
+        inbox,
+        mode,
+    )
+}
+
+pub fn import_from_store(
+    store: &ObjectStore,
+    data_dir: &Path,
+    keys: &Keys,
+    head: &str,
+    ledger: &str,
+    inbox: &Path,
+    mode: ImportMode,
+) -> anyhow::Result<Value> {
     let sealer = CellSealer::new(keys);
-    let store = open_store(data_dir)?;
     let ledger = Ledger::named(data_dir, ledger)?;
     let import = Import {
-        store: &store,
+        store,
         sealer: &sealer,
         head: parse_id(head)?,
         inbox,

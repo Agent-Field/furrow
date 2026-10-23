@@ -1,7 +1,7 @@
 //! `materialize`: put an imported head on disk.
 
 use crate::model::{ObjectId, SnapshotTrigger};
-use crate::repository::{FurrowRepository, HeldPath, SealOptions};
+use crate::repository::{FurrowRepository, HeldPath};
 use std::path::{Path, PathBuf};
 
 /// Restores `head` into `target`, which may be an empty folder in a data
@@ -45,17 +45,19 @@ pub fn materialize_timeline_holding(
     head: ObjectId,
     timeline: Option<&str>,
 ) -> anyhow::Result<(ObjectId, Vec<HeldPath>)> {
-    let options = SealOptions {
-        changed: None,
-        overlay: cell_dir,
-    };
-    let (mut repository, _) = FurrowRepository::attach_and_seal_timeline_in(
-        data_dir,
-        target,
-        timeline,
+    let mut repository =
+        FurrowRepository::attach_timeline_in(data_dir, target, timeline, cell_dir)?;
+    materialize_repository_holding(&mut repository, head)
+}
+
+pub fn materialize_repository_holding(
+    repository: &mut FurrowRepository,
+    head: ObjectId,
+) -> anyhow::Result<(ObjectId, Vec<HeldPath>)> {
+    repository.seal(
         Some("before materialize".to_owned()),
         SnapshotTrigger::SyncPull,
-        options,
+        None,
     )?;
     let (_, plan) = repository.rewind(&head, &[], false)?;
     repository.adopt_head(&head)?;

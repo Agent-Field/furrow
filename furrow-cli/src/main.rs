@@ -29,6 +29,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List every capture candidate before screening it, with a token for turn-end.
+    CapturePlan {
+        #[command(flatten)]
+        seal: SealArgs,
+    },
     /// Project first-capture cost after policy and existing-store deduplication.
     Estimate,
     /// Attach a repository and create its first complete snapshot.
@@ -489,6 +494,12 @@ struct SealArgs {
     /// `.cell/` entry.
     #[arg(long, value_name = "DIR")]
     cell_dir: Option<PathBuf>,
+    /// Make the capture durable before acknowledging it.
+    #[arg(long)]
+    durable: bool,
+    /// Capture only the candidates screened with this capture-plan token.
+    #[arg(long)]
+    plan: Option<String>,
 }
 
 impl SealArgs {
@@ -573,6 +584,19 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("FURROW_TIMELINE", timeline);
     }
     match cli.command {
+        Command::CapturePlan { seal } => {
+            let options = seal.options()?;
+            let repository = FurrowRepository::attach_timeline_in(
+                &furrow::repository::data_root()?,
+                &cli.repo,
+                selected_timeline().as_deref(),
+                options.overlay,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_value(repository.capture_plan(options.changed.as_deref())?)?
+            );
+        }
         Command::Estimate => {
             let estimate = FurrowRepository::estimate(&cli.repo)?;
             if cli.json {
@@ -1552,10 +1576,16 @@ fn main() -> anyhow::Result<()> {
             ref_name,
             timings,
         } => {
-            anyhow::ensure!(
-                push || pull || follow,
-                "choose exactly one of --push, --pull, or --follow"
-            );
+            if !push && !pull && !follow {
+                furrow::store::ObjectStore::open(
+                    furrow::repository::data_root()?.join("store-v1"),
+                )?
+                .sync()?;
+                if cli.json {
+                    println!("{}", serde_json::json!({"durable": true}));
+                }
+                return Ok(());
+            }
             let ref_name = ref_name.as_deref();
             let mut repository = open_selected(&cli.repo, None)?;
             if follow {
@@ -2367,12 +2397,41 @@ fn run_hook(
     let turn = hook_value(turn, "FURROW_TURN_ID")?;
     let tool = hook_value(tool, "FURROW_TOOL_NAME")?;
     let label = furrow_daemon::hook_label(event, &agent, turn.as_deref(), tool.as_deref());
-    let (repository, snapshot) = seal_selected(
+    let durable = seal.durable;
+    let plan = seal.plan.clone();
+    let options = seal.options()?;
+    if event == "turn-end" && std::env::var_os("FURROW_NO_DAEMON").is_none() {
+        let answer = daemon_seal(root, &agent, turn.as_deref(), options, plan, durable)?;
+        if json {
+            println!("{answer}");
+        } else {
+            println!(
+                "Sealed {} {}",
+                &answer["snapshot"].as_str().context("snapshot missing")?[..12],
+                label
+            );
+        }
+        return Ok(());
+    }
+    let mut repository = FurrowRepository::attach_timeline_in(
+        &furrow::repository::data_root()?,
         root,
-        Some(label.clone()),
-        SnapshotTrigger::AgentRun,
-        seal.options()?,
+        selected_timeline().as_deref(),
+        options.overlay,
     )?;
+    let snapshot = match plan {
+        Some(token) => {
+            repository.seal_plan(Some(label.clone()), SnapshotTrigger::AgentRun, &token)?
+        }
+        None => repository.seal(
+            Some(label.clone()),
+            SnapshotTrigger::AgentRun,
+            options.changed.as_deref(),
+        )?,
+    };
+    if durable {
+        repository.sync()?;
+    }
     if json {
         let mut answer = repository.snapshot_json(&snapshot)?;
         answer["event"] = serde_json::json!(event);
@@ -2382,6 +2441,136 @@ fn run_hook(
         println!("Sealed {} {}", &id_hex(&snapshot)[..12], label);
     }
     Ok(())
+}
+
+/// Connect before sending: an interrupted answer must never cause a capture replay.
+fn daemon_seal(
+    root: &std::path::Path,
+    agent: &str,
+    turn: Option<&str>,
+    options: SealOptions,
+    plan: Option<String>,
+    durable: bool,
+) -> anyhow::Result<serde_json::Value> {
+    use furrow::model::ObjectKind;
+    use furrow::store::object_id;
+    let data_dir = furrow::repository::data_root()?;
+    fs::create_dir_all(&data_dir)?;
+    let data_dir = data_dir.canonicalize()?;
+    let executable = std::env::current_exe()?;
+    let metadata = fs::metadata(&executable)?;
+    let modified = metadata.modified()?.duration_since(std::time::UNIX_EPOCH)?;
+    let identity =
+        serde_json::to_vec(&(&data_dir, &executable, metadata.len(), modified.as_nanos()))?;
+    let hash = id_hex(&object_id(ObjectKind::Chunk, &identity));
+    let socket = std::env::temp_dir()
+        .join(format!("furrow-{}", &hash[..24]))
+        .join("s");
+    let socket = std::env::var_os("FURROW_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or(socket);
+    let stream = match furrow_daemon::client::connect(&socket) {
+        Ok(stream) => stream,
+        Err(_) => {
+            let parent = socket.parent().context("daemon socket has no directory")?;
+            fs::create_dir_all(parent)?;
+            let log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(socket.with_extension("log"))?;
+            let mut command = std::process::Command::new(executable);
+            command
+                .arg("serve")
+                .arg("--socket")
+                .arg(&socket)
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone()?)
+                .stderr(log);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // A background engine must have its own console group and cannot retain the caller's console.
+                command.creation_flags(0x00000208);
+            }
+            spawn_local_daemon(&mut command).context("start local capture daemon")?;
+            let started = std::time::Instant::now();
+            loop {
+                match furrow_daemon::client::connect(&socket) {
+                    Ok(stream) => break stream,
+                    Err(error) => {
+                        anyhow::ensure!(
+                            started.elapsed() < std::time::Duration::from_secs(5),
+                            "local capture daemon did not start: {error}"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+    };
+    let cell_dir = options.overlay.map(std::path::absolute).transpose()?;
+    let request = serde_json::json!({
+        "V": 1, "id": 1, "verb": "seal",
+        "target": {"data_dir": data_dir, "tree": root.canonicalize()?, "cell_dir": cell_dir, "timeline": selected_timeline()},
+        "args": {"agent": agent, "turn": turn, "changed": options.changed, "plan": plan, "durable": durable}
+    });
+    furrow_daemon::client::exchange(stream, &request)
+}
+
+fn spawn_local_daemon(command: &mut std::process::Command) -> io::Result<std::process::Child> {
+    #[cfg(windows)]
+    let _handles = NonInheritedStandardHandles::take()?;
+    command.spawn()
+}
+
+#[cfg(windows)]
+struct NonInheritedStandardHandles(Vec<(*mut std::ffi::c_void, u32)>);
+
+#[cfg(windows)]
+impl NonInheritedStandardHandles {
+    fn take() -> io::Result<Self> {
+        let mut handles = Self(Vec::new());
+        for kind in [-10_i32, -11, -12] {
+            // SAFETY: these are process-owned standard handles; no handle is closed or transferred here.
+            let handle = unsafe { GetStdHandle(kind as u32) };
+            if handle.is_null() || handle as isize == -1 {
+                continue;
+            }
+            let mut flags = 0;
+            // SAFETY: flags is writable, and the standard handle remains live through spawn.
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if flags & 1 != 0 {
+                // SAFETY: only inheritance is changed, while this single-threaded CLI starts its daemon.
+                if unsafe { SetHandleInformation(handle, 1, 0) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                handles.0.push((handle, flags));
+            }
+        }
+        Ok(handles)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NonInheritedStandardHandles {
+    fn drop(&mut self) {
+        for (handle, flags) in self.0.drain(..) {
+            // SAFETY: restore the inheritance bit on the same still-live standard handle.
+            unsafe {
+                SetHandleInformation(handle, 1, flags & 1);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+    fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+    fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
 }
 
 fn hook_value(explicit: Option<String>, environment: &str) -> anyhow::Result<Option<String>> {

@@ -7,6 +7,7 @@
 //! every store one writer thread while different stores run in parallel; the
 //! [`server::Server`] owns the socket, the idle clock and shutdown.
 
+pub mod client;
 pub mod handle;
 pub mod router;
 pub mod server;

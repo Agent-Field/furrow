@@ -55,6 +55,8 @@ pub fn consistent_backup(path: &Path, temp_dir: &Path) -> anyhow::Result<Consist
 
     let file = NamedTempFile::new_in(temp_dir)?;
     let mut destination = Connection::open(file.path())?;
+    // The temporary image is captured into the ordered pack before publication; syncing it adds no durability.
+    destination.pragma_update(None, "synchronous", "OFF")?;
     {
         let backup = Backup::new(&source, &mut destination)?;
         backup.run_to_completion(128, Duration::from_millis(2), None)?;

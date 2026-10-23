@@ -265,3 +265,88 @@ Four timelines use 33,521,664 allocated bytes versus 32,899,072 for one (1.01892
 Functional gates pass: Linux 268 tests and Windows 249 tests, with one existing ignored vector generator on each platform. Every Windows executable runs in one native request (final-native-all-01, 20 executables). Both release builds, fmt, both clippy gates and ARM64 check pass. Native Windows-to-Linux fixture return, old v0.1.0/v0.2.0 writers and 53 local relay vectors pass.
 
 Unmet measured bounds: G3. These failed wall-time bounds are retained as failures. The shared host has variable filesystem waits; CPU medians and syscall diagnostics are supporting evidence, not substitutes for the required wall-time limits. No durability sync, assertion, ceiling or sample is removed to obtain a pass.
+
+## Default-on F4: ordered capture and retained sessions (2026-10-23)
+
+Base is `618bbcb`; head is the edit-only F4 handoff. Linux/ext4 on the shared eight-core host, release builds with the pinned Rust toolchain. `measure.py` in the F4 lane directory runs seven transport pairs and five base/head pairs per existing scenario in strict A B A B order, followed by a fixed five additional pairs for each scenario whose first-five head/base median exceeds 1.10× (the rule was declared before the full matrix completed). Every raw row in `measurements.jsonl` records before/after `/proc/pressure/io`, load, and artifact hashes. `measurement-source.json` binds the binaries to source digests. Fixture setup is excluded from timed operations; subprocess RSS includes setup. All samples are retained.
+
+The host was loaded: I/O `some avg10` ranged from 13.67% to 69.80%. The Linux workspace suite also ran during part of the measurement interval. These are loaded-host observations; quiet-machine acceptance remains unproven.
+
+Linux head SHA-256: `9d465d8af37054a668a0bb2e79bf1ad257c5adfcae547c136c8528422c746c05`. Benchmark SHA-256: `8da8d5c6368fc65909b3159d9e051ab3864dc4b0d16cebb4934f13352190fa52`.
+
+### Transport and ignore comparison
+
+The transport fixture has 10,000 unique files across ten directories, a real Git repository, an aged initial stat cache, five warmups, and one rewritten file per request. Spawned CLI samples connect to the persistent daemon via `FURROW_SOCKET`. Second-timeline samples include attachment and the first full capture of the same unchanged folder. The original transport phase retained seven head-only second-timeline observations; a separate five-pair A/B phase closes that comparison gap and is shown separately below.
+
+| Operation | Base p50 / p95 ms | Head p50 / p95 ms | Head range ms |
+|---|---:|---:|---:|
+| Daemon delta, no gitignore | 261.555 / 408.733 | 3.914 / 7.950 | 3.644–7.950 |
+| Daemon delta, gitignore | 165.393 / 2408.649 | 3.634 / 3.707 | 3.540–3.707 |
+| Spawned CLI delta | 285.211 / 560.426 | 5.258 / 9.263 | 4.798–9.263 |
+| Second timeline, original head-only phase | — | 1253.188 / 3039.216 | 555.293–3039.216 |
+| Second timeline, five matched A/B pairs | 543.812 / 672.213 | 139.854 / 190.440 | 137.508–190.440 |
+
+The ignore/no-ignore median ratio is 0.929× (P5 limit 1.1×). Warm daemon and spawned-CLI numeric limits pass in this run. The matched second-timeline phase meets the <=300 ms numeric limit for all five head samples. The original head-only phase under heavier load exceeded it; both phases are retained. Quiet-machine acceptance is not claimed.
+
+### Existing scenarios
+
+10,000 files, 100 changed files for the existing delta scenario, 128 MiB chunk stream, 32 MiB warm cache, 721 historical snapshots, 1,000 lookups and five universes. Existing scenarios retain synchronous durability. The comparison below uses medians; <=1.10× is the specified regression limit.
+
+| Scenario | N per binary | Base p50 / p95 ms | Head p50 / p95 ms | Head/base p50 | Base / head p50 CPU ms |
+|---|---:|---:|---:|---:|---:|
+| chunk | 5 | 225.966 / 228.943 | 224.681 / 231.164 | 0.994× | 225.961 / 224.682 |
+| tree-diff | 5 | 20657.844 / 21001.158 | 21093.929 / 21231.769 | 1.021× | 20654.616 / 21093.546 |
+| refs | 5 | 117.331 / 118.339 | 117.366 / 120.946 | 1.000× | 117.310 / 117.362 |
+| cold-seal | 10 | 2582.941 / 6743.858 | 2286.697 / 6374.228 | 0.885× | 748.224 / 702.050 |
+| delta-seal | 5 | 151.591 / 852.022 | 110.329 / 278.221 | 0.728× | 10.943 / 12.578 |
+| unchanged-seal | 5 | 782.947 / 1089.723 | 476.536 / 744.997 | 0.609× | 144.823 / 132.826 |
+| fork | 5 | 7298.878 / 15344.312 | 6931.215 / 13341.313 | 0.950× | 2320.901 / 2197.445 |
+| universes | 10 | 19134.323 / 57735.127 | 24605.836 / 50566.322 | 1.286× | 9394.855 / 9240.962 |
+| radar | 10 | 574.709 / 875.516 | 690.499 / 1076.744 | 1.201× | 289.749 / 275.466 |
+| gc | 5 | 88.456 / 97.246 | 69.618 / 93.436 | 0.787× | 42.036 / 39.721 |
+
+| Scenario | Base wall range ms | Head wall range ms |
+|---|---:|---:|
+| chunk | 225.260–228.943 | 222.927–231.164 |
+| tree-diff | 20558.195–21001.158 | 20818.066–21231.769 |
+| refs | 112.790–118.339 | 111.516–120.946 |
+| cold-seal | 1772.760–6743.858 | 1542.737–6374.228 |
+| delta-seal | 104.381–852.022 | 62.006–278.221 |
+| unchanged-seal | 384.505–1089.723 | 266.579–744.997 |
+| fork | 3177.775–15344.312 | 3401.509–13341.313 |
+| universes | 14283.330–57735.127 | 16623.265–50566.322 |
+| radar | 400.540–875.516 | 348.351–1076.744 |
+| gc | 61.552–97.246 | 65.694–93.436 |
+
+The +10% comparison is not established: `universes` 1.286×, `radar` 1.201×. Contention is recorded per sample; it is not used to discard observations or declare this gate green.
+
+### New engine scenarios
+
+`capture-delta` times one written capture; `capture-plan-delta` includes planning and capture. Both move explicit durability outside the timer. `second-timeline` includes attaching the second timeline and its first unchanged capture. Fixture aging prevents racy-stat rehashes.
+
+| Scenario | N | p50 / p95 wall ms | p50 CPU ms | Wall range ms |
+|---|---:|---:|---:|---:|
+| capture-delta | 5 | 6.419 / 6.558 | 3.676 | 6.064–6.558 |
+| capture-plan-delta | 5 | 7.361 / 59.381 | 4.490 | 7.323–59.381 |
+| second-timeline | 5 | 1107.882 / 1418.582 | 132.078 | 887.315–1418.582 |
+
+### Retained store resources
+
+Five already-warm requests per binary were traced separately on a 50-file fixture. Flush-thread pack opens are counted separately from capture reader/append opens; explicit or periodic durability still needs storage handles. Timing includes strace overhead.
+
+| Version | Requests | Total ms | Catalog opens | Path-index opens | Pack read / append opens | Flush pack opens | fsync calls |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| A | 5 | 283.385 | 0 | 10 | 10 / 20 | 0 | 10 |
+| B | 5 | 87.810 | 0 | 0 | 0 / 0 | 0 | 0 |
+
+### Original five pairs for extended scenarios
+
+Every original and extension observation remains in the pooled table above. There is one fixed extension, with no further sampling based on its outcome.
+
+| Scenario | Initial base p50 ms | Initial head p50 ms | Initial head/base |
+|---|---:|---:|---:|
+| cold-seal | 3257.310 | 3676.479 | 1.129× |
+| universes | 18495.929 | 22544.204 | 1.219× |
+| radar | 575.855 | 726.226 | 1.261× |
+
+The lane also retains `trace_sessions.py` and its raw syscall traces for the before/after store-open proof, crash-injection and torn-record test logs, native Windows summaries, and compatibility runs using the actual v0.1.0 and earlier v0.2.0 writers. See the lane NOTES for exact commands and gate outcomes.

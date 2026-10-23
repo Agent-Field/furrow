@@ -106,13 +106,13 @@ impl Server {
             self.wait_for_client();
             self.accept_pending();
         }
-        self.router.close();
+        let flushed = self.router.close_durable();
         #[cfg(windows)]
         drop(self.listener);
         let _ = fs::remove_file(&self.config.socket);
         #[cfg(windows)]
         crate::signals::finished();
-        Ok(())
+        flushed
     }
 
     fn should_exit(&self) -> bool {

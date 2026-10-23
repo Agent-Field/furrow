@@ -15,7 +15,6 @@ use crate::model::{
     Snapshot, SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
 };
 use crate::name_fold::NameFolding;
-#[cfg(unix)]
 use crate::overlay::WithOverlay;
 use crate::overlay::{self, Overlay};
 use crate::path_index::{PathIndex, CHILD_BATCH};
@@ -62,6 +61,8 @@ pub struct FurrowRepository {
     family_id: String,
     store: ObjectStore,
     overlay: Option<Overlay>,
+    path_index: std::cell::RefCell<Option<PathIndex>>,
+    capture_scope: std::cell::RefCell<Option<capture_plan::PreparedPlan>>,
 }
 
 /// What a seal is told beyond its label and trigger.
@@ -449,16 +450,57 @@ impl FurrowRepository {
         existing_trigger: SnapshotTrigger,
         options: SealOptions,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        let mut repository = Self::attach_timeline_in(data_dir, root, timeline, options.overlay)?;
+        let id = repository.seal(label, existing_trigger, options.changed.as_deref())?;
+        Ok((repository, id))
+    }
+
+    /// Attaches without reading workspace contents, so a caller can screen a plan first.
+    pub fn attach_timeline_in(
+        data_dir: &Path,
+        root: &Path,
+        timeline: Option<&str>,
+        overlay: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
-        let home = IdentityHome::of(options.overlay.is_some() || timeline.is_some());
         let store_root = data_dir.join(STORE_DIR);
         anyhow::ensure!(
             !root.starts_with(&store_root),
             "workspace cannot contain the furrow store"
         );
-        let mut store = ObjectStore::open(store_root)?;
+        let store = ObjectStore::open(store_root)?;
+        Self::attach_using_store(root, timeline, overlay, store)
+    }
+
+    /// Attaches another timeline using this thread's already-open store and pack handles.
+    pub fn attach_timeline_shared(
+        &self,
+        root: &Path,
+        timeline: Option<&str>,
+        overlay: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        Self::attach_using_store(root.canonicalize()?, timeline, overlay, self.store.clone())
+    }
+
+    /// Attaches a timeline to a store session already held by its daemon writer.
+    pub fn attach_timeline_store(
+        store: ObjectStore,
+        root: &Path,
+        timeline: Option<&str>,
+        overlay: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        Self::attach_using_store(root.canonicalize()?, timeline, overlay, store)
+    }
+
+    fn attach_using_store(
+        root: PathBuf,
+        timeline: Option<&str>,
+        overlay: Option<PathBuf>,
+        mut store: ObjectStore,
+    ) -> anyhow::Result<Self> {
+        let home = IdentityHome::of(overlay.is_some() || timeline.is_some());
         let workspace_id = match timeline {
             Some(id) => timeline_workspace_id(id)?,
             None => home.attach_id(&root, &store)?,
@@ -467,16 +509,20 @@ impl FurrowRepository {
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         let family_id = ensure_family_id(home, &root, &store, &workspace_id)?;
         coord::reconcile(&root, &store, &family_id)?;
-        let mut repository = Self {
+        let repository = Self {
             root,
             workspace_id,
             family_id,
             store,
-            overlay: options.overlay.map(Overlay::new),
+            overlay: overlay
+                .map(std::path::absolute)
+                .transpose()?
+                .map(Overlay::new),
+            path_index: Default::default(),
+            capture_scope: Default::default(),
         };
         repository.recover_interrupted_rewind()?;
-        let id = repository.seal(label, existing_trigger, options.changed.as_deref())?;
-        Ok((repository, id))
+        Ok(repository)
     }
 
     /// Seals the attached workspace: the first seal of a workspace is its
@@ -523,11 +569,25 @@ impl FurrowRepository {
         overlay: Option<PathBuf>,
         timeline: Option<&str>,
     ) -> anyhow::Result<Self> {
+        Self::open_timeline_store(
+            ObjectStore::open(data_dir.join(STORE_DIR))?,
+            root,
+            overlay,
+            timeline,
+        )
+    }
+
+    /// Opens an attached timeline without reopening the shared catalog or pack session.
+    pub fn open_timeline_store(
+        mut store: ObjectStore,
+        root: &Path,
+        overlay: Option<PathBuf>,
+        timeline: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
         let home = IdentityHome::of(overlay.is_some() || timeline.is_some());
-        let mut store = ObjectStore::open(data_dir.join(STORE_DIR))?;
         let workspace_id = match timeline {
             Some(id) => {
                 let id = timeline_workspace_id(id)?;
@@ -548,10 +608,39 @@ impl FurrowRepository {
             workspace_id,
             family_id,
             store,
-            overlay: overlay.map(Overlay::new),
+            overlay: overlay
+                .map(std::path::absolute)
+                .transpose()?
+                .map(Overlay::new),
+            path_index: Default::default(),
+            capture_scope: Default::default(),
         };
         repository.recover_interrupted_rewind()?;
         Ok(repository)
+    }
+
+    /// Defers device flushes to the daemon's group commit without deferring capture.
+    pub fn defer_durability(&self) -> anyhow::Result<()> {
+        self.store.defer_durability()
+    }
+
+    pub fn resume_durability(&self) {
+        self.store.resume_durability();
+    }
+
+    /// Makes all captures in this data directory durable before returning.
+    pub fn sync(&self) -> anyhow::Result<()> {
+        self.store.sync()?;
+        self.checkpoint_capture_index()
+    }
+
+    /// Bounds the advisory WAL without putting checkpoints on the capture path.
+    pub fn checkpoint_capture_index(&self) -> anyhow::Result<()> {
+        self.store.checkpoint_catalog()?;
+        if let Some(index) = self.path_index.borrow().as_ref() {
+            index.checkpoint()?;
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -1854,6 +1943,8 @@ impl FurrowRepository {
             family_id,
             store,
             overlay: None,
+            path_index: Default::default(),
+            capture_scope: Default::default(),
         })
     }
 
@@ -3262,6 +3353,7 @@ impl FurrowRepository {
             )?;
         }
         if purge {
+            self.path_index.borrow_mut().take();
             self.store.purge_workspace(&self.workspace_id)?;
             if announce {
                 eprintln!("workspace detached; unreachable data will be removed by `furrow gc`");
@@ -3306,7 +3398,7 @@ impl FurrowRepository {
         };
         if paths
             .iter()
-            .any(|path| changed_path_matches(&self.root, path, POLICY_FILE_BYTES))
+            .any(|path| capture_rules_changed(&self.root, path))
         {
             return self.capture_root_retry_with_policy(policy);
         }
@@ -3365,7 +3457,12 @@ impl FurrowRepository {
     ) -> anyhow::Result<ObjectId> {
         let mut index = self.open_path_index()?;
         let generation = self.store_generation()?;
-        if index.root(&generation)?.is_none() {
+        if !self.index_matches_head(&index, &generation, policy)? {
+            anyhow::ensure!(
+                self.capture_scope.borrow().is_none(),
+                "capture plan is stale; re-plan the full capture"
+            );
+            drop(index);
             return self.capture_root_retry_with_policy(policy);
         }
 
@@ -3442,6 +3539,10 @@ impl FurrowRepository {
                 // Making a link changes the directory that holds the new name
                 // and nothing that names the file's other paths, so they are
                 // found by looking at the whole tree once.
+                anyhow::ensure!(
+                    self.capture_scope.borrow().is_none(),
+                    "capture plan needs a full hard-link walk; re-plan"
+                );
                 index.reset()?;
                 return self.capture_directory_impl(&self.root, index, policy);
             }
@@ -3674,7 +3775,25 @@ impl FurrowRepository {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn children(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<Box<dyn Iterator<Item = std::io::Result<OsString>>>> {
+        let names = fs::read_dir(path)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut names = names;
+        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let names = names.into_iter().map(Ok);
+        Ok(match &self.overlay {
+            Some(overlay) if path == self.root && overlay.source().is_dir() => {
+                Box::new(WithOverlay::new(names))
+            }
+            _ => Box::new(names),
+        })
+    }
+
     fn child_path(&self, directory: &Path, name: &OsStr) -> PathBuf {
         match &self.overlay {
             Some(overlay) if directory == self.root && name.as_bytes() == overlay::NAME => {
@@ -3726,6 +3845,7 @@ impl FurrowRepository {
         policy: &CapturePolicy,
         metadata: &fs::Metadata,
     ) -> anyhow::Result<Option<TreeEntry>> {
+        self.check_capture_path(path, metadata)?;
         let file_type = metadata.file_type();
         let (secs, nanos) = metadata_time(metadata);
         let relative = self
@@ -3841,14 +3961,41 @@ impl FurrowRepository {
         Ok(tree_id)
     }
 
-    fn open_path_index(&self) -> anyhow::Result<PathIndex> {
-        PathIndex::open(&self.workspace_data_dir().join("paths.sqlite3"))
+    fn open_path_index(&self) -> anyhow::Result<std::cell::RefMut<'_, PathIndex>> {
+        let mut index = self.path_index.borrow_mut();
+        if index.is_none() {
+            *index = Some(PathIndex::open(
+                &self.workspace_data_dir().join("paths.sqlite3"),
+            )?);
+        }
+        Ok(std::cell::RefMut::map(index, |index| {
+            index.as_mut().expect("opened above")
+        }))
+    }
+
+    fn index_matches_head(
+        &self,
+        index: &PathIndex,
+        generation: &str,
+        policy: &CapturePolicy,
+    ) -> anyhow::Result<bool> {
+        let Some(root) = index.root(generation)? else {
+            return Ok(false);
+        };
+        let Some(head) = self.store.workspace_head(&self.workspace_id)? else {
+            return Ok(false);
+        };
+        let snapshot: Snapshot = self.store.read_struct(&head, ObjectKind::Snapshot)?;
+        Ok(root == snapshot.root_tree
+            && snapshot.excluded_paths == policy.rule_strings()
+            && snapshot.ignored.is_some() == policy.ignored_summary().is_some())
     }
 
     fn store_generation(&self) -> anyhow::Result<String> {
         Ok(format!(
-            "{}:tree-entry-class-v1",
-            fs::read_to_string(self.store.root().join("packs/CURRENT"))?.trim()
+            "{}:tree-entry-class-v1:{}",
+            fs::read_to_string(self.store.root().join("packs/CURRENT"))?.trim(),
+            fs::read_to_string(self.store.root().join("capture-generation")).unwrap_or_default()
         ))
     }
 
@@ -3931,10 +4078,16 @@ impl FurrowRepository {
         for _ in 0..3 {
             let (secs, nanos) = now();
             let read_at_nanos = secs.saturating_mul(1_000_000_000) + i64::from(nanos);
+            if self.capture_scope.borrow().is_some() && self.logical_path(path).is_some() {
+                self.check_capture_path(path, &fs::symlink_metadata(path)?)?;
+            }
             let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
             let before = file
                 .metadata()
                 .with_context(|| format!("stat open file {}", path.display()))?;
+            if self.logical_path(path).is_some() {
+                self.check_capture_path(path, &before)?;
+            }
             let xattrs = self.capture_xattrs(path)?;
             let chunked = self.store_chunks(file)?;
             let after = fs::metadata(path).with_context(|| format!("restat {}", path.display()))?;
@@ -4026,7 +4179,25 @@ impl FurrowRepository {
         let mut backups = Vec::new();
         let temp_dir = self.store.root().join("tmp");
         for path in candidates {
-            match sqlite_adapter::consistent_backup(&path, &temp_dir) {
+            self.check_capture_path(&path, &fs::symlink_metadata(&path)?)?;
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut name = path.as_os_str().to_owned();
+                name.push(suffix);
+                let sidecar = PathBuf::from(name);
+                if let Ok(metadata) = fs::symlink_metadata(&sidecar) {
+                    self.check_capture_path(&sidecar, &metadata)?;
+                }
+            }
+            let staged = if self.capture_scope.borrow().is_some() {
+                Some(self.stage_scoped_database(&path, &temp_dir)?)
+            } else {
+                None
+            };
+            let source = staged
+                .as_ref()
+                .map(|d| d.path().join("db"))
+                .unwrap_or_else(|| path.clone());
+            match sqlite_adapter::consistent_backup(&source, &temp_dir) {
                 Ok(backup) => {
                     let blob = self.capture_file(backup.file.path())?;
                     let relative = self
@@ -5747,3 +5918,16 @@ mod odd_names_tests;
 mod seal_tests;
 #[cfg(all(test, windows))]
 mod windows_tests;
+
+mod capture_plan;
+pub use capture_plan::CapturePlan;
+
+#[cfg(test)]
+mod perf_tests;
+
+fn capture_rules_changed(root: &Path, path: &Path) -> bool {
+    changed_path_matches(root, path, POLICY_FILE_BYTES)
+        || path.file_name().is_some_and(|name| name == ".gitignore")
+        || changed_path_matches(root, path, b".git/index")
+        || changed_path_matches(root, path, b".git/info/exclude")
+}

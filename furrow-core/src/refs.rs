@@ -233,6 +233,17 @@ impl RefLog {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<RefRecord> {
+        self.append_ordered(snapshot_id, sealed_at, label, trigger, true)
+    }
+
+    pub(crate) fn append_ordered(
+        &self,
+        snapshot_id: ObjectId,
+        sealed_at: i64,
+        label: Option<String>,
+        trigger: SnapshotTrigger,
+        durable: bool,
+    ) -> anyhow::Result<RefRecord> {
         let lock = self.lock()?;
         let mut file = self.open_log()?;
         self.ensure_index(&mut file)?;
@@ -271,12 +282,66 @@ impl RefLog {
         file.write_all(&len_bytes)?;
         file.write_all(checksum.as_bytes())?;
         file.write_all(&payload)?;
-        file.sync_data()?;
+        crate::fault::point("seal.ref-written");
+        if durable {
+            file.sync_data()?;
+        }
         let end = file.stream_position()?;
         let frame_hash = hash_frame(&len_bytes, checksum.as_bytes(), &payload);
         self.append_index(IndexRecord::new(start, end, frame_hash, &file.metadata()?))?;
         FileExt::unlock(&lock)?;
         Ok(record)
+    }
+
+    pub(crate) fn complete_len(&self) -> anyhow::Result<u64> {
+        let _lock = self.lock()?;
+        Ok(self.open_log()?.metadata()?.len())
+    }
+
+    /// The caller already sampled a complete prefix; flushing it must not hold up the next append.
+    pub(crate) fn sync(&self) -> anyhow::Result<()> {
+        self.open_log()?.sync_data()?;
+        Ok(())
+    }
+
+    /// Only the suffix after the durable boundary may be discarded after power loss.
+    pub(crate) fn repair_suffix(
+        &self,
+        durable_len: u64,
+        mut present: impl FnMut(&ObjectId) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<bool> {
+        let _lock = self.lock()?;
+        let mut file = self.open_log()?;
+        let len = file.metadata()?.len();
+        anyhow::ensure!(len >= durable_len, "durable reference prefix was lost");
+        let mut offset = 0;
+        let mut previous = [0; 32];
+        let mut sequence = 1;
+        let mut records = Vec::new();
+        while offset < len {
+            let frame = read_frame_at(&mut file, offset);
+            let valid = match &frame {
+                Ok(Some(frame)) => {
+                    frame.record.sequence == sequence
+                        && frame.record.previous_frame == previous
+                        && (offset < durable_len || present(&frame.record.snapshot_id)?)
+                }
+                _ => false,
+            };
+            if !valid {
+                anyhow::ensure!(offset >= durable_len, "durable reference prefix is corrupt");
+                file.set_len(offset)?;
+                file.sync_data()?;
+                self.rewrite_index(&file, &records)?;
+                return Ok(true);
+            }
+            let frame = frame?.context("reference frame missing")?;
+            offset = frame.end;
+            previous = frame.frame_hash;
+            sequence += 1;
+            records.push(frame);
+        }
+        Ok(false)
     }
 
     fn lock(&self) -> anyhow::Result<File> {
@@ -409,9 +474,7 @@ impl RefLog {
                 &IndexRecord::new(record.start, record.end, record.frame_hash, &metadata),
             )?;
         }
-        index.sync_all()?;
         crate::platform::rename(temporary, &self.index_path)?;
-        crate::platform::sync_path(self.index_path.parent().context("index has no parent")?)?;
         Ok(())
     }
 
