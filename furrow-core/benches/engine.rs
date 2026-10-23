@@ -192,6 +192,7 @@ fn run_scenario(name: &str, profile: Profile) -> anyhow::Result<Sample> {
         "refs" => benchmark_refs(profile),
         "cold-seal" => benchmark_cold_seal(profile),
         "delta-seal" => benchmark_delta_seal(profile),
+        "unchanged-seal" => benchmark_unchanged_seal(profile),
         "fork" => benchmark_fork(profile),
         "universes" => benchmark_universes(profile),
         "radar" => benchmark_radar(profile),
@@ -331,6 +332,29 @@ fn benchmark_delta_seal(profile: Profile) -> anyhow::Result<Sample> {
         before,
         changed.len() as u64,
         changed.len() as u64 * Workspace::FILE_BYTES as u64,
+        None,
+    )
+}
+
+// S9 measures a full unchanged capture, so ignored-content savings cannot hide stat-walk regressions.
+fn benchmark_unchanged_seal(profile: Profile) -> anyhow::Result<Sample> {
+    let workspace = Workspace::new(profile, false)?;
+    // The unchanged case starts outside the two-second racy-stat safety window.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let (mut repository, _) = FurrowRepository::attach_and_snapshot(
+        &workspace.repo,
+        Some("benchmark baseline".to_owned()),
+        SnapshotTrigger::Manual,
+    )?;
+    let before = usage()?;
+    let started = Instant::now();
+    repository.snapshot(Some("unchanged".to_owned()), SnapshotTrigger::Manual)?;
+    sample(
+        "unchanged-seal",
+        started,
+        before,
+        profile.files as u64,
+        0,
         None,
     )
 }
@@ -504,6 +528,7 @@ fn benchmark_gc(profile: Profile) -> anyhow::Result<Sample> {
             claims: Vec::new(),
             excluded_paths: Vec::new(),
             hardlinks: Vec::new(),
+            ignored: None,
         };
         let id = store.put_struct(ObjectKind::Snapshot, &snapshot)?;
         store.publish_snapshot("history", id, sealed_at, None, SnapshotTrigger::Watcher)?;

@@ -150,6 +150,8 @@ pub struct Snapshot {
     /// snapshot sealed before links were recorded, so those keep their IDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hardlinks: Vec<LinkGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored: Option<crate::policy::IgnoredSummary>,
 }
 
 /// Paths that were hard links of one another when the snapshot was sealed,

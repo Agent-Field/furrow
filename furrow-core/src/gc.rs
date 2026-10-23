@@ -554,6 +554,7 @@ mod tests {
             claims: Vec::new(),
             excluded_paths: Vec::new(),
             hardlinks: Vec::new(),
+            ignored: None,
         }
     }
 

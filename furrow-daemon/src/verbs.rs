@@ -73,7 +73,10 @@ impl Verb for Seal {
         let a: SealArgs = args(value)?;
         let label = hook_label("turn-end", &a.agent, a.turn.as_deref(), None);
         let id = handle.seal(label.clone(), a.changed)?;
-        Ok(json!({"event": "turn-end", "label": label, "snapshot": id_hex(&id)}))
+        let mut answer = handle.repo()?.snapshot_json(&id)?;
+        answer["event"] = json!("turn-end");
+        answer["label"] = json!(label);
+        Ok(answer)
     }
 }
 
@@ -94,7 +97,7 @@ impl Verb for Snap {
         let a: SnapArgs = args(value)?;
         let manual = furrow::model::SnapshotTrigger::Manual;
         let id = handle.repo()?.snapshot(a.message, manual)?;
-        Ok(json!({"snapshot": id_hex(&id)}))
+        handle.repo()?.snapshot_json(&id)
     }
 }
 
@@ -308,11 +311,12 @@ impl Verb for Materialize {
         let a: MaterializeArgs = args(value)?;
         handle.release();
         let target = handle.target();
-        ops::restore_head(
+        ops::restore_timeline_head(
             &target.data_dir,
             &target.tree,
             target.cell_dir.clone(),
             &a.head,
+            target.timeline.as_deref(),
         )
     }
 }

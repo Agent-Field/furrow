@@ -120,13 +120,20 @@ impl ObjectStore {
         fs::create_dir_all(root.join("packs"))?;
         fs::create_dir_all(root.join("locks"))?;
         fs::create_dir_all(root.join("workspaces"))?;
+        let startup = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("locks").join("startup.lock"))?;
+        wait_lock(&startup, true)?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(root.join("locks").join("maintenance.lock"))?;
-        FileExt::lock_shared(&lock)?;
+        wait_lock(&lock, false)?;
         let active_pack = read_or_initialize_current(&root)?;
         let catalog = Catalog::open(&root.join("catalog.sqlite3"))?;
         let maintenance = Rc::new(MaintenanceState {
@@ -154,7 +161,8 @@ impl ObjectStore {
 
     pub fn put_bytes(&self, kind: ObjectKind, bytes: &[u8]) -> anyhow::Result<ObjectId> {
         let _maintenance = self.acquire_maintenance_shared()?;
-        self.put_bytes_locked(kind, bytes)
+        // Every writer takes the catalog before the pack, including restore previews.
+        self.catalog.batch(|| self.put_bytes_locked(kind, bytes))
     }
 
     fn put_bytes_locked(&self, kind: ObjectKind, bytes: &[u8]) -> anyhow::Result<ObjectId> {
@@ -174,7 +182,7 @@ impl ObjectStore {
             .read(true)
             .write(true)
             .open(lock_path)?;
-        lock.lock_exclusive()?;
+        wait_lock(&lock, true)?;
 
         if self.catalog.object(&id)?.is_none() {
             let active_pack = self.active_pack.borrow().clone();
@@ -242,9 +250,9 @@ impl ObjectStore {
             .write(true)
             .open(&self.maintenance.path)?;
         if exclusive {
-            file.lock_exclusive()?;
+            wait_lock(&file, true)?;
         } else {
-            FileExt::lock_shared(&file)?;
+            wait_lock(&file, false)?;
         }
         *self.active_pack.borrow_mut() = read_or_initialize_current(&self.root)?;
         self.maintenance.depth.set(1);
@@ -327,7 +335,13 @@ impl ObjectStore {
         if !workspace_dir.join("root.path").exists() {
             write_root_path(&workspace_dir, root)?;
         }
-        self.catalog.ensure_workspace(id, root)?;
+        // Named timelines share a physical root but have separate catalog bindings.
+        let catalog_root = if id.starts_with("t-") {
+            [b"timeline:".as_slice(), id.as_bytes()].concat()
+        } else {
+            root.to_vec()
+        };
+        self.catalog.ensure_workspace(id, &catalog_root)?;
         let detached = workspace_dir.join("detached");
         if detached.exists() {
             fs::remove_file(detached)?;
@@ -359,10 +373,28 @@ impl ObjectStore {
         Ok(id)
     }
 
+    /// Moves only the named timeline, leaving siblings attached to their folders.
+    pub fn rebind_timeline(
+        &mut self,
+        timeline: &str,
+        from: &[u8],
+        to: &[u8],
+    ) -> anyhow::Result<String> {
+        let id = crate::repository::timeline_workspace_id(timeline)?;
+        let directory = self.workspace_data_dir(&id);
+        anyhow::ensure!(
+            fs::read(directory.join("root.path"))? == from,
+            "timeline is not attached at the folder that moved"
+        );
+        write_root_path(&directory, to)?;
+        Ok(id)
+    }
+
     pub fn find_workspace(&self, root: &[u8]) -> anyhow::Result<Option<String>> {
         for entry in fs::read_dir(self.root.join("workspaces"))? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with("t-")
+            {
                 continue;
             }
             if entry.path().join("detached").exists() {
@@ -753,7 +785,7 @@ impl ObjectStore {
             .read(true)
             .write(true)
             .open(self.root.join("locks").join("pack.lock"))?;
-        lock.lock_exclusive()?;
+        wait_lock(&lock, true)?;
         let mut pack = OpenOptions::new().read(true).write(true).open(&pack_path)?;
         let file_len = pack.metadata()?.len();
         let checkpoint = self.catalog.pack_checkpoint(&pack_name)?;
@@ -933,6 +965,30 @@ impl ObjectStore {
             record_start.saturating_add(HEADER_LEN),
         )?;
         Ok(())
+    }
+}
+
+/// Store writers wait a bounded interval so a stalled process cannot hang a caller forever.
+pub(crate) fn wait_lock(file: &File, exclusive: bool) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        let result = if exclusive {
+            file.try_lock_exclusive()
+        } else {
+            FileExt::try_lock_shared(file)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::ensure!(
+                    started.elapsed() < crate::catalog::WRITER_WAIT,
+                    "store writer is still busy after waiting {} seconds; retry the operation",
+                    crate::catalog::WRITER_WAIT.as_secs()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 

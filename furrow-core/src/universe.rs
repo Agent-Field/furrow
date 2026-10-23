@@ -235,7 +235,7 @@ impl UniverseCommand<'_> {
             .command
             .split_first()
             .context("universe requires a command")?;
-        let child = match self.driver {
+        let mut child = match self.driver {
             ExecutionDriver::LinuxMountNamespace => {
                 let mut child = Command::new(self.executable);
                 child
@@ -254,6 +254,8 @@ impl UniverseCommand<'_> {
                 child
             }
         };
+        // An isolated workspace carries its own identity, independent of its source chat.
+        child.env_remove("FURROW_TIMELINE");
         Ok(child)
     }
 }

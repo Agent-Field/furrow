@@ -5,13 +5,11 @@
 use super::export::{published, ExportJob};
 use super::fetch::{want, Import};
 use super::ledger::Ledger;
-use super::materialize::materialize_holding;
 use super::open_store;
 use crate::model::{id_hex, parse_id};
 use crate::sealer::{CellSealer, Keys};
 use anyhow::Context;
 use serde_json::{json, Value};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 pub fn export(
@@ -108,7 +106,23 @@ pub fn restore_head(
     cell_dir: Option<PathBuf>,
     head: &str,
 ) -> anyhow::Result<Value> {
-    let (head, held) = materialize_holding(data_dir, tree, cell_dir, parse_id(head)?)?;
+    restore_timeline_head(data_dir, tree, cell_dir, head, None)
+}
+
+pub fn restore_timeline_head(
+    data_dir: &Path,
+    tree: &Path,
+    cell_dir: Option<PathBuf>,
+    head: &str,
+    timeline: Option<&str>,
+) -> anyhow::Result<Value> {
+    let (head, held) = crate::exchange::materialize::materialize_timeline_holding(
+        data_dir,
+        tree,
+        cell_dir,
+        parse_id(head)?,
+        timeline,
+    )?;
     let mut answer = json!({"snapshot": id_hex(&head)});
     if !held.is_empty() {
         answer["held"] = serde_json::to_value(&held)?;
@@ -120,11 +134,29 @@ pub fn restore_head(
 /// folder was moved into place after it was restored, and the engine must
 /// still know it by its new path.
 pub fn rebind(data_dir: &Path, from: &Path, to: &Path) -> anyhow::Result<Value> {
+    rebind_timeline(data_dir, from, to, None)
+}
+
+pub fn rebind_timeline(
+    data_dir: &Path,
+    from: &Path,
+    to: &Path,
+    timeline: Option<&str>,
+) -> anyhow::Result<Value> {
     let mut store = open_store(data_dir)?;
-    let id = store.rebind_workspace(
-        moved_path(from)?.as_os_str().as_bytes(),
-        moved_path(to)?.as_os_str().as_bytes(),
-    )?;
+    let from = moved_path(from)?;
+    let to = moved_path(to)?;
+    let id = match timeline {
+        Some(timeline) => store.rebind_timeline(
+            timeline,
+            from.as_os_str().as_encoded_bytes(),
+            to.as_os_str().as_encoded_bytes(),
+        )?,
+        None => store.rebind_workspace(
+            from.as_os_str().as_encoded_bytes(),
+            to.as_os_str().as_encoded_bytes(),
+        )?,
+    };
     Ok(json!({"workspace": id}))
 }
 

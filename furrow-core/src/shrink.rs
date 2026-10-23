@@ -35,14 +35,15 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
     let root = root
         .canonicalize()
         .with_context(|| format!("open {}", root.display()))?;
-    let policy = CapturePolicy::load(&root)?;
+    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root)?;
     let mut candidates = Vec::new();
 
     for include in includes {
         let relative = validate_relative(include)?;
         refuse_internal_path(&relative)?;
         anyhow::ensure!(
-            !policy.excludes_bytes(relative.as_os_str().as_bytes()),
+            !policy.excludes_bytes(relative.as_os_str().as_bytes())
+                && !policy.contains_ignored(relative.as_os_str().as_bytes()),
             "cannot shrink policy-excluded path {}; its undo bytes are not captured",
             include.display()
         );
@@ -73,7 +74,9 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
         if is_internal_root(&relative) {
             continue;
         }
-        if policy.excludes_bytes(relative.as_os_str().as_bytes()) {
+        if policy.excludes_bytes(relative.as_os_str().as_bytes())
+            || policy.contains_ignored(relative.as_os_str().as_bytes())
+        {
             continue;
         }
         if let Some(class) = classify(&entry.path()) {
@@ -120,9 +123,15 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
 
 pub fn apply(root: &Path, plan: &ShrinkPlan) -> anyhow::Result<()> {
     let root = root.canonicalize()?;
+    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root)?;
     for candidate in &plan.candidates {
         let relative = validate_relative(&candidate.relative)?;
         refuse_internal_path(&relative)?;
+        anyhow::ensure!(
+            !policy.excludes_bytes(relative.as_os_str().as_bytes())
+                && !policy.contains_ignored(relative.as_os_str().as_bytes()),
+            "cannot shrink a policy-protected path; its undo bytes are not captured"
+        );
         let path = root.join(relative);
         ensure_safe_ancestors(&root, &path)?;
         let metadata = match fs::symlink_metadata(&path) {

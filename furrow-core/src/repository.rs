@@ -80,6 +80,8 @@ pub struct SnapshotSummary {
     /// imported head does. Absent from the JSON when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub shallow: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored: Option<crate::policy::IgnoredSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -429,17 +431,33 @@ impl FurrowRepository {
         existing_trigger: SnapshotTrigger,
         options: SealOptions,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        Self::attach_and_seal_timeline_in(data_dir, root, None, label, existing_trigger, options)
+    }
+
+    /// Attaches a caller-named independent timeline in the shared object store.
+    pub fn attach_and_seal_timeline_in(
+        data_dir: &Path,
+        root: &Path,
+        timeline: Option<&str>,
+        label: Option<String>,
+        existing_trigger: SnapshotTrigger,
+        options: SealOptions,
+    ) -> anyhow::Result<(Self, ObjectId)> {
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
-        let home = IdentityHome::of(options.overlay.is_some());
+        let home = IdentityHome::of(options.overlay.is_some() || timeline.is_some());
         let store_root = data_dir.join(STORE_DIR);
         anyhow::ensure!(
             !root.starts_with(&store_root),
             "workspace cannot contain the furrow store"
         );
         let mut store = ObjectStore::open(store_root)?;
-        let workspace_id = home.attach_id(&root, &store)?;
+        let workspace_id = match timeline {
+            Some(id) => timeline_workspace_id(id)?,
+            None => home.attach_id(&root, &store)?,
+        };
+        check_timeline_root(&store, &workspace_id, &root)?;
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         let family_id = ensure_family_id(home, &root, &store, &workspace_id)?;
         coord::reconcile(&root, &store, &family_id)?;
@@ -489,12 +507,33 @@ impl FurrowRepository {
         root: &Path,
         overlay: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        Self::open_timeline_in(data_dir, root, overlay, None)
+    }
+
+    /// Opens exactly the named timeline; omission retains the legacy identity rules.
+    pub fn open_timeline_in(
+        data_dir: &Path,
+        root: &Path,
+        overlay: Option<PathBuf>,
+        timeline: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
-        let home = IdentityHome::of(overlay.is_some());
+        let home = IdentityHome::of(overlay.is_some() || timeline.is_some());
         let mut store = ObjectStore::open(data_dir.join(STORE_DIR))?;
-        let workspace_id = home.open_id(&root, &store)?;
+        let workspace_id = match timeline {
+            Some(id) => {
+                let id = timeline_workspace_id(id)?;
+                anyhow::ensure!(
+                    store.workspace_data_dir(&id).join("root.path").exists(),
+                    "timeline is not attached; seal it first"
+                );
+                id
+            }
+            None => home.open_id(&root, &store)?,
+        };
+        check_timeline_root(&store, &workspace_id, &root)?;
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         let family_id = ensure_family_id(home, &root, &store, &workspace_id)?;
         coord::reconcile(&root, &store, &family_id)?;
@@ -611,6 +650,7 @@ impl FurrowRepository {
                 claims,
                 excluded_paths: policy.rule_strings(),
                 hardlinks,
+                ignored: policy.omitted.clone(),
             };
             let id = self.store.put_struct(ObjectKind::Snapshot, &snapshot)?;
             Ok((id, secs))
@@ -634,9 +674,27 @@ impl FurrowRepository {
                     materialization: self.materialization(&row.id)?,
                     pinned: pinned.contains(&row.id),
                     shallow: self.is_shallow(&row.id)?,
+                    ignored: self.snapshot_ignored(&row.id)?,
                 })
             })
             .collect()
+    }
+
+    /// Returns the capture omission report without changing snapshot identity.
+    pub fn snapshot_ignored(
+        &self,
+        id: &ObjectId,
+    ) -> anyhow::Result<Option<crate::policy::IgnoredSummary>> {
+        let snapshot: Snapshot = self.store.read_struct(id, ObjectKind::Snapshot)?;
+        Ok(snapshot.ignored)
+    }
+
+    pub fn snapshot_json(&self, id: &ObjectId) -> anyhow::Result<serde_json::Value> {
+        let mut value = serde_json::json!({"snapshot": id_hex(id)});
+        if let Some(report) = self.snapshot_ignored(id)? {
+            value["ignored"] = serde_json::to_value(report)?;
+        }
+        Ok(value)
     }
 
     /// True when the snapshot's parent is not in this store.
@@ -919,7 +977,11 @@ impl FurrowRepository {
             .find(|fork| fork.name == name)
             .with_context(|| format!("fork `{name}` was not found"))?;
         anyhow::ensure!(fork.destination.exists(), "fork directory no longer exists");
-        let repository = FurrowRepository::open(&fork.destination)?;
+        let repository = FurrowRepository::open_composed_in(
+            self.store.root().parent().context("store has no parent")?,
+            &fork.destination,
+            None,
+        )?;
         let timeline = repository.timeline(limit.saturating_add(1))?;
         let head = timeline.first().map(|snapshot| snapshot.id.clone());
         let (cursor_found, mut snapshots) = match after {
@@ -1141,6 +1203,7 @@ impl FurrowRepository {
             change.raw_path != b".furrow"
                 && !is_identity_path(&change.raw_path)
                 && !protected.excludes_bytes(&change.raw_path)
+                && !protected.contains_ignored(&change.raw_path)
         });
         let plan = RewindPlan {
             preview_digest: rewind_preview_digest(
@@ -1211,6 +1274,7 @@ impl FurrowRepository {
                 change.raw_path != b".furrow"
                     && !is_identity_path(&change.raw_path)
                     && !protected.excludes_bytes(&change.raw_path)
+                    && !protected.contains_ignored(&change.raw_path)
             });
             let rollback_plan = RewindPlan {
                 preview_digest: String::new(),
@@ -1475,12 +1539,22 @@ impl FurrowRepository {
         }
         let (fork_repository, fork_head) = if report.atomic_hierarchy {
             self.verify_atomic_fork(&base, &destination, &report)?;
-            let fork_repository = FurrowRepository::attach_existing_snapshot(&destination, base)?;
+            let fork_repository = FurrowRepository::attach_existing_snapshot(
+                self.store.root().parent().context("store has no parent")?,
+                &destination,
+                base,
+            )?;
             self.open_path_index()?
                 .backup_to(&fork_repository.workspace_data_dir().join("paths.sqlite3"))?;
             (fork_repository, base)
         } else {
-            let (fork_repository, fork_head) = FurrowRepository::watch(&destination)?;
+            let (fork_repository, fork_head) = FurrowRepository::attach_and_seal_in(
+                self.store.root().parent().context("store has no parent")?,
+                &destination,
+                Some("initial protection".to_owned()),
+                SnapshotTrigger::Manual,
+                SealOptions::default(),
+            )?;
             if !self.snapshots_match_fork(&base, &fork_repository, &fork_head)? {
                 bail!(
                     "source changed while the fork was being created; the isolated copy remains at {} for inspection",
@@ -1635,7 +1709,13 @@ impl FurrowRepository {
             atomic_hierarchy: false,
         };
 
-        let (fork_repository, fork_head) = FurrowRepository::watch(&destination)?;
+        let (fork_repository, fork_head) = FurrowRepository::attach_and_seal_in(
+            self.store.root().parent().context("store has no parent")?,
+            &destination,
+            Some("initial protection".to_owned()),
+            SnapshotTrigger::Manual,
+            SealOptions::default(),
+        )?;
         if !self.snapshots_match_fork(&base, &fork_repository, &fork_head)? {
             bail!(
                 "source changed while the fork was being created; the isolated copy remains at {} for inspection",
@@ -1708,7 +1788,11 @@ impl FurrowRepository {
         Ok(())
     }
 
-    fn attach_existing_snapshot(root: &Path, snapshot_id: ObjectId) -> anyhow::Result<Self> {
+    fn attach_existing_snapshot(
+        data_dir: &Path,
+        root: &Path,
+        snapshot_id: ObjectId,
+    ) -> anyhow::Result<Self> {
         let root = root.canonicalize()?;
         fs::create_dir_all(root.join(".furrow"))?;
         let workspace_id = new_workspace_id(&root);
@@ -1716,7 +1800,7 @@ impl FurrowRepository {
             &root.join(WORKSPACE_FILE),
             format!("{workspace_id}\n").as_bytes(),
         )?;
-        let mut store = ObjectStore::open(data_root()?.join(STORE_DIR))?;
+        let mut store = ObjectStore::open(data_dir.join(STORE_DIR))?;
         let snapshot: Snapshot = store.read_struct(&snapshot_id, ObjectKind::Snapshot)?;
         store.ensure_workspace(&workspace_id, root.as_os_str().as_bytes())?;
         let family_id = ensure_family_id(IdentityHome::Workspace, &root, &store, &workspace_id)?;
@@ -1899,7 +1983,11 @@ impl FurrowRepository {
             if !fork.destination.exists() {
                 continue;
             }
-            let fork_repository = match FurrowRepository::open(&fork.destination) {
+            let fork_repository = match FurrowRepository::open_composed_in(
+                self.store.root().parent().context("store has no parent")?,
+                &fork.destination,
+                None,
+            ) {
                 Ok(repository) => repository,
                 Err(_) => {
                     fork.radar_stale = true;
@@ -1956,7 +2044,11 @@ impl FurrowRepository {
                 "fork directory no longer exists: {}",
                 fork.destination.display()
             );
-            let mut fork_repository = FurrowRepository::open(&fork.destination)?;
+            let mut fork_repository = FurrowRepository::open_composed_in(
+                self.store.root().parent().context("store has no parent")?,
+                &fork.destination,
+                None,
+            )?;
             let head = fork_repository.snapshot(
                 Some(format!("inspection boundary for {}", fork.name)),
                 SnapshotTrigger::Inspection,
@@ -2090,8 +2182,12 @@ impl FurrowRepository {
                     && !self.root.starts_with(&destination),
                 "refusing to remove an unsafe fork destination"
             );
-            let fork_repository = FurrowRepository::open(&destination)
-                .context("fork identity is missing or no longer matches its recorded directory")?;
+            let fork_repository = FurrowRepository::open_composed_in(
+                self.store.root().parent().context("store has no parent")?,
+                &destination,
+                None,
+            )
+            .context("fork identity is missing or no longer matches its recorded directory")?;
             fork_repository.forget(true)?;
             fs::remove_dir_all(&destination)?;
             if let Some(parent) = destination.parent() {
@@ -2125,7 +2221,11 @@ impl FurrowRepository {
             .with_context(|| format!("fork `{fork_name}` was not found"))?;
         anyhow::ensure!(fork.destination.exists(), "fork directory no longer exists");
 
-        let mut fork_repository = FurrowRepository::open(&fork.destination)?;
+        let mut fork_repository = FurrowRepository::open_composed_in(
+            self.store.root().parent().context("store has no parent")?,
+            &fork.destination,
+            None,
+        )?;
         let (ours, theirs) = if dry_run {
             (
                 self.store
@@ -2402,6 +2502,7 @@ impl FurrowRepository {
         let verification = std::process::Command::new("/bin/sh")
             .args(["-c", check])
             .current_dir(&scratch)
+            .env_remove("FURROW_TIMELINE")
             .output()
             .with_context(|| format!("run merge check `{check}`"))?;
         let check_output = command_output(&verification.stdout, &verification.stderr);
@@ -2565,6 +2666,7 @@ impl FurrowRepository {
         let status = std::process::Command::new(program)
             .args(arguments)
             .current_dir(&probe)
+            .env_remove("FURROW_TIMELINE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2605,7 +2707,9 @@ impl FurrowRepository {
         let target_policy = CapturePolicy::from_rules(&target_snapshot.excluded_paths)?;
         let protected = current_policy.union(&target_policy);
         changes.retain(|change| {
-            change.raw_path != b".furrow" && !protected.excludes_bytes(&change.raw_path)
+            change.raw_path != b".furrow"
+                && !protected.excludes_bytes(&change.raw_path)
+                && !protected.contains_ignored(&change.raw_path)
         });
         let target_id = id_hex(target);
         let current_tree = id_hex(&current.root_tree);
@@ -2807,6 +2911,7 @@ impl FurrowRepository {
             change.raw_path != b".furrow"
                 && !is_identity_path(&change.raw_path)
                 && !protected.excludes_bytes(&change.raw_path)
+                && !protected.contains_ignored(&change.raw_path)
                 && !self.in_overlay(&change.raw_path)
         });
         let held = self.colliding_paths(&target_snapshot.root_tree, &changes)?;
@@ -2887,6 +2992,7 @@ impl FurrowRepository {
     ) -> anyhow::Result<(ObjectId, RewindPlan)> {
         let lock = self.acquire_mutation_lock()?;
         let plan = self.plan_rewind(target, paths)?;
+        let restore_policy = self.load_policy()?;
         let pre = self.snapshot(
             Some(format!("before rewind to {}", &id_hex(target)[..12])),
             SnapshotTrigger::PreRewind,
@@ -2916,7 +3022,11 @@ impl FurrowRepository {
                 test_pause("FURROW_TEST_REWIND_PAUSE_AFTER_APPLY_MS");
                 self.verify_plan_state(&self.root, &target_entries, &plan, paths)?;
                 if sqlite_consistent {
-                    self.restore_sqlite_backups(&target_snapshot.sqlite_backups, paths)?;
+                    self.restore_sqlite_backups(
+                        &target_snapshot.sqlite_backups,
+                        paths,
+                        &restore_policy,
+                    )?;
                 }
                 Ok(())
             });
@@ -2963,10 +3073,11 @@ impl FurrowRepository {
     /// person's tree.
     fn load_policy(&self) -> anyhow::Result<CapturePolicy> {
         let own = CapturePolicy::load(&self.root)?;
-        match &self.overlay {
-            Some(overlay) => Ok(own.union(&CapturePolicy::load(overlay.source())?)),
-            None => Ok(own),
-        }
+        let policy = match &self.overlay {
+            Some(overlay) => own.union(&CapturePolicy::load(overlay.source())?),
+            None => own,
+        };
+        policy.resolve_gitignore(&self.root)
     }
 
     fn in_overlay(&self, raw_path: &[u8]) -> bool {
@@ -3039,7 +3150,7 @@ impl FurrowRepository {
         let _maintenance = self.store.acquire_maintenance_exclusive()?;
         self.store.detach_workspace(&self.workspace_id)?;
         let workspace_file = self.root.join(WORKSPACE_FILE);
-        if workspace_file.exists() {
+        if !self.workspace_id.starts_with("t-") && workspace_file.exists() {
             fs::remove_file(&workspace_file)?;
             File::open(
                 workspace_file
@@ -3094,6 +3205,10 @@ impl FurrowRepository {
         changed_paths: Option<&[PathBuf]>,
         policy: &CapturePolicy,
     ) -> anyhow::Result<ObjectId> {
+        // Ignore rules and the tracked index may change outside a caller's delta list.
+        if policy.uses_gitignore() {
+            return self.capture_root_retry_with_policy(policy);
+        }
         let Some(paths) = changed_paths else {
             return self.capture_root_retry_with_policy(policy);
         };
@@ -3705,9 +3820,13 @@ impl FurrowRepository {
         &self,
         backups: &[SqliteBackup],
         selected_paths: &[PathBuf],
+        protected: &CapturePolicy,
     ) -> anyhow::Result<()> {
         for backup in backups {
-            if !selected(&backup.path, selected_paths) {
+            if !selected(&backup.path, selected_paths)
+                || protected.excludes_bytes(&backup.path)
+                || protected.contains_ignored(&backup.path)
+            {
                 continue;
             }
             anyhow::ensure!(
@@ -3737,7 +3856,7 @@ impl FurrowRepository {
                 let mut sidecar = path_bytes.to_vec();
                 sidecar.extend_from_slice(suffix);
                 let sidecar = PathBuf::from(OsString::from_vec(sidecar));
-                if sidecar.exists() {
+                if sidecar.exists() && !protected.excludes_path(&self.root, &sidecar) {
                     fs::remove_file(sidecar)?;
                 }
             }
@@ -4079,8 +4198,12 @@ impl FurrowRepository {
         root: &Path,
         snapshot: &Snapshot,
         selected_paths: &[PathBuf],
+        protected: &CapturePolicy,
     ) -> anyhow::Result<()> {
         let unlinked = hardlink::restore(&snapshot.hardlinks, |path| {
+            if protected.excludes_bytes(path) {
+                return Ok(None);
+            }
             self.intact_member(root, snapshot, path, selected_paths)
         })?;
         if !unlinked.is_empty() {
@@ -4133,6 +4256,12 @@ impl FurrowRepository {
         mode: ApplyMode<'_>,
         mut before_file: impl FnMut(&TreeEntry) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        // Resolve protection before writes can replace the policy or Git's ignore files.
+        let protected = if root == self.root {
+            self.load_policy()?
+        } else {
+            CapturePolicy::default()
+        };
         let mut applied_operations = 0_usize;
         let changed: BTreeSet<Vec<u8>> = plan
             .changes
@@ -4241,7 +4370,7 @@ impl FurrowRepository {
         }
 
         if let Some(snapshot) = mode.links {
-            self.restore_links(root, snapshot, selected_paths)?;
+            self.restore_links(root, snapshot, selected_paths, &protected)?;
         }
 
         // Apply directory modes and mtimes after child operations, deepest
@@ -4316,7 +4445,7 @@ impl FurrowRepository {
             .read(true)
             .write(true)
             .open(path)?;
-        file.lock_exclusive()?;
+        crate::store::wait_lock(&file, true)?;
         Ok(file)
     }
 
@@ -4372,6 +4501,28 @@ impl FurrowRepository {
 }
 
 /// Where the object store lives inside a data directory.
+/// A namespaced digest keeps caller ids out of filesystem paths and legacy identities.
+pub fn timeline_workspace_id(timeline: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !timeline.is_empty() && timeline.len() <= 1024 && !timeline.contains('\0'),
+        "timeline id must contain 1..1024 bytes without NUL"
+    );
+    Ok(format!("t-{}", blake3::hash(timeline.as_bytes()).to_hex()))
+}
+
+fn check_timeline_root(store: &ObjectStore, id: &str, root: &Path) -> anyhow::Result<()> {
+    if id.starts_with("t-") {
+        let binding = store.workspace_data_dir(id).join("root.path");
+        if binding.exists() {
+            anyhow::ensure!(
+                fs::read(binding)? == root.as_os_str().as_encoded_bytes(),
+                "timeline is attached to another folder; use rebind after moving it"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn store_path(data_dir: &Path) -> PathBuf {
     data_dir.join(STORE_DIR)
 }
@@ -5099,7 +5250,7 @@ fn path_depth(path: &[u8]) -> usize {
     Path::new(OsStr::from_bytes(path)).components().count()
 }
 
-fn safe_join(root: &Path, relative: &[u8]) -> anyhow::Result<PathBuf> {
+pub(crate) fn safe_join(root: &Path, relative: &[u8]) -> anyhow::Result<PathBuf> {
     let path = PathBuf::from(OsString::from_vec(relative.to_vec()));
     for component in path.components() {
         anyhow::ensure!(

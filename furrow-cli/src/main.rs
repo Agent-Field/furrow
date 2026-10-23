@@ -21,6 +21,9 @@ struct Cli {
     repo: PathBuf,
     #[arg(long, global = true)]
     json: bool,
+    /// Independent timeline in the shared data directory, chosen by the caller.
+    #[arg(long, global = true, env = "FURROW_TIMELINE")]
+    timeline: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -503,6 +506,56 @@ impl SealArgs {
     }
 }
 
+fn selected_timeline() -> Option<String> {
+    std::env::var("FURROW_TIMELINE").ok()
+}
+
+fn open_selected(
+    root: &std::path::Path,
+    overlay: Option<PathBuf>,
+) -> anyhow::Result<FurrowRepository> {
+    FurrowRepository::open_timeline_in(
+        &furrow::repository::data_root()?,
+        root,
+        overlay,
+        selected_timeline().as_deref(),
+    )
+}
+
+fn seal_selected(
+    root: &std::path::Path,
+    label: Option<String>,
+    trigger: SnapshotTrigger,
+    options: SealOptions,
+) -> anyhow::Result<(FurrowRepository, furrow::model::ObjectId)> {
+    FurrowRepository::attach_and_seal_timeline_in(
+        &furrow::repository::data_root()?,
+        root,
+        selected_timeline().as_deref(),
+        label,
+        trigger,
+        options,
+    )
+}
+
+fn snapshot_selected(
+    root: &std::path::Path,
+    label: Option<String>,
+    trigger: SnapshotTrigger,
+) -> anyhow::Result<(FurrowRepository, furrow::model::ObjectId)> {
+    seal_selected(root, label, trigger, SealOptions::default())
+}
+
+fn watch_selected(
+    root: &std::path::Path,
+) -> anyhow::Result<(FurrowRepository, furrow::model::ObjectId)> {
+    snapshot_selected(
+        root,
+        Some("initial protection".to_owned()),
+        SnapshotTrigger::Manual,
+    )
+}
+
 fn read_changed_stdin() -> anyhow::Result<Vec<PathBuf>> {
     use std::os::unix::ffi::OsStrExt;
     let mut input = Vec::new();
@@ -516,6 +569,10 @@ fn read_changed_stdin() -> anyhow::Result<Vec<PathBuf>> {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Some(timeline) = &cli.timeline {
+        furrow::repository::timeline_workspace_id(timeline)?;
+        std::env::set_var("FURROW_TIMELINE", timeline);
+    }
     match cli.command {
         Command::Estimate => {
             let estimate = FurrowRepository::estimate(&cli.repo)?;
@@ -546,16 +603,12 @@ fn main() -> anyhow::Result<()> {
             no_daemon,
             debounce_ms,
         } => {
-            let (repository, id) = FurrowRepository::watch(&cli.repo)?;
+            let (repository, id) = watch_selected(&cli.repo)?;
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "workspace": repository.root(),
-                        "snapshot": id_hex(&id),
-                        "store": repository.store_root(),
-                    })
-                );
+                let mut answer = repository.snapshot_json(&id)?;
+                answer["workspace"] = serde_json::json!(repository.root());
+                answer["store"] = serde_json::json!(repository.store_root());
+                println!("{answer}");
             } else {
                 println!("Protected {}", repository.root().display());
                 println!("Snapshot {}", id_hex(&id));
@@ -571,7 +624,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Daemon { debounce_ms } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             furrow::watcher::run(
                 repository,
                 std::time::Duration::from_millis(debounce_ms.max(10)),
@@ -598,16 +651,16 @@ fn main() -> anyhow::Result<()> {
             furrow::universe::exec_linux_namespace(&source, &target, &command)?;
         }
         Command::Snap { message, cell_dir } => {
-            let mut repository = FurrowRepository::open_composed(&cli.repo, cell_dir)?;
+            let mut repository = open_selected(&cli.repo, cell_dir)?;
             let id = repository.snapshot(message, SnapshotTrigger::Manual)?;
             if cli.json {
-                println!("{}", serde_json::json!({"snapshot": id_hex(&id)}));
+                println!("{}", repository.snapshot_json(&id)?);
             } else {
                 println!("Snapshot {}", id_hex(&id));
             }
         }
         Command::Timeline { limit } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let timeline = repository.timeline(limit)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&timeline)?);
@@ -625,7 +678,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Pin { snapshot } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let id = repository.resolve_snapshot(&snapshot)?;
             let changed = repository.pin(&id)?;
             if cli.json {
@@ -640,7 +693,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Unpin { snapshot } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let id = repository.resolve_snapshot(&snapshot)?;
             let changed = repository.unpin(&id)?;
             if cli.json {
@@ -655,7 +708,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Diff { target } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let diff = repository.diff(&target)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&diff)?);
@@ -683,7 +736,7 @@ fn main() -> anyhow::Result<()> {
             sqlite_consistent,
             cell_dir,
         } => {
-            let mut repository = FurrowRepository::open_composed(&cli.repo, cell_dir)?;
+            let mut repository = open_selected(&cli.repo, cell_dir)?;
             let target = repository.resolve_snapshot(&snapshot)?;
             let plan = repository.plan_rewind(&target, &paths)?;
             if cli.json || dry_run {
@@ -723,7 +776,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Status { fidelity } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let status = repository.status()?;
             if cli.json {
                 if fidelity {
@@ -779,7 +832,7 @@ fn main() -> anyhow::Result<()> {
             no_open,
             merge_check,
         } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             furrow::ui::run(repository.root(), port, no_open, merge_check, cli.json)?;
         }
         Command::Fork {
@@ -792,7 +845,7 @@ fn main() -> anyhow::Result<()> {
                 !cli.json || command.is_empty(),
                 "--json cannot be combined with a fork command"
             );
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let name = name.unwrap_or_else(default_fork_name);
             let destination =
                 destination.unwrap_or_else(|| default_fork_destination(&repository, &name));
@@ -828,6 +881,7 @@ fn main() -> anyhow::Result<()> {
                 let status = std::process::Command::new(program)
                     .args(arguments)
                     .current_dir(&summary.destination)
+                    .env_remove("FURROW_TIMELINE")
                     .env("FURROW_FORK_NAME", &summary.name)
                     .env("FURROW_FORK_BASE", &summary.base_snapshot)
                     .status()
@@ -836,7 +890,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Forks => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let forks = repository.forks()?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&forks)?);
@@ -869,7 +923,7 @@ fn main() -> anyhow::Result<()> {
             follow,
             interval_ms,
         } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let mut cursor = after;
             loop {
                 let page = repository.events(cursor.as_deref(), limit)?;
@@ -898,7 +952,7 @@ fn main() -> anyhow::Result<()> {
             once,
             interval_ms,
         } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let mut cursor = after;
             loop {
                 let updates = repository.fork_updates(&name, cursor.as_deref(), 1000)?;
@@ -930,7 +984,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::ForkRemove { name, keep_files } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let removal = repository.remove_fork(&name, keep_files)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&removal)?);
@@ -953,7 +1007,7 @@ fn main() -> anyhow::Result<()> {
             owner,
             ttl_seconds,
         } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
             let outcome = repository.claim(&pattern, &owner, ttl_seconds)?;
             if cli.json {
@@ -968,7 +1022,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Claims => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let claims = repository.claims()?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&claims)?);
@@ -987,7 +1041,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Release { claim, owner } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
             let outcome = repository.release_claim(&claim, &owner)?;
             if cli.json {
@@ -1015,7 +1069,7 @@ fn main() -> anyhow::Result<()> {
                     (Some(_), Some(_)) => unreachable!("clap enforces conflicts"),
                 };
                 anyhow::ensure!(bytes.len() <= 1024 * 1024, "coord value exceeds 1 MiB");
-                let mut repository = FurrowRepository::open(&cli.repo)?;
+                let mut repository = open_selected(&cli.repo, None)?;
                 let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
                 let outcome = repository.coord_write(&path, &bytes, &owner)?;
                 if cli.json {
@@ -1038,7 +1092,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             CoordCommand::Read { path } => {
-                let repository = FurrowRepository::open(&cli.repo)?;
+                let repository = open_selected(&cli.repo, None)?;
                 let bytes = repository.coord_read(&path)?;
                 if cli.json {
                     let value = String::from_utf8(bytes)
@@ -1049,7 +1103,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             CoordCommand::List => {
-                let repository = FurrowRepository::open(&cli.repo)?;
+                let repository = open_selected(&cli.repo, None)?;
                 let entries = repository.coord_list()?;
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -1062,7 +1116,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             CoordCommand::Remove { path, owner } => {
-                let mut repository = FurrowRepository::open(&cli.repo)?;
+                let mut repository = open_selected(&cli.repo, None)?;
                 let owner = owner.unwrap_or_else(|| repository.default_claim_owner());
                 let outcome = repository.coord_remove(&path, &owner)?;
                 if cli.json {
@@ -1079,7 +1133,7 @@ fn main() -> anyhow::Result<()> {
         Command::Hook { command } => match command {
             HookCommand::Install => {
                 let hooks = install_hook_adapters(&cli.repo)?;
-                let (_, snapshot) = FurrowRepository::attach_and_snapshot(
+                let (_, snapshot) = snapshot_selected(
                     &cli.repo,
                     Some("installed agent hooks".to_owned()),
                     SnapshotTrigger::AgentRun,
@@ -1118,7 +1172,7 @@ fn main() -> anyhow::Result<()> {
             command,
         } => {
             anyhow::ensure!(!cli.json, "--json cannot be combined with `furrow run`");
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let destination =
                 destination.unwrap_or_else(|| default_fork_destination(&repository, &name));
             let plan = match at {
@@ -1144,6 +1198,7 @@ fn main() -> anyhow::Result<()> {
             let status = std::process::Command::new(program)
                 .args(arguments)
                 .current_dir(&summary.destination)
+                .env_remove("FURROW_TIMELINE")
                 .env("FURROW_FORK_NAME", &summary.name)
                 .env("FURROW_FORK_BASE", &summary.base_snapshot)
                 .status()
@@ -1182,7 +1237,7 @@ fn main() -> anyhow::Result<()> {
             let label = message.unwrap_or_else(|| command_name.into_owned());
             anyhow::ensure!(!label.trim().is_empty(), "try label cannot be empty");
             anyhow::ensure!(label.len() <= 256, "try label is limited to 256 bytes");
-            let (mut repository, before) = FurrowRepository::attach_and_snapshot(
+            let (mut repository, before) = snapshot_selected(
                 &cli.repo,
                 Some(format!("before try: {label}")),
                 SnapshotTrigger::AgentRun,
@@ -1231,7 +1286,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let store_before = FurrowRepository::global_store_physical_bytes()?;
-            let (mut repository, before) = FurrowRepository::attach_and_snapshot(
+            let (mut repository, before) = snapshot_selected(
                 &cli.repo,
                 Some("before shrink".to_owned()),
                 SnapshotTrigger::Manual,
@@ -1286,7 +1341,7 @@ fn main() -> anyhow::Result<()> {
             limit,
             command,
         } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let outcome = repository.bisect(&command, good.as_deref(), bad.as_deref(), limit)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
@@ -1312,7 +1367,7 @@ fn main() -> anyhow::Result<()> {
             check,
             dry_run,
         } => {
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             let outcome = if let Some(snapshot) = snapshot {
                 repository.merge_snapshot(&snapshot, base.as_deref(), check.as_deref(), dry_run)?
             } else {
@@ -1354,7 +1409,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Forget { purge } => {
-            FurrowRepository::open(&cli.repo)?.forget(purge)?;
+            open_selected(&cli.repo, None)?.forget(purge)?;
             println!("Repository detached from furrow");
         }
         Command::Gc { dry_run } => {
@@ -1407,7 +1462,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Pair { remote, name, key } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let namespace = name.unwrap_or_else(|| default_sync_name(&repository));
             let summary = repository.pair(&remote, &namespace, key.as_deref())?;
             print_pair_summary(&summary, cli.json)?;
@@ -1415,7 +1470,7 @@ fn main() -> anyhow::Result<()> {
         Command::Remote {
             command: RemoteCommand::Add { remote, name, key },
         } => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             let namespace = name.unwrap_or_else(|| default_sync_name(&repository));
             let summary = repository.pair(&remote, &namespace, key.as_deref())?;
             print_pair_summary(&summary, cli.json)?;
@@ -1450,7 +1505,7 @@ fn main() -> anyhow::Result<()> {
                     .status()
                     .context("start git for clone destination")?;
                 anyhow::ensure!(status.success(), "git init failed for clone destination");
-                let (mut repository, _) = FurrowRepository::watch(&destination)?;
+                let (mut repository, _) = watch_selected(&destination)?;
                 repository.pair(PathBuf::from(&transport).as_path(), &namespace, Some(&key))?;
                 let outcome = repository
                     .sync_pull(true, None)
@@ -1503,7 +1558,7 @@ fn main() -> anyhow::Result<()> {
                 "choose exactly one of --push, --pull, or --follow"
             );
             let ref_name = ref_name.as_deref();
-            let mut repository = FurrowRepository::open(&cli.repo)?;
+            let mut repository = open_selected(&cli.repo, None)?;
             if follow {
                 anyhow::ensure!(poll_seconds > 0, "--poll-seconds must be greater than zero");
                 let mut session = repository.sync_follow_session(ref_name)?;
@@ -1624,7 +1679,7 @@ fn main() -> anyhow::Result<()> {
             })?;
         }
         Command::Mcp => {
-            let repository = FurrowRepository::open(&cli.repo)?;
+            let repository = open_selected(&cli.repo, None)?;
             furrow::mcp::run(repository)?;
         }
     }
@@ -1731,7 +1786,7 @@ fn execute_universes(
         "`furrow exec` requires a command after -- (or use --plan)"
     );
 
-    let mut repository = FurrowRepository::open(repo)?;
+    let mut repository = open_selected(repo, None)?;
     let canonical_workdir = repository.root().to_path_buf();
     let driver = furrow::universe::select_driver();
     let base_name = explicit_name.unwrap_or_else(default_exec_name);
@@ -2312,17 +2367,17 @@ fn run_hook(
     let turn = hook_value(turn, "FURROW_TURN_ID")?;
     let tool = hook_value(tool, "FURROW_TOOL_NAME")?;
     let label = furrow_daemon::hook_label(event, &agent, turn.as_deref(), tool.as_deref());
-    let (_, snapshot) = FurrowRepository::attach_and_seal(
+    let (repository, snapshot) = seal_selected(
         root,
         Some(label.clone()),
         SnapshotTrigger::AgentRun,
         seal.options()?,
     )?;
     if json {
-        println!(
-            "{}",
-            serde_json::json!({"event": event, "label": label, "snapshot": id_hex(&snapshot)})
-        );
+        let mut answer = repository.snapshot_json(&snapshot)?;
+        answer["event"] = serde_json::json!(event);
+        answer["label"] = serde_json::json!(label);
+        println!("{answer}");
     } else {
         println!("Sealed {} {}", &id_hex(&snapshot)[..12], label);
     }

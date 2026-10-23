@@ -77,3 +77,44 @@ test under latency/loss shaping before claiming the 100 ms RTT contract:
 ```bash
 cargo test --locked -j 2 -p furrow-cli --test cli persistent_ssh_helper_syncs_independent_stores_over_framed_stdio -- --nocapture
 ```
+
+## Shared-store and Git-aware capture contracts
+
+`furrow-cli/tests/shared_store.rs` measures actual data-directory bytes for four
+independent timelines capturing a 31 MiB tree, verifies that adding one changed
+file adds only its chunks plus metadata, and stresses concurrent daemon writers
+and one-shot CLI processes against the same store. It compares the capture
+policy against real Git's tracked and ignored file lists, and exercises shared
+export/import, purge and GC. Each test names its S1–S10 contract items.
+
+The `gitignore` directive reads Git's ignore control files and enumerates ignored
+paths to report file counts and sizes. It stats ignored files without opening
+their contents. This metadata accounting is proportional to the number of
+ignored paths, not the number of ignored bytes. A large generated file therefore
+adds no content I/O to seals. Unchanged captures without the directive retain
+the existing stat-cache path. Measurements for the default-on wave are recorded
+in lane F1's NOTES.md and accompanying command logs.
+
+### Default-on wave measurements: 2026-10-22
+
+On the shared Linux/ext4 machine with Rust 1.97.1, four caller-named timelines
+capturing 31 distinct MiB of files occupied 33,521,664 allocated bytes versus
+32,899,072 for one timeline (1.0189×, measured with `du -s -B1`). Replacing one
+1 MiB file added 1,150,976 allocated bytes.
+
+A full unchanged 10,000-file seal, outside the existing two-second racy-stat
+window, measured a median **897.739 ms before / 865.107 ms after** across seven
+alternating samples per binary. This passes the 10% regression ceiling. Fixture
+aging and first capture were outside the timed operation.
+
+Tracing first and unchanged seals with a 200 MiB ignored output file found
+**zero ignored regular-file opens and zero content reads**. Exact omission counts
+still required metadata operations and one ignored-directory open per seal.
+Directory enumeration is required for first-seal exact accounting; this does not
+establish literal zero access below ignored directories.
+
+The broader nine-scenario benchmark completed before and after, but shared disk
+pressure produced large wall-time differences (including journal `fsync` stalls
+over nine seconds). Several broader wall-time medians regressed; their raw logs
+and comparison table are retained in lane F1's handoff. These measurements do
+not establish that every documented performance ceiling passes on this machine.

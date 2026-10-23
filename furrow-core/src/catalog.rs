@@ -22,6 +22,26 @@ pub struct PackCheckpoint {
 
 /// Page cache for the catalog connection, in KiB.
 const CACHE_KIB: i64 = 32 * 1024;
+pub(crate) const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn writer_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(|error| {
+            matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        })
+    {
+        anyhow::anyhow!(
+            "store writer is still busy after waiting {} seconds; retry the operation",
+            WRITER_WAIT.as_secs()
+        )
+    } else {
+        error
+    }
+}
 
 pub struct Catalog {
     conn: Connection,
@@ -29,8 +49,13 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_inner(path).map_err(writer_error)
+    }
+
+    fn open_inner(path: &Path) -> anyhow::Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("open catalog {}", path.display()))?;
+        conn.busy_timeout(WRITER_WAIT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // The catalog indexes the packs and the reference log, which are the
         // durable record: a commit lost to a crash is rebuilt at the next
@@ -169,7 +194,9 @@ impl Catalog {
         if !self.conn.is_autocommit() {
             return write();
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| writer_error(error.into()))?;
         match write() {
             Ok(value) => {
                 self.conn.execute_batch("COMMIT")?;

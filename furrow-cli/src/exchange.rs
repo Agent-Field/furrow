@@ -119,10 +119,19 @@ fn execute(verb: Exchange, repo: &Path) -> anyhow::Result<Value> {
             &inbox,
             ImportMode::from_flags(primed, partial)?,
         ),
-        Exchange::Rebind { from } => ops::rebind(&data_dir, &from, repo),
-        Exchange::Materialize { head, cell_dir } => {
-            ops::restore_head(&data_dir, repo, cell_dir, &head)
-        }
+        Exchange::Rebind { from } => ops::rebind_timeline(
+            &data_dir,
+            &from,
+            repo,
+            crate::selected_timeline().as_deref(),
+        ),
+        Exchange::Materialize { head, cell_dir } => ops::restore_timeline_head(
+            &data_dir,
+            repo,
+            cell_dir,
+            &head,
+            crate::selected_timeline().as_deref(),
+        ),
     }
 }
 

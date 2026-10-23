@@ -32,10 +32,11 @@ impl Handle {
     pub fn repo(&mut self) -> anyhow::Result<&mut FurrowRepository> {
         if self.repo.is_none() {
             let target = &self.target;
-            let repo = FurrowRepository::open_composed_in(
+            let repo = FurrowRepository::open_timeline_in(
                 &target.data_dir,
                 &target.tree,
                 target.cell_dir.clone(),
+                target.timeline.as_deref(),
             )
             .context("open store")?;
             self.repo = Some(repo);
@@ -65,9 +66,10 @@ impl Handle {
             changed,
             overlay: target.cell_dir.clone(),
         };
-        let (repo, id) = FurrowRepository::attach_and_seal_in(
+        let (repo, id) = FurrowRepository::attach_and_seal_timeline_in(
             &target.data_dir,
             &target.tree,
+            target.timeline.as_deref(),
             Some(label),
             SnapshotTrigger::AgentRun,
             options,

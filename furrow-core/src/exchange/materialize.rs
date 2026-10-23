@@ -34,13 +34,25 @@ pub fn materialize_holding(
     cell_dir: Option<PathBuf>,
     head: ObjectId,
 ) -> anyhow::Result<(ObjectId, Vec<HeldPath>)> {
+    materialize_timeline_holding(data_dir, target, cell_dir, head, None)
+}
+
+/// Materializes into one caller-named timeline of a shared store.
+pub fn materialize_timeline_holding(
+    data_dir: &Path,
+    target: &Path,
+    cell_dir: Option<PathBuf>,
+    head: ObjectId,
+    timeline: Option<&str>,
+) -> anyhow::Result<(ObjectId, Vec<HeldPath>)> {
     let options = SealOptions {
         changed: None,
         overlay: cell_dir,
     };
-    let (mut repository, _) = FurrowRepository::attach_and_seal_in(
+    let (mut repository, _) = FurrowRepository::attach_and_seal_timeline_in(
         data_dir,
         target,
+        timeline,
         Some("before materialize".to_owned()),
         SnapshotTrigger::SyncPull,
         options,

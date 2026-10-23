@@ -20,6 +20,8 @@ pub struct Target {
     pub tree: PathBuf,
     #[serde(default)]
     pub cell_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub timeline: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

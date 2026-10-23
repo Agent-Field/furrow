@@ -199,3 +199,69 @@ The black-box suite runs against independent temporary Git repositories and isol
 ## License
 
 Apache-2.0
+
+### Shared stores and chat timelines
+
+Several chats can use the same `FURROW_DATA_DIR`. Pass `--timeline <id>` (or
+`FURROW_TIMELINE=<id>`) on every command for that chat, including `hook`, `snap`,
+`timeline`, `rewind`, `fork`, `merge`, `materialize`, and `rebind`. The caller picks
+a nonempty ID of at most 1024 bytes. Each ID has its own head, history, cache,
+retention and forks; all IDs share content-addressed objects. Two IDs can attach
+to the same folder. File changes and restores still change that shared folder.
+Omitting the ID keeps the existing folder-based identity and data layout.
+
+For example:
+
+```bash
+export FURROW_DATA_DIR=/tmp/furrow-shared
+furrow --repo ./project --timeline chat-a hook turn-end --turn 1
+furrow --repo ./project --timeline chat-b hook turn-end --turn 1
+furrow --repo ./project --timeline chat-a timeline
+```
+
+Named identities live in the store and add no `.furrow` directory to the tree.
+Commands launched by `fork`, `run`, and `exec` use their isolated workspace’s
+own identity; the source chat’s timeline environment is not inherited there.
+After moving a folder, use the same ID with `--repo <new-path> rebind --from
+<old-path>`. `forget --purge` removes that timeline; GC retains objects reachable
+from other timelines. Concurrent writers wait for the catalog and pack locks;
+a lock still busy after 30 seconds returns a message asking the caller to retry.
+
+The daemon's existing target object accepts an optional `timeline` string next
+to `data_dir`, `tree`, and `cell_dir`. Supply it on every request for that chat.
+Export, import, want and published continue to use explicit snapshot IDs and
+store-wide transport ledgers; their framing, encryption and remote IDs are
+unchanged. Use distinct outbox/inbox directories for independent transfers.
+
+### Leave Git-ignored output outside snapshots
+
+Add this line to `.furrowpolicy` (including a composed `.cell` policy):
+
+```text
+gitignore
+exclude private/secrets
+```
+
+`exclude` keeps its existing literal subtree meaning. `gitignore` additionally
+omits untracked files ignored by Git, using Git's own matcher: nested
+`.gitignore` files, `.git/info/exclude`, `core.excludesFile`, negation, anchored
+patterns, directory patterns and `**` all behave as Git does. Tracked files are
+captured even when an ignore pattern matches. The directive needs Git installed;
+outside a Git working tree it does nothing. It triggers a full metadata walk,
+even with `--changed`, because ignore rules and the tracked index can change
+independently of a caller's changed-path list.
+
+Ignored contents are never opened for capture, including safety snapshots.
+Rewind and materialize protect existing ignored files and directories from
+removal or replacement, even when restoring a snapshot made before the directive
+was enabled. Restore uses the current ignore rules and tracked index. Keep the
+directive in the composed policy when that preference must survive restoring an
+older tree that has a different `.furrowpolicy`.
+
+Snapshot, hook, and timeline JSON add `ignored` when the directive is active in a
+Git repository: `{"files": 2, "bytes": 209715200, "paths": ["dist/"]}`. This is
+per-snapshot accounting of omitted untracked files, with up to 20 collapsed
+paths. Counts and sizes come from directory listings and metadata, never file
+contents; symlinks count their link length. Explicit `exclude` subtrees are not
+included in these counts. Older snapshots and captures without the directive
+omit this field and retain their existing serialization.

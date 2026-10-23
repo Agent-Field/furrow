@@ -32,7 +32,7 @@ pub struct CaptureEstimate {
 
 pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEstimate> {
     let root = root.canonicalize()?;
-    let policy = CapturePolicy::load(&root)?;
+    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root)?;
     let database = tempfile::NamedTempFile::new()?;
     let mut connection = Connection::open(database.path())?;
     connection.execute_batch(
