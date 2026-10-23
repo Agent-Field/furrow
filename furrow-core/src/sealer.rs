@@ -343,7 +343,9 @@ mod tests {
 
     #[test]
     fn pinned_vectors_are_reproduced_and_open() {
-        let file: Value = serde_json::from_slice(&std::fs::read(vectors_path()).unwrap()).unwrap();
+        // R3/W7: pinned vectors travel with relocated native test executables.
+        let file: Value =
+            serde_json::from_slice(include_bytes!("../../testdata/stage1-vectors.json")).unwrap();
         assert_eq!(file["V"], 1);
         let s = CellSealer::new(&Keys {
             cell_key: unhex(&file["cell_key"]),

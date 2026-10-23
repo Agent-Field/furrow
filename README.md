@@ -181,9 +181,26 @@ cargo install --locked --path furrow-cli -j 2
 ```
 
 Build output lives in the ignored root `target/` directory. Release tags build
-`furrow-cli` for Linux and macOS on amd64 and arm64; their assets are named
-`furrow-linux-amd64`, `furrow-linux-arm64`, `furrow-darwin-amd64`, and
-`furrow-darwin-arm64`.
+`furrow-cli` for Linux, macOS and Windows on amd64 and arm64. Assets are named
+`furrow-linux-amd64`, `furrow-linux-arm64`, `furrow-darwin-amd64`,
+`furrow-darwin-arm64`, `furrow-windows-amd64.exe`, and `furrow-windows-arm64.exe`.
+`SHA256SUMS` covers every asset.
+
+Native Windows requires Windows 10 1803 or newer for the daemon's AF_UNIX
+socket. `serve --socket <path>` uses the same newline-delimited JSON protocol
+as Unix, exits when idle, and drains requests on Ctrl-C, Ctrl-Break or console
+close. Keep the socket path short (the AF_UNIX limit is 108 bytes).
+Snapshots store `/` paths and untouched bytes; Windows preserves a recorded
+POSIX mode when sealing again and gives new files mode 0644. Names Windows
+refuses, case collisions, FIFOs, and symlinks without permission are left out
+of restoration and reported with reasons in JSON `held`. The snapshot retains
+those entries. Long workspace paths use Windows verbatim absolute paths.
+File replacement retries sharing violations for at most 1.27 seconds before
+reporting a blocked-file error. File durability uses FlushFileBuffers;
+directory syncing is a no-op on Windows. POSIX extended attributes and native
+CoW are unavailable there; forks use independent streaming copies. Restore previews
+ignore Windows directory timestamp differences and compare their children
+recursively: NTFS directory listings can report a stale last-write time.
 
 Engine integrations can use `furrow exchange <verb> --help` and
 `furrow serve --help` to discover their runtime contract. Exchange encryption
@@ -193,6 +210,24 @@ writes frames for the caller to transport. Hook sealing accepts repeatable
 external directory composed as `.cell/`, replacing any root `.cell/` entry in
 the sealed tree. An explicitly empty changed list
 means nothing changed; omitting the list requests a full capture.
+
+Windows MSVC executables reserve 32 MiB of stack through `.cargo/config.toml`,
+for debug and release builds, including daemon and test helpers. The same
+configuration statically links the MSVC runtime so fresh machines need no runtime
+installer. Debug command parsing alone can use more than Windows' default 1 MiB stack; recursive capture
+also needs headroom. The reserve uses virtual address space and commits pages on
+use. Keep this workspace configuration when building Windows artifacts.
+
+
+Relocated Windows tests use a debug companion built with
+`--features furrow-core/fault-injection`, matching Cargo's test dependencies.
+Crash tests arm these points through their own environment; ordinary release
+builds compile them out.
+
+The CLI, daemon and exchange behavioural suites run on native Windows as well as
+Unix. Tests scope POSIX mode changes, executable hook scripts, privileged symlink
+creation and macOS attributes to the platforms that support them. Windows warm
+materialization checks use NTFS file IDs to detect unintended rewrites.
 
 The black-box suite runs against independent temporary Git repositories and isolated stores: secret recovery, reversible rewind, metadata fidelity, SQLite logical recovery, index reconstruction, truncated-pack recovery, path-escape rejection, interrupted-rewind recovery, and fork isolation.
 
@@ -252,7 +287,10 @@ Evaluation runs in process and needs no Git executable. Tracked
 files are captured even when a pattern matches. Linked worktrees and nested
 repositories use their own index and rules. A missing or unreadable index gives
 no tracked exceptions, and invalid index names are never followed. Outside a
-Git working tree the directive does nothing.
+Git working tree the directive does nothing. On Windows, native paths are
+normalized to `/` for matching, Git's case setting is honored (with a filesystem
+probe when absent), and absolute Windows `core.excludesFile` paths are supported.
+Shared timelines and indexed exceptions use the same capture rules on NTFS.
 
 A full seal prunes ignored directories without listing them. When an ignored
 directory contains tracked files, capture follows only their indexed paths.

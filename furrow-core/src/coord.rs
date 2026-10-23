@@ -302,8 +302,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    File::open(parent)?.sync_all()?;
+    crate::platform::persist(temporary, path).map_err(|error| error.error)?;
+    crate::platform::sync_path(parent)?;
     Ok(())
 }
 
@@ -359,7 +359,7 @@ fn remove_leaf(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

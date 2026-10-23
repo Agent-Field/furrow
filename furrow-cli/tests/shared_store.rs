@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 
+fn furrow_exe() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_furrow")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_furrow")))
+}
+
 struct Rig {
     _temp: tempfile::TempDir,
     data: PathBuf,
@@ -33,7 +39,7 @@ impl Rig {
     }
 
     fn cli(&self, timeline: &str, args: &[&str]) -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_furrow"))
+        let output = Command::new(furrow_exe())
             .env("FURROW_DATA_DIR", &self.data)
             .env("HOME", self._temp.path().join("home"))
             .env("FURROW_NO_DAEMON", "1")
@@ -140,6 +146,7 @@ fn s1_s2_independent_heads_share_content_on_disk() {
 
 fn git(root: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new("git")
+        .args(["-c", "core.autocrlf=false"])
         .env("HOME", root)
         .arg("-C")
         .arg(root)
@@ -482,7 +489,9 @@ fn s1_fork_merge_and_rebind_select_only_the_named_timeline() {
     repo.fork("job", &destination).unwrap();
     assert!(rig.repo("b").forks().unwrap().is_empty());
     fs::write(destination.join("file"), "merged").unwrap();
-    let merged = repo.merge("job", Some("true"), false).unwrap();
+    // I3 uses the native shell's successful command so the same merge check runs on Windows.
+    let check = if cfg!(windows) { "exit /b 0" } else { "true" };
+    let merged = repo.merge("job", Some(check), false).unwrap();
     assert!(merged.result_snapshot.is_some());
     assert_eq!(fs::read_to_string(rig.tree.join("file")).unwrap(), "merged");
     assert_eq!(rig.repo("b").status().unwrap().head.unwrap(), sibling);
@@ -597,7 +606,7 @@ fn s3_stalled_writer_times_out_with_a_bounded_retry_message() {
     let connection = rusqlite::Connection::open(rig.data.join("store-v1/catalog.sqlite3")).unwrap();
     connection.execute_batch("BEGIN IMMEDIATE").unwrap();
     let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let output = Command::new(furrow_exe())
         .env("FURROW_DATA_DIR", &rig.data)
         .env("HOME", rig._temp.path().join("home"))
         .args(["--json", "--repo"])
@@ -649,7 +658,7 @@ fn s1_fork_commands_keep_the_forks_own_identity() {
     for verb in ["fork", "run", "exec"] {
         let name = format!("{verb}-job");
         let destination = rig._temp.path().join(&name);
-        let mut command = Command::new(env!("CARGO_BIN_EXE_furrow"));
+        let mut command = Command::new(furrow_exe());
         command
             .env("FURROW_DATA_DIR", &rig.data)
             .env("HOME", rig._temp.path().join("home"))
@@ -666,7 +675,7 @@ fn s1_fork_commands_keep_the_forks_own_identity() {
         }
         let output = command
             .arg("--")
-            .arg(env!("CARGO_BIN_EXE_furrow"))
+            .arg(furrow_exe())
             .args(["--json", "snap", "-m", "child command"])
             .output()
             .unwrap();
@@ -816,7 +825,7 @@ fn g1_user_config_xdg_linked_worktree_nested_repo_and_no_git_binary() {
     )
     .unwrap();
     let capture = || {
-        let output = Command::new(env!("CARGO_BIN_EXE_furrow"))
+        let output = Command::new(furrow_exe())
             .env("FURROW_DATA_DIR", &rig.data)
             .env("HOME", &home)
             .env_remove("XDG_CONFIG_HOME")

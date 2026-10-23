@@ -1,11 +1,10 @@
 //! Cross-process suppression of filesystem events produced by snapshot apply.
 
+use crate::platform::MetadataExt;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const ACTIVE_FILE: &str = "apply-active.json";
@@ -78,7 +77,7 @@ impl ApplyGuard {
                 path.as_path()
             };
             entries.push(BaselineEntry {
-                path: relative.as_os_str().as_bytes().to_vec(),
+                path: crate::platform::path_bytes(relative),
                 identity: identity(&self.root.join(relative))?,
             });
         }
@@ -138,8 +137,8 @@ pub fn filter_events(
         } else {
             path.as_path()
         };
-        let key = relative.as_os_str().as_bytes();
-        match baseline.get(key) {
+        let key = crate::platform::path_bytes(relative);
+        match baseline.get(&key) {
             Some(expected) => identity(&root.join(relative)).as_ref().ok() != Some(expected),
             None => true,
         }
@@ -161,8 +160,7 @@ fn identity(path: &Path) -> anyhow::Result<Option<FileIdentity>> {
 }
 
 fn process_alive(pid: u32) -> bool {
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    crate::platform::process_alive(pid)
 }
 
 fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
@@ -178,7 +176,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     use std::io::Write;
     temporary.write_all(bytes)?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    crate::platform::persist(temporary, path).map_err(|error| error.error)?;
     Ok(())
 }
 

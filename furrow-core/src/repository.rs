@@ -15,11 +15,16 @@ use crate::model::{
     Snapshot, SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
 };
 use crate::name_fold::NameFolding;
-use crate::overlay::{self, Overlay, WithOverlay};
+#[cfg(unix)]
+use crate::overlay::WithOverlay;
+use crate::overlay::{self, Overlay};
 use crate::path_index::{PathIndex, CHILD_BATCH};
+use crate::platform::{FileTypeExt, MetadataExt};
+use crate::platform::{OsStrExt, OsStringExt};
 use crate::policy::{CapturePolicy, POLICY_FILE_BYTES};
 use crate::radar::{EventPage, Radar, UniverseRegistration};
 use crate::self_write::ApplyGuard;
+#[cfg(unix)]
 use crate::sorted_dir::SortedDirectory;
 use crate::sqlite_adapter;
 use crate::store::ObjectStore;
@@ -36,11 +41,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(all(test, unix))]
+use crate::platform::PermissionsExt;
 
 const STORE_DIR: &str = "store-v1";
 const WORKSPACE_FILE: &str = ".furrow/workspace-id";
@@ -1152,7 +1158,7 @@ impl FurrowRepository {
                 .restore(&remote_snapshot.claims)?;
         }
 
-        if local_snapshot.root_tree == remote_snapshot.root_tree {
+        if self.working_trees_match(&local_snapshot.root_tree, &remote_snapshot.root_tree)? {
             // Nothing to materialize, but the whole graph must still land and be
             // verified before the local identity adopts the remote snapshot.
             let pulled = pull.finish()?;
@@ -1168,12 +1174,15 @@ impl FurrowRepository {
             ));
         }
 
-        let can_fast_forward = pull.base_root() == Some(local_snapshot.root_tree)
-            || prior_sync.as_ref().is_some_and(|state| {
-                pull.base_root() == Some(state.remote_root)
-                    && state.local_root == Some(local_snapshot.root_tree)
-            })
-            || bootstrap;
+        let follows_prior = match prior_sync.as_ref() {
+            Some(state) if pull.base_root() == Some(state.remote_root) => match state.local_root {
+                Some(root) => self.working_trees_match(&root, &local_snapshot.root_tree)?,
+                None => false,
+            },
+            _ => false,
+        };
+        let can_fast_forward =
+            pull.base_root() == Some(local_snapshot.root_tree) || follows_prior || bootstrap;
 
         if !can_fast_forward {
             // Divergence: land and verify the whole remote graph so it can be
@@ -1418,16 +1427,20 @@ impl FurrowRepository {
             .context("workspace has no sealed snapshot")?;
         let local_snapshot: Snapshot = self.store.read_struct(&local_head, ObjectKind::Snapshot)?;
         let last_synced = self.read_sync_state()?;
+        let matches_synced = match last_synced.as_ref().and_then(|state| state.local_root) {
+            Some(root) => self.working_trees_match(&root, &local_snapshot.root_tree)?,
+            None => false,
+        };
 
         match remote_root {
             None => Ok(SyncFollowOutcome::Published {
                 report: self.sync_push_on(true, &session.config, &mut session.remote)?,
             }),
             Some(remote_root)
-                if last_synced.as_ref().is_some_and(|state| {
-                    state.remote_root == remote_root
-                        && state.local_root == Some(local_snapshot.root_tree)
-                }) || (last_synced.is_none() && local_snapshot.root_tree == remote_root) =>
+                if last_synced
+                    .as_ref()
+                    .is_some_and(|state| state.remote_root == remote_root && matches_synced)
+                    || (last_synced.is_none() && local_snapshot.root_tree == remote_root) =>
             {
                 if last_synced.is_none() {
                     self.write_sync_state(remote_root, local_snapshot.root_tree)?;
@@ -1559,13 +1572,7 @@ impl FurrowRepository {
                 .backup_to(&fork_repository.workspace_data_dir().join("paths.sqlite3"))?;
             (fork_repository, base)
         } else {
-            let (fork_repository, fork_head) = FurrowRepository::attach_and_seal_in(
-                self.store.root().parent().context("store has no parent")?,
-                &destination,
-                Some("initial protection".to_owned()),
-                SnapshotTrigger::Manual,
-                SealOptions::default(),
-            )?;
+            let (fork_repository, fork_head) = self.capture_fork(&destination, base)?;
             if !self.snapshots_match_fork(&base, &fork_repository, &fork_head)? {
                 bail!(
                     "source changed while the fork was being created; the isolated copy remains at {} for inspection",
@@ -1632,8 +1639,8 @@ impl FurrowRepository {
                 )
             })?;
         let staging_path = staging.path().to_path_buf();
-        let root_mode = fs::symlink_metadata(&self.root)?.permissions().mode();
-        fs::set_permissions(&staging_path, fs::Permissions::from_mode(root_mode))?;
+        let root_mode = fs::symlink_metadata(&self.root)?.mode();
+        crate::platform::set_mode(&staging_path, root_mode)?;
 
         let mut usage = TreeUsage::default();
         let mut cow_cloned = TreeUsage::default();
@@ -1664,7 +1671,7 @@ impl FurrowRepository {
                     if let Some(parent) = destination_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    std::os::unix::fs::symlink(
+                    crate::platform::symlink(
                         OsString::from_vec(flat.entry.link_target.clone()),
                         &destination_path,
                     )?;
@@ -1676,12 +1683,7 @@ impl FurrowRepository {
                     if let Some(parent) = destination_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    let cpath = std::ffi::CString::new(destination_path.as_os_str().as_bytes())?;
-                    let result =
-                        unsafe { libc::mkfifo(cpath.as_ptr(), flat.entry.mode as libc::mode_t) };
-                    if result != 0 {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
+                    crate::platform::create_fifo(&destination_path, flat.entry.mode)?;
                 }
                 EntryKind::SocketMarker => {}
             }
@@ -1695,9 +1697,9 @@ impl FurrowRepository {
             }
         }
 
-        fs::rename(&staging_path, &destination)
+        crate::platform::rename(&staging_path, &destination)
             .with_context(|| format!("publish fork {}", destination.display()))?;
-        File::open(&destination_parent)?.sync_all()?;
+        crate::platform::sync_path(&destination_parent)?;
         std::mem::forget(staging);
 
         let tier = match (cow_cloned.files, store_restored.files) {
@@ -1720,13 +1722,7 @@ impl FurrowRepository {
             atomic_hierarchy: false,
         };
 
-        let (fork_repository, fork_head) = FurrowRepository::attach_and_seal_in(
-            self.store.root().parent().context("store has no parent")?,
-            &destination,
-            Some("initial protection".to_owned()),
-            SnapshotTrigger::Manual,
-            SealOptions::default(),
-        )?;
+        let (fork_repository, fork_head) = self.capture_fork(&destination, base)?;
         if !self.snapshots_match_fork(&base, &fork_repository, &fork_head)? {
             bail!(
                 "source changed while the fork was being created; the isolated copy remains at {} for inspection",
@@ -1734,6 +1730,32 @@ impl FurrowRepository {
             );
         }
         self.finalize_fork(plan, destination, base, fork_repository, fork_head, report)
+    }
+
+    fn capture_fork(&self, destination: &Path, base: ObjectId) -> anyhow::Result<(Self, ObjectId)> {
+        #[cfg(windows)]
+        {
+            // Seed recorded modes before capturing a Windows copy of a Unix
+            // tree. Attaching a fresh head would otherwise reset executables.
+            let mut repository = Self::attach_existing_snapshot(
+                self.store.root().parent().context("store has no parent")?,
+                destination,
+                base,
+            )?;
+            let head = repository.snapshot(None, SnapshotTrigger::ForkBase)?;
+            Ok((repository, head))
+        }
+        #[cfg(unix)]
+        {
+            let _ = base;
+            Self::attach_and_seal_in(
+                self.store.root().parent().context("store has no parent")?,
+                destination,
+                Some("initial protection".to_owned()),
+                SnapshotTrigger::Manual,
+                SealOptions::default(),
+            )
+        }
     }
 
     fn finalize_fork(
@@ -1779,11 +1801,15 @@ impl FurrowRepository {
     /// Reapply a captured entry's mode, extended attributes, and mtime after
     /// cloning its content straight from the live workspace file.
     fn apply_captured_metadata(&self, destination: &Path, entry: &TreeEntry) -> anyhow::Result<()> {
-        fs::set_permissions(destination, fs::Permissions::from_mode(entry.mode))?;
+        crate::platform::set_mode(destination, entry.mode)?;
         if let Some(xattrs_id) = entry.xattrs {
             let xattrs: Xattrs = self.store.read_struct(&xattrs_id, ObjectKind::Xattrs)?;
             for xattr in restorable_xattrs(xattrs.entries) {
-                match xattr::set(destination, OsStr::from_bytes(&xattr.name), &xattr.value) {
+                match crate::platform::xattr::set(
+                    destination,
+                    OsStr::from_bytes(&xattr.name),
+                    &xattr.value,
+                ) {
                     Ok(()) => {}
                     Err(error)
                         if matches!(
@@ -1882,7 +1908,8 @@ impl FurrowRepository {
             for entry in fs::read_dir(&directory)? {
                 let entry = entry?;
                 let path = entry.path();
-                let relative = path.strip_prefix(destination)?.as_os_str().as_bytes();
+                let relative_bytes = crate::platform::path_bytes(path.strip_prefix(destination)?);
+                let relative = relative_bytes.as_slice();
                 if is_identity_path(relative) || policy.excludes_bytes(relative) {
                     continue;
                 }
@@ -1943,7 +1970,7 @@ impl FurrowRepository {
                 );
             }
             EntryKind::Symlink => anyhow::ensure!(
-                fs::read_link(&path)?.as_os_str().as_bytes() == indexed.link_target,
+                crate::platform::path_bytes(&fs::read_link(&path)?) == indexed.link_target,
                 "atomic fork symlink changed for `{}`",
                 String::from_utf8_lossy(relative)
             ),
@@ -2202,11 +2229,11 @@ impl FurrowRepository {
             fork_repository.forget(true)?;
             fs::remove_dir_all(&destination)?;
             if let Some(parent) = destination.parent() {
-                File::open(parent)?.sync_all()?;
+                crate::platform::sync_path(parent)?;
             }
         }
         fs::remove_file(&record_path)?;
-        File::open(self.forks_dir())?.sync_all()?;
+        crate::platform::sync_path(self.forks_dir())?;
         Ok(ForkRemoval {
             name: name.to_owned(),
             destination: fork.destination,
@@ -2510,8 +2537,7 @@ impl FurrowRepository {
             fs::remove_file(scratch_identity)?;
         }
         self.apply_plan_at(&scratch, &target_entries, &rewind_plan, &[])?;
-        let verification = std::process::Command::new("/bin/sh")
-            .args(["-c", check])
+        let verification = crate::platform::shell(check)
             .current_dir(&scratch)
             .env_remove("FURROW_TIMELINE")
             .output()
@@ -2528,7 +2554,7 @@ impl FurrowRepository {
         let ours_snapshot: Snapshot = self.store.read_struct(&ours, ObjectKind::Snapshot)?;
         let current_root = self.capture_root_retry()?;
         anyhow::ensure!(
-            current_root == ours_snapshot.root_tree,
+            self.working_trees_match(&current_root, &ours_snapshot.root_tree)?,
             "source workspace changed while the merge was being verified; retry"
         );
         self.write_restore_intent(&RestoreIntent {
@@ -2683,7 +2709,7 @@ impl FurrowRepository {
             .stderr(Stdio::null())
             .status()
             .with_context(|| format!("run bisect command at {}", &id_hex(snapshot)[..12]))?;
-        use std::os::unix::process::ExitStatusExt;
+        use crate::platform::ExitStatusExt;
         let check = BisectCheck {
             snapshot: id_hex(snapshot),
             label: label.clone(),
@@ -2813,7 +2839,7 @@ impl FurrowRepository {
         let path = self.sync_incoming_path();
         if path.exists() {
             fs::remove_file(&path)?;
-            File::open(path.parent().context("sync root has no parent")?)?.sync_all()?;
+            crate::platform::sync_path(path.parent().context("sync root has no parent")?)?;
         }
         Ok(())
     }
@@ -2844,6 +2870,13 @@ impl FurrowRepository {
         }
         base_entries.retain(|_, entry| entry.entry.kind != EntryKind::SocketMarker);
         fork_entries.retain(|_, entry| entry.entry.kind != EntryKind::SocketMarker);
+        #[cfg(windows)]
+        for entries in [&mut base_entries, &mut fork_entries] {
+            for flat in entries.values_mut() {
+                flat.entry.mtime_nanos = flat.entry.mtime_nanos / 100 * 100;
+                flat.entry.xattrs = None;
+            }
+        }
         Ok(base_entries
             .iter()
             .map(|(path, entry)| (path, &entry.entry))
@@ -2948,13 +2981,45 @@ impl FurrowRepository {
         target_root: &ObjectId,
         changes: &[RewindChange],
     ) -> anyhow::Result<Vec<HeldPath>> {
-        let folding = NameFolding::probe(&self.root);
-        if !folding.is_active() {
+        self.colliding_paths_at(&self.root, target_root, changes)
+    }
+
+    fn colliding_paths_at(
+        &self,
+        destination: &Path,
+        target_root: &ObjectId,
+        changes: &[RewindChange],
+    ) -> anyhow::Result<Vec<HeldPath>> {
+        let folding = NameFolding::probe(destination);
+        if !folding.is_active() && !cfg!(windows) {
             return Ok(Vec::new());
         }
         let mut directories: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
         let mut held = Vec::new();
+        #[cfg(windows)]
+        let symlink_refusal = crate::platform::symlink_refusal(destination);
         for change in changes.iter().filter(|change| change.action != "remove") {
+            #[cfg(windows)]
+            {
+                let entry = self.lookup_tree_path(target_root, &change.raw_path)?;
+                let reason = crate::platform::unsupported_name(&change.raw_path).or_else(|| {
+                    match entry.as_ref().map(|entry| &entry.kind) {
+                        Some(EntryKind::Symlink) => symlink_refusal.clone(),
+                        Some(EntryKind::Fifo | EntryKind::SocketMarker) => {
+                            Some("Windows cannot create this special file".into())
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some(reason) = reason {
+                    held.push(HeldPath {
+                        path: display_relative(&change.raw_path),
+                        reason,
+                        raw_path: change.raw_path.clone(),
+                    });
+                    continue;
+                }
+            }
             let (parent, name) = split_parent(&change.raw_path);
             if !directories.contains_key(parent) {
                 let kept = self.kept_names(target_root, parent, &folding)?;
@@ -3002,7 +3067,7 @@ impl FurrowRepository {
         sqlite_consistent: bool,
     ) -> anyhow::Result<(ObjectId, RewindPlan)> {
         let lock = self.acquire_mutation_lock()?;
-        let plan = self.plan_rewind(target, paths)?;
+        let mut plan = self.plan_rewind(target, paths)?;
         let restore_policy = self.load_policy()?;
         let pre = self.snapshot(
             Some(format!("before rewind to {}", &id_hex(target)[..12])),
@@ -3023,7 +3088,7 @@ impl FurrowRepository {
             target_snapshot: *target,
             paths: paths
                 .iter()
-                .map(|path| path.as_os_str().as_bytes().to_vec())
+                .map(|path| crate::platform::path_bytes(path))
                 .collect(),
         })?;
 
@@ -3072,7 +3137,8 @@ impl FurrowRepository {
         self.clear_restore_intent()?;
         let overlay_restored = self.restore_overlay(&target_snapshot.root_tree);
         FileExt::unlock(&lock)?;
-        overlay_restored.context("restore the composed directory")?;
+        let overlay_held = overlay_restored.context("restore the composed directory")?;
+        plan.held.extend(overlay_held);
         Ok((pre, plan))
     }
 
@@ -3108,9 +3174,9 @@ impl FurrowRepository {
 
     /// Puts the sealed `.cell/` entry back into the overlay's directory,
     /// changing only what differs, so the directory matches the sealed tree.
-    fn restore_overlay(&self, root_tree: &ObjectId) -> anyhow::Result<()> {
+    fn restore_overlay(&self, root_tree: &ObjectId) -> anyhow::Result<Vec<HeldPath>> {
         let Some(overlay) = &self.overlay else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let sealed = self
             .lookup_tree_path(root_tree, overlay::NAME)?
@@ -3123,6 +3189,14 @@ impl FurrowRepository {
         let current = self.capture_overlay_tree()?;
         let mut changes = Vec::new();
         self.diff_directory(current, target, Vec::new(), &[], &mut changes)?;
+        #[cfg(windows)]
+        let held = match target {
+            Some(tree) => self.colliding_paths_at(destination, &tree, &changes)?,
+            None => Vec::new(),
+        };
+        #[cfg(unix)]
+        let held: Vec<HeldPath> = Vec::new();
+        changes.retain(|change| !held.iter().any(|entry| entry.covers(&change.raw_path)));
         let plan = RewindPlan {
             preview_digest: rewind_preview_digest("overlay", None, &changes),
             target: "overlay".to_owned(),
@@ -3136,7 +3210,20 @@ impl FurrowRepository {
         };
         self.apply_plan_at(destination, &entries, &plan, &[])?;
         self.verify_plan_state(destination, &entries, &plan, &[])?;
-        sealed.map_or(Ok(()), |entry| pin_directory(destination, &entry))
+        sealed.map_or(Ok(()), |entry| pin_directory(destination, &entry))?;
+        Ok(held
+            .into_iter()
+            .map(|entry| {
+                let mut raw_path = overlay::NAME.to_vec();
+                raw_path.push(b'/');
+                raw_path.extend_from_slice(&entry.raw_path);
+                HeldPath {
+                    path: display_relative(&raw_path),
+                    raw_path,
+                    reason: entry.reason,
+                }
+            })
+            .collect())
     }
 
     /// The tree of the overlay directory as it is now, or None when absent.
@@ -3168,12 +3255,11 @@ impl FurrowRepository {
         let workspace_file = self.root.join(WORKSPACE_FILE);
         if !self.workspace_id.starts_with("t-") && workspace_file.exists() {
             fs::remove_file(&workspace_file)?;
-            File::open(
+            crate::platform::sync_path(
                 workspace_file
                     .parent()
                     .context("workspace file has no parent")?,
-            )?
-            .sync_all()?;
+            )?;
         }
         if purge {
             self.store.purge_workspace(&self.workspace_id)?;
@@ -3192,20 +3278,14 @@ impl FurrowRepository {
         let Ok(pid) = pid.trim().parse::<i32>() else {
             return false;
         };
-        unsafe { libc::kill(pid, 0) == 0 }
+        crate::platform::process_alive(pid as u32)
     }
 
     fn stop_watcher(&self) -> anyhow::Result<()> {
         let pid_path = self.workspace_data_dir().join("daemon.pid");
         if let Ok(pid) = fs::read_to_string(&pid_path) {
             if let Ok(pid) = pid.trim().parse::<i32>() {
-                let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-                if result != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(error.into());
-                    }
-                }
+                crate::platform::stop_process(pid as u32)?;
             }
         }
         if pid_path.exists() {
@@ -3429,6 +3509,7 @@ impl FurrowRepository {
             && index.link_has_no_known_sibling(relative)?)
     }
 
+    #[cfg(unix)]
     fn capture_directory_impl(
         &self,
         path: &Path,
@@ -3485,9 +3566,100 @@ impl FurrowRepository {
         Ok(tree_id)
     }
 
+    #[cfg(windows)]
+    fn capture_directory_impl(
+        &self,
+        path: &Path,
+        index: &PathIndex,
+        policy: &CapturePolicy,
+    ) -> anyhow::Result<ObjectId> {
+        let relative = self
+            .logical_path(path)
+            .context("directory is outside the tree")?;
+        // Windows supplies metadata with FindFirstFile/FindNextFile. Feed the
+        // existing disk-backed index directly, then build in its byte order;
+        // sorting names first would discard that metadata and reopen each file.
+        if let Some(names) = policy.tracked_children(&relative) {
+            for name in names {
+                let child_path = path.join(name);
+                let child_relative = self
+                    .logical_path(&child_path)
+                    .context("child is outside the tree")?;
+                if policy.excludes_bytes(&child_relative) {
+                    continue;
+                }
+                let metadata = match fs::symlink_metadata(&child_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if let Some(entry) =
+                    self.capture_path_entry_with_metadata(&child_path, index, policy, &metadata)?
+                {
+                    index.upsert(&child_relative, &relative, &entry)?;
+                }
+            }
+            let tree_id = self.rebuild_indexed_directory(index, &relative)?;
+            self.store
+                .cache_directory(&self.workspace_id, &relative, &tree_id)?;
+            return Ok(tree_id);
+        }
+        let overlay = self
+            .overlay
+            .as_ref()
+            .filter(|overlay| path == self.root && overlay.source().is_dir());
+        for child in fs::read_dir(path)? {
+            let child = child?;
+            if overlay.is_some() && child.file_name().as_bytes() == overlay::NAME {
+                continue;
+            }
+            let child_path = child.path();
+            if child_path.starts_with(self.store.root())
+                || child_path == self.root.join(".furrow")
+                || child_path == self.root.join(WORKSPACE_FILE)
+                || child_path == self.root.join(FAMILY_FILE)
+                || child_path == self.root.join(FORK_FILE)
+            {
+                continue;
+            }
+            let child_relative = self
+                .logical_path(&child_path)
+                .context("child is outside the tree")?;
+            if policy.excludes_bytes(&child_relative) {
+                continue;
+            }
+            let metadata = child.metadata()?;
+            // NTFS listing timestamps can predate the directory's last child
+            // creation. Refresh directories so a first seal records their true
+            // time, while regular files keep the listing-only stat-cache path.
+            let metadata = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::symlink_metadata(&child_path)?
+            } else {
+                metadata
+            };
+            if let Some(entry) =
+                self.capture_path_entry_with_metadata(&child_path, index, policy, &metadata)?
+            {
+                index.upsert(&child_relative, &relative, &entry)?;
+            }
+        }
+        if let Some(overlay) = overlay {
+            if !policy.excludes_bytes(overlay::NAME) {
+                if let Some(entry) = self.capture_path_entry(overlay.source(), index, policy)? {
+                    index.upsert(overlay::NAME, &relative, &entry)?;
+                }
+            }
+        }
+        let tree_id = self.rebuild_indexed_directory(index, &relative)?;
+        self.store
+            .cache_directory(&self.workspace_id, &relative, &tree_id)?;
+        Ok(tree_id)
+    }
+
     /// The sorted child names of a directory of the tree; the root's include
     /// the overlay's when its directory exists (an absent one is not a tree
     /// that changed under the walk, it is an entry that is not there).
+    #[cfg(unix)]
     fn children(
         &self,
         path: &Path,
@@ -3502,6 +3674,7 @@ impl FurrowRepository {
         })
     }
 
+    #[cfg(unix)]
     fn child_path(&self, directory: &Path, name: &OsStr) -> PathBuf {
         match &self.overlay {
             Some(overlay) if directory == self.root && name.as_bytes() == overlay::NAME => {
@@ -3519,7 +3692,7 @@ impl FurrowRepository {
             .or_else(|| {
                 path.strip_prefix(&self.root)
                     .ok()
-                    .map(|relative| relative.as_os_str().as_bytes().to_vec())
+                    .map(crate::platform::path_bytes)
             })
     }
 
@@ -3543,8 +3716,18 @@ impl FurrowRepository {
     ) -> anyhow::Result<Option<TreeEntry>> {
         let metadata =
             fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        self.capture_path_entry_with_metadata(path, index, policy, &metadata)
+    }
+
+    fn capture_path_entry_with_metadata(
+        &self,
+        path: &Path,
+        index: &PathIndex,
+        policy: &CapturePolicy,
+        metadata: &fs::Metadata,
+    ) -> anyhow::Result<Option<TreeEntry>> {
         let file_type = metadata.file_type();
-        let (secs, nanos) = metadata_time(&metadata);
+        let (secs, nanos) = metadata_time(metadata);
         let relative = self
             .logical_path(path)
             .context("captured path is outside the tree")?;
@@ -3553,12 +3736,12 @@ impl FurrowRepository {
             .next()
             .context("captured path has no filename")?
             .to_vec();
-        let mode = metadata.permissions().mode();
+        let mode = self.recorded_mode(&relative, metadata.mode())?;
         let class = content_class::classify(&relative);
         if file_type.is_file() {
-            index.note_link(&relative, hardlink::identity(&metadata))?;
+            index.note_link(&relative, hardlink::identity(metadata))?;
             return self
-                .capture_file_entry(path, &relative, name, class, &metadata)
+                .capture_file_entry(path, &relative, name, class, metadata)
                 .map(Some);
         }
         let xattrs = if file_type.is_dir() {
@@ -3589,7 +3772,7 @@ impl FurrowRepository {
                 name,
                 kind: EntryKind::Symlink,
                 target: None,
-                link_target: fs::read_link(path)?.as_os_str().as_bytes().to_vec(),
+                link_target: crate::platform::path_bytes(&fs::read_link(path)?),
                 mode,
                 size: metadata.len(),
                 mtime_secs: secs,
@@ -3626,7 +3809,7 @@ impl FurrowRepository {
             kind: EntryKind::Directory,
             target: Some(target),
             link_target: Vec::new(),
-            mode: metadata.permissions().mode(),
+            mode: self.recorded_mode(&relative, metadata.mode())?,
             size: 0,
             mtime_secs,
             mtime_nanos,
@@ -3694,7 +3877,30 @@ impl FurrowRepository {
                 .with_context(|| format!("capture file {}", path.display()))
                 .and_then(|read| self.cache_read(relative, read))?,
         };
-        Ok(file_entry(name, class, &row))
+        let mut entry = file_entry(name, class, &row);
+        entry.mode = self.recorded_mode(relative, entry.mode)?;
+        Ok(entry)
+    }
+
+    /// Windows keeps the mode of an imported or previously sealed entry, as
+    /// core.fileMode=false does. A newly created regular file starts at 0644.
+    fn recorded_mode(&self, relative: &[u8], local: u32) -> anyhow::Result<u32> {
+        #[cfg(windows)]
+        if let Some(head) = self.store.workspace_head(&self.workspace_id)? {
+            let snapshot: Snapshot = self.store.read_struct(&head, ObjectKind::Snapshot)?;
+            if let Some(entry) = self.lookup_tree_path(&snapshot.root_tree, relative)? {
+                if matches!(
+                    (entry.kind, local & 0o170000),
+                    (EntryKind::File, 0o100000)
+                        | (EntryKind::Directory, 0o040000)
+                        | (EntryKind::Symlink, 0o120000)
+                ) {
+                    return Ok(entry.mode);
+                }
+            }
+        }
+        let _ = relative;
+        Ok(local)
     }
 
     fn unchanged_row(
@@ -3720,6 +3926,8 @@ impl FurrowRepository {
 
     /// Reads a file into the store, retrying while it changes underneath.
     fn read_file(&self, path: &Path) -> anyhow::Result<FileRead> {
+        #[cfg(all(test, windows))]
+        windows_tests::CONTENT_READS.with(|count| count.set(count.get() + 1));
         for _ in 0..3 {
             let (secs, nanos) = now();
             let read_at_nanos = secs.saturating_mul(1_000_000_000) + i64::from(nanos);
@@ -3772,10 +3980,10 @@ impl FurrowRepository {
 
     fn capture_xattrs(&self, path: &Path) -> anyhow::Result<Option<ObjectId>> {
         let mut entries = Vec::new();
-        match xattr::list(path) {
+        match crate::platform::xattr::list(path) {
             Ok(names) => {
                 for name in names.filter(|name| !system_attrs::is_system_managed(name)) {
-                    if let Some(value) = xattr::get(path, &name)
+                    if let Some(value) = crate::platform::xattr::get(path, &name)
                         .with_context(|| format!("read xattr {:?} on {}", name, path.display()))?
                     {
                         entries.push(XattrEntry {
@@ -3896,6 +4104,22 @@ impl FurrowRepository {
         Ok(result)
     }
 
+    /// Windows directory timestamps must not turn an unchanged working tree
+    /// into a divergence or invalidate a merge's content precondition.
+    fn working_trees_match(&self, left: &ObjectId, right: &ObjectId) -> anyhow::Result<bool> {
+        if left == right {
+            return Ok(true);
+        }
+        #[cfg(windows)]
+        {
+            let mut changes = Vec::new();
+            self.diff_directory(Some(*left), Some(*right), Vec::new(), &[], &mut changes)?;
+            Ok(changes.is_empty())
+        }
+        #[cfg(unix)]
+        Ok(false)
+    }
+
     fn diff_directory(
         &self,
         before: Option<ObjectId>,
@@ -3941,7 +4165,10 @@ impl FurrowRepository {
         }
         path.extend_from_slice(&name);
 
-        if selected(&path, selections) {
+        let parent_selected = selected(&path, selections);
+        #[cfg(windows)]
+        let change_start = changes.len();
+        if parent_selected {
             changes.push(RewindChange {
                 path: display_relative(&path),
                 action: match (&before, &after) {
@@ -3966,6 +4193,16 @@ impl FurrowRepository {
             if before_tree.is_some() || after_tree.is_some() {
                 self.diff_directory(before_tree, after_tree, path, selections, changes)?;
             }
+        }
+        // A changed child needs its container's recorded time restored too.
+        // Prune the container only when recursive comparison found no actual
+        // child changes, including when nested stale times changed tree IDs.
+        #[cfg(windows)]
+        if parent_selected
+            && changes.len() == change_start + 1
+            && directory_metadata_matches(before.as_ref(), after.as_ref())
+        {
+            changes.pop();
         }
         Ok(())
     }
@@ -4054,11 +4291,10 @@ impl FurrowRepository {
             return Ok(false);
         }
         if entry.kind == EntryKind::Symlink {
-            return Ok(fs::read_link(path)?.as_os_str().as_bytes() == entry.link_target);
+            return Ok(crate::platform::path_bytes(&fs::read_link(path)?) == entry.link_target);
         }
-        if metadata.permissions().mode() != entry.mode
-            || metadata.mtime() != entry.mtime_secs
-            || metadata.mtime_nsec().max(0) as u32 != entry.mtime_nanos
+        if (!cfg!(windows) && metadata.mode() != entry.mode)
+            || !crate::platform::time_matches(&metadata, entry.mtime_secs, entry.mtime_nanos)
         {
             return Ok(false);
         }
@@ -4090,7 +4326,7 @@ impl FurrowRepository {
         let expected: Xattrs = self.store.read_struct(&expected, ObjectKind::Xattrs)?;
         for entry in restorable_xattrs(expected.entries) {
             let name = OsStr::from_bytes(&entry.name);
-            let actual = match xattr::get(path, name) {
+            let actual = match crate::platform::xattr::get(path, name) {
                 Ok(actual) => actual,
                 Err(error)
                     if matches!(
@@ -4105,7 +4341,7 @@ impl FurrowRepository {
             if actual.as_deref() == Some(entry.value.as_slice()) {
                 continue;
             }
-            match xattr::set(path, name, &entry.value) {
+            match crate::platform::xattr::set(path, name, &entry.value) {
                 Ok(()) => {}
                 Err(error)
                     if matches!(
@@ -4342,7 +4578,7 @@ impl FurrowRepository {
                     self.restore_file_with_sync(&destination, &flat.entry, mode.sync_each_file)?
                 }
                 EntryKind::Symlink => {
-                    std::os::unix::fs::symlink(
+                    crate::platform::symlink(
                         OsString::from_vec(flat.entry.link_target.clone()),
                         &destination,
                     )?;
@@ -4351,12 +4587,7 @@ impl FurrowRepository {
                     filetime::set_symlink_file_times(&destination, mtime, mtime)?;
                 }
                 EntryKind::Fifo => {
-                    let cpath = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
-                    let result =
-                        unsafe { libc::mkfifo(cpath.as_ptr(), flat.entry.mode as libc::mode_t) };
-                    if result != 0 {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
+                    crate::platform::create_fifo(&destination, flat.entry.mode)?;
                 }
                 EntryKind::SocketMarker => {}
                 EntryKind::Directory => unreachable!(),
@@ -4439,11 +4670,15 @@ impl FurrowRepository {
         if sync_file {
             temp.as_file().sync_all()?;
         }
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(entry.mode))?;
+        crate::platform::set_mode(temp.path(), entry.mode)?;
         if let Some(xattrs_id) = entry.xattrs {
             let xattrs: Xattrs = self.store.read_struct(&xattrs_id, ObjectKind::Xattrs)?;
             for xattr in restorable_xattrs(xattrs.entries) {
-                match xattr::set(temp.path(), OsStr::from_bytes(&xattr.name), &xattr.value) {
+                match crate::platform::xattr::set(
+                    temp.path(),
+                    OsStr::from_bytes(&xattr.name),
+                    &xattr.value,
+                ) {
                     Ok(()) => {}
                     Err(error)
                         if matches!(
@@ -4454,7 +4689,7 @@ impl FurrowRepository {
                 }
             }
         }
-        temp.persist(destination).map_err(|error| error.error)?;
+        crate::platform::persist(temp, destination).map_err(|error| error.error)?;
         let mtime = FileTime::from_unix_time(entry.mtime_secs, entry.mtime_nanos);
         filetime::set_file_mtime(destination, mtime)?;
         Ok(())
@@ -4484,7 +4719,7 @@ impl FurrowRepository {
     fn write_restore_intent(&self, intent: &RestoreIntent) -> anyhow::Result<()> {
         let path = self.restore_intent_path();
         atomic_write(&path, &serde_json::to_vec(intent)?)?;
-        File::open(path.parent().context("restore intent has no parent")?)?.sync_all()?;
+        crate::platform::sync_path(path.parent().context("restore intent has no parent")?)?;
         Ok(())
     }
 
@@ -4492,7 +4727,7 @@ impl FurrowRepository {
         let path = self.restore_intent_path();
         if path.exists() {
             fs::remove_file(&path)?;
-            File::open(path.parent().context("restore intent has no parent")?)?.sync_all()?;
+            crate::platform::sync_path(path.parent().context("restore intent has no parent")?)?;
         }
         Ok(())
     }
@@ -4721,7 +4956,7 @@ fn nearest_directory(path: &Path) -> Option<PathBuf> {
 /// Gives the overlay directory itself the mode and mtime its `.cell/` entry
 /// recorded; the plan restores everything inside it, never the directory.
 fn pin_directory(destination: &Path, entry: &TreeEntry) -> anyhow::Result<()> {
-    fs::set_permissions(destination, fs::Permissions::from_mode(entry.mode & 0o7777))?;
+    crate::platform::set_mode(destination, entry.mode & 0o7777)?;
     let mtime = FileTime::from_unix_time(entry.mtime_secs, entry.mtime_nanos);
     filetime::set_file_mtime(destination, mtime)?;
     Ok(())
@@ -4769,7 +5004,25 @@ fn stable_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
         && before.mtime_nsec() == after.mtime_nsec()
         && before.ctime() == after.ctime()
         && before.ctime_nsec() == after.ctime_nsec()
-        && before.mode() == after.mode()
+        && crate::platform::cache_mode(before) == crate::platform::cache_mode(after)
+}
+
+// NTFS directory listings can retain an earlier last-write time until another
+// process opens the directory. Compare children recursively instead of replacing
+// their container: child trees can differ solely through stale directory times.
+#[cfg(windows)]
+fn directory_metadata_matches(before: Option<&TreeEntry>, after: Option<&TreeEntry>) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    if before.kind != EntryKind::Directory || after.kind != EntryKind::Directory {
+        return false;
+    }
+    let mut comparable = before.clone();
+    comparable.target = after.target;
+    comparable.mtime_secs = after.mtime_secs;
+    comparable.mtime_nanos = after.mtime_nanos;
+    comparable == *after
 }
 
 fn directory_target_only_difference(before: Option<&TreeEntry>, after: Option<&TreeEntry>) -> bool {
@@ -4864,6 +5117,15 @@ fn restorable_xattrs(entries: Vec<XattrEntry>) -> impl Iterator<Item = XattrEntr
         .filter(|entry| !system_attrs::is_system_managed(OsStr::from_bytes(&entry.name)))
 }
 
+#[cfg(windows)]
+fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
+    cached.size == metadata.len()
+        && cached.mtime_secs == metadata.mtime()
+        && cached.mtime_nanos == metadata.mtime_nsec()
+        && cached.mode == crate::platform::cache_mode(metadata)
+}
+
+#[cfg(unix)]
 fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
     cached.device == metadata.dev()
         && cached.inode == metadata.ino()
@@ -4884,11 +5146,9 @@ fn entry_matches_metadata(entry: &TreeEntry, metadata: &fs::Metadata) -> bool {
         EntryKind::Fifo => file_type.is_fifo(),
         EntryKind::SocketMarker => file_type.is_socket(),
     };
-    let (secs, nanos) = metadata_time(metadata);
     kind_matches
-        && entry.mode == metadata.mode()
-        && entry.mtime_secs == secs
-        && entry.mtime_nanos == nanos
+        && (cfg!(windows) || entry.mode == metadata.mode())
+        && crate::platform::time_matches(metadata, entry.mtime_secs, entry.mtime_nanos)
         && (entry.kind != EntryKind::File || entry.size == metadata.len())
 }
 
@@ -4918,7 +5178,7 @@ fn cached_from_read(read: &FileRead) -> CachedFile {
         mtime_nanos: metadata.mtime_nsec(),
         ctime_secs: metadata.ctime(),
         ctime_nanos: metadata.ctime_nsec(),
-        mode: metadata.mode(),
+        mode: crate::platform::cache_mode(metadata),
         blob_id: read.blob,
         xattrs: read.xattrs,
         sqlite: read.sqlite,
@@ -4932,7 +5192,7 @@ fn file_entry(name: Vec<u8>, class: ContentClass, row: &CachedFile) -> TreeEntry
         kind: EntryKind::File,
         target: Some(row.blob_id),
         link_target: Vec::new(),
-        mode: row.mode,
+        mode: crate::platform::snapshot_mode(row.mode),
         size: row.size,
         mtime_secs: row.mtime_secs,
         mtime_nanos: row.mtime_nanos.max(0) as u32,
@@ -4962,7 +5222,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
+    crate::platform::persist(temp, path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -5269,7 +5529,7 @@ fn validate_relative_path(path: &[u8]) -> anyhow::Result<()> {
 fn relative_parent(path: &[u8]) -> Vec<u8> {
     Path::new(OsStr::from_bytes(path))
         .parent()
-        .map_or_else(Vec::new, |parent| parent.as_os_str().as_bytes().to_vec())
+        .map_or_else(Vec::new, crate::platform::path_bytes)
 }
 
 fn path_depth(path: &[u8]) -> usize {
@@ -5315,10 +5575,9 @@ fn ensure_safe_parent(root: &Path, destination: &Path) -> anyhow::Result<()> {
 /// wrote or one that was already right.
 fn stat_matches_entry(metadata: &fs::Metadata, entry: &TreeEntry) -> bool {
     metadata.is_file()
-        && metadata.permissions().mode() == entry.mode
+        && (cfg!(windows) || metadata.mode() == entry.mode)
         && metadata.len() == entry.size
-        && metadata.mtime() == entry.mtime_secs
-        && metadata.mtime_nsec().max(0) as u32 == entry.mtime_nanos
+        && crate::platform::time_matches(metadata, entry.mtime_secs, entry.mtime_nanos)
 }
 
 /// How a plan is written: whether each file is flushed as it lands, and the
@@ -5348,7 +5607,7 @@ fn changed_path_matches(root: &Path, path: &Path, expected: &[u8]) -> bool {
     absolute
         .strip_prefix(root)
         .ok()
-        .is_some_and(|relative| relative.as_os_str().as_bytes() == expected)
+        .is_some_and(|relative| crate::platform::path_bytes(relative) == expected)
 }
 
 fn changed_path_is_identity(root: &Path, path: &Path) -> bool {
@@ -5360,7 +5619,7 @@ fn changed_path_is_identity(root: &Path, path: &Path) -> bool {
     absolute
         .strip_prefix(root)
         .ok()
-        .is_some_and(|relative| is_identity_path(relative.as_os_str().as_bytes()))
+        .is_some_and(|relative| is_identity_path(&crate::platform::path_bytes(relative)))
 }
 
 fn is_identity_path(path: &[u8]) -> bool {
@@ -5368,6 +5627,22 @@ fn is_identity_path(path: &[u8]) -> bool {
 }
 
 fn test_pause(variable: &str) {
+    if let Some(ready) = std::env::var_os(format!("{variable}_GATE")) {
+        // The interference harness must rendezvous at the real boundary;
+        // sampling a short sleep can miss it on a loaded machine.
+        let ready = PathBuf::from(ready);
+        fs::write(&ready, b"ready").expect("publish test boundary");
+        let release = ready.with_extension("release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !release.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test boundary was not released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        return;
+    }
     let Some(milliseconds) = std::env::var_os(variable)
         .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
     else {
@@ -5404,10 +5679,7 @@ const OWNER_WRITABLE_DIR: u32 = 0o700;
 /// read-only directory that holds files be written at all.
 fn prepare_directory(destination: &Path, entry: &TreeEntry) -> anyhow::Result<()> {
     fs::create_dir_all(destination)?;
-    fs::set_permissions(
-        destination,
-        fs::Permissions::from_mode(entry.mode | OWNER_WRITABLE_DIR),
-    )?;
+    crate::platform::set_mode(destination, entry.mode | OWNER_WRITABLE_DIR)?;
     Ok(())
 }
 
@@ -5415,7 +5687,7 @@ fn prepare_directory(destination: &Path, entry: &TreeEntry) -> anyhow::Result<()
 /// first, after every child is written, so a child write cannot move the
 /// captured timestamp and a read-only mode cannot block the children.
 fn finish_directory(destination: &Path, entry: &TreeEntry) -> anyhow::Result<()> {
-    fs::set_permissions(destination, fs::Permissions::from_mode(entry.mode))?;
+    crate::platform::set_mode(destination, entry.mode)?;
     let mtime = FileTime::from_unix_time(entry.mtime_secs, entry.mtime_nanos);
     filetime::set_file_mtime(destination, mtime)?;
     Ok(())
@@ -5467,9 +5739,11 @@ fn sync_pull_outcome(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod hardlink_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod odd_names_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod seal_tests;
+#[cfg(all(test, windows))]
+mod windows_tests;

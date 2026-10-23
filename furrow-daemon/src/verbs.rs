@@ -123,16 +123,22 @@ impl Verb for Restore {
         let target = repo.resolve_snapshot(&a.snapshot)?;
         let plan = repo.plan_rewind(&target, &a.paths)?;
         if plan.changes.is_empty() {
-            return Ok(json!({"restored": id_hex(&target), "changes": 0}));
+            let answer = json!({"restored": id_hex(&target), "changes": 0});
+            #[cfg(windows)]
+            let answer = furrow::platform::with_held(answer, &plan.held)?;
+            return Ok(answer);
         }
         let (pre, applied) = repo
             .rewind(&target, &a.paths, a.sqlite_consistent)
             .context("rewind failed")?;
-        Ok(json!({
+        let answer = json!({
             "restored": applied.target,
             "pre_rewind_snapshot": id_hex(&pre),
             "changes": applied.changes.len(),
-        }))
+        });
+        #[cfg(windows)]
+        let answer = furrow::platform::with_held(answer, &applied.held)?;
+        Ok(answer)
     }
 }
 

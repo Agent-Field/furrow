@@ -3,6 +3,8 @@ use crate::catalog::{CachedFile, Catalog, PackCheckpoint, TimelineRow};
 use crate::fault;
 use crate::gc::{self, GcReport};
 use crate::model::{ObjectId, ObjectKind, SnapshotTrigger};
+use crate::platform::FileReadAt;
+use crate::platform::OsStringExt;
 use crate::refs::{RefLog, RefRecord};
 use crate::retention::RetentionLog;
 use anyhow::Context;
@@ -12,8 +14,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::FileExt as UnixFileExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -345,7 +345,7 @@ impl ObjectStore {
         let detached = workspace_dir.join("detached");
         if detached.exists() {
             fs::remove_file(detached)?;
-            File::open(&workspace_dir)?.sync_all()?;
+            crate::platform::sync_path(&workspace_dir)?;
         }
         let refs = RefLog::open(&self.root, id)?;
         let ref_head = refs.head()?.map(|record| record.snapshot_id);
@@ -424,7 +424,7 @@ impl ObjectStore {
             .write(true)
             .open(marker)?;
         file.sync_all()?;
-        File::open(workspace_dir)?.sync_all()?;
+        crate::platform::sync_path(workspace_dir)?;
         self.catalog.detach_workspace(id)?;
         Ok(())
     }
@@ -434,7 +434,7 @@ impl ObjectStore {
         let workspace_dir = self.workspace_data_dir(id);
         if workspace_dir.exists() {
             fs::remove_dir_all(&workspace_dir)?;
-            File::open(self.root.join("workspaces"))?.sync_all()?;
+            crate::platform::sync_path(self.root.join("workspaces"))?;
         }
         Ok(())
     }
@@ -709,8 +709,8 @@ impl ObjectStore {
             .open(&temporary)?;
         writeln!(file, "{pack}")?;
         file.sync_all()?;
-        fs::rename(temporary, packs.join(CURRENT_FILE))?;
-        File::open(&packs)?.sync_all()?;
+        crate::platform::rename(temporary, packs.join(CURRENT_FILE))?;
+        crate::platform::sync_path(&packs)?;
         *self.active_pack.borrow_mut() = pack.to_owned();
         Ok(())
     }
@@ -731,7 +731,7 @@ impl ObjectStore {
         };
         let path = self.root.join("packs").join(&run.pack);
         if path.exists() {
-            File::open(path)?.sync_data()?;
+            crate::platform::sync_data(path)?;
         }
         self.advance_checkpoint(&run)
     }
@@ -979,7 +979,10 @@ pub(crate) fn wait_lock(file: &File, exclusive: bool) -> anyhow::Result<()> {
         };
         match result {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
                 anyhow::ensure!(
                     started.elapsed() < crate::catalog::WRITER_WAIT,
                     "store writer is still busy after waiting {} seconds; retry the operation",
@@ -1008,8 +1011,8 @@ fn read_or_initialize_current(root: &Path) -> anyhow::Result<String> {
         .open(&temporary)?;
     writeln!(file, "{INITIAL_PACK_NAME}")?;
     file.sync_all()?;
-    fs::rename(temporary, current)?;
-    File::open(packs)?.sync_all()?;
+    crate::platform::rename(temporary, current)?;
+    crate::platform::sync_path(packs)?;
     Ok(INITIAL_PACK_NAME.to_owned())
 }
 
@@ -1062,8 +1065,8 @@ fn write_root_path(workspace_dir: &Path, root: &[u8]) -> anyhow::Result<()> {
         .open(&temporary)?;
     file.write_all(root)?;
     file.sync_all()?;
-    fs::rename(&temporary, workspace_dir.join("root.path"))?;
-    File::open(workspace_dir)?.sync_all()?;
+    crate::platform::rename(&temporary, workspace_dir.join("root.path"))?;
+    crate::platform::sync_path(workspace_dir)?;
     Ok(())
 }
 

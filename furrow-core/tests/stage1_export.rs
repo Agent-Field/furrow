@@ -54,6 +54,7 @@ fn strict_decode(frame: &[u8]) -> (serde_json::Value, Vec<(String, Vec<u8>)>) {
     (header, objects)
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn export_frames_decode() {
     let src = source();
@@ -89,6 +90,7 @@ fn export_frames_decode() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn export_order_is_snapshot_trees_xattrs_blobs_chunks() {
     let src = source();
@@ -101,6 +103,7 @@ fn export_order_is_snapshot_trees_xattrs_blobs_chunks() {
 
 /// A taker can open an object only after its parent, so the first frame must
 /// carry the snapshot and the trees before any blob.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn the_first_frame_holds_the_snapshot_and_trees_before_any_blob() {
     let src = source();
@@ -151,6 +154,7 @@ fn send_ranks(src: &Source, report: &furrow::exchange::export::ExportReport) -> 
         .collect()
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn an_object_larger_than_max_frame_gets_a_frame_of_its_own() {
     let src = source();
@@ -165,6 +169,7 @@ fn an_object_larger_than_max_frame_gets_a_frame_of_its_own() {
         .all(|info| info.bytes <= 1024 || info.objects == 1));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn second_export_is_empty() {
     let src = source();
@@ -181,6 +186,7 @@ fn second_export_is_empty() {
     assert_eq!(second.head_rid, first.head_rid);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn published_appends_header_rids_and_deletes_frame_files() {
     let src = source();
@@ -197,6 +203,7 @@ fn published_appends_header_rids_and_deletes_frame_files() {
     assert_eq!(published(&ledger, &paths).unwrap(), 0);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn published_refuses_a_file_that_is_not_a_frame() {
     let src = source();
@@ -208,6 +215,7 @@ fn published_refuses_a_file_that_is_not_a_frame() {
     assert!(ledger.recorded().unwrap().is_empty());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn reexport_after_crash_is_identical() {
     let src = source();
@@ -229,6 +237,7 @@ fn reexport_after_crash_is_identical() {
     assert_eq!(first.head_rid, again.head_rid);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_crash_after_some_frames_were_published_resends_only_the_rest() {
     let src = source();
@@ -249,6 +258,7 @@ fn a_crash_after_some_frames_were_published_resends_only_the_rest() {
     assert_eq!(unsent, resent);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn new_ledger_resends_everything() {
     let src = source();
@@ -267,6 +277,7 @@ fn new_ledger_resends_everything() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_ledger_name_must_be_sixteen_lowercase_hex_characters() {
     let dir = tempfile::tempdir().unwrap();
@@ -283,6 +294,7 @@ fn a_ledger_name_must_be_sixteen_lowercase_hex_characters() {
     assert!(Ledger::named(dir.path(), LEDGER).is_ok());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn head_that_is_not_in_the_store_is_refused() {
     let src = source();
@@ -299,6 +311,7 @@ fn head_that_is_not_in_the_store_is_refused() {
     assert!(error.to_string().contains("not complete"), "{error:#}");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn keys_never_on_argv_or_disk() {
     let cell_hex = hex::encode([0x11; 32]);
@@ -362,6 +375,7 @@ fn keys_never_on_argv_or_disk() {
 /// The default frame size is the contract's `BulkFrame` (§22.6), not the old
 /// 1 MiB: a bulk take fetches whole megabyte-scale objects in one frame. The
 /// fixture's 3 MiB blob lands in a frame the old default would have split.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn the_default_frame_size_is_bulk_frame() {
     assert_eq!(DEFAULT_MAX_FRAME, 8 << 20);

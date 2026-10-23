@@ -2,12 +2,16 @@ use furrow_daemon::{Config, Server, Stop};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tempfile::TempDir;
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 struct Daemon {
     dir: TempDir,
@@ -120,6 +124,7 @@ fn snapshot(sealed: &Value) -> String {
     sealed["snapshot"].as_str().unwrap().to_owned()
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn seal_and_restore_round_trip() {
     let daemon = Daemon::start(Duration::from_secs(60));
@@ -150,6 +155,7 @@ fn seal_and_restore_round_trip() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn health_and_refusals_keep_the_connection() {
     let daemon = Daemon::start(Duration::from_secs(60));
@@ -183,6 +189,7 @@ fn health_and_refusals_keep_the_connection() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn stores_run_in_parallel_and_each_has_one_writer() {
     let daemon = Daemon::start(Duration::from_secs(60));
@@ -224,6 +231,7 @@ fn stores_run_in_parallel_and_each_has_one_writer() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_client_dying_mid_request_does_not_stop_the_store() {
     let daemon = Daemon::start(Duration::from_secs(60));
@@ -256,11 +264,16 @@ fn a_client_dying_mid_request_does_not_stop_the_store() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn the_socket_is_owner_only_and_single() {
     let daemon = Daemon::start(Duration::from_secs(60));
-    let mode = fs::metadata(daemon.socket()).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600);
+    // P2/W5: socket permission bits exist only on Unix; exclusion holds everywhere.
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(daemon.socket()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
     let config = Config {
         socket: daemon.socket(),
         idle: Duration::from_secs(1),
@@ -272,6 +285,7 @@ fn the_socket_is_owner_only_and_single() {
     daemon.finish();
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn an_idle_daemon_exits_and_removes_its_socket() {
     let daemon = Daemon::start(Duration::from_millis(200));
@@ -281,6 +295,7 @@ fn an_idle_daemon_exits_and_removes_its_socket() {
     assert!(!Path::new(&socket).exists());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_shutdown_request_stops_the_daemon() {
     let mut daemon = Daemon::start(Duration::from_secs(60));
@@ -291,6 +306,7 @@ fn a_shutdown_request_stops_the_daemon() {
     assert!(!daemon.socket().exists());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn shutdown_finishes_the_request_in_flight() {
     let daemon = Daemon::start(Duration::from_secs(60));

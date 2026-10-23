@@ -5,6 +5,9 @@
 //! a sibling staging directory and published with one rename, so callers never
 //! observe a partial fork.
 
+#[cfg(unix)]
+use crate::platform::OsStrExt;
+use crate::platform::{symlink, FileTypeExt, MetadataExt};
 use anyhow::{bail, Context};
 use filetime::{set_file_times, set_symlink_file_times, FileTime};
 use serde::{Deserialize, Serialize};
@@ -15,8 +18,6 @@ use std::fs::{self, File, Metadata, OpenOptions, ReadDir};
 use std::io::{self, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -297,7 +298,7 @@ pub(crate) fn fork_workspace_excluding(
             apply_metadata(&source_path, &destination_path, &metadata, true)?;
             counters.symlinks += 1;
         } else if file_type.is_fifo() {
-            create_fifo(&destination_path, metadata.permissions().mode())
+            create_fifo(&destination_path, metadata.mode())
                 .with_context(|| format!("create FIFO {}", destination_path.display()))?;
             apply_metadata(&source_path, &destination_path, &metadata, false)?;
             counters.fifos += 1;
@@ -306,7 +307,7 @@ pub(crate) fn fork_workspace_excluding(
         }
     }
 
-    fs::rename(&staging_path, &destination).with_context(|| {
+    crate::platform::rename(&staging_path, &destination).with_context(|| {
         format!(
             "publish fork {} as {}",
             staging_path.display(),
@@ -381,9 +382,9 @@ fn try_atomic_hierarchy_clone(
     if source_has_hardlinks || counters.skipped_special > 0 {
         return Ok(None);
     }
-    fs::rename(staging_path, destination)
+    crate::platform::rename(staging_path, destination)
         .with_context(|| format!("publish fork {}", destination.display()))?;
-    File::open(destination_parent)?.sync_all()?;
+    crate::platform::sync_path(destination_parent)?;
     staging.armed = false;
     Ok(Some(ForkReport {
         tier: ForkTier::NativeCow,
@@ -498,6 +499,7 @@ fn measure_cloned_hierarchy(source: &Path, root: &Path) -> anyhow::Result<(Count
     Ok((counters, source_has_hardlinks))
 }
 
+#[cfg(unix)]
 fn create_fifo(path: &Path, mode: u32) -> io::Result<()> {
     use std::ffi::CString;
 
@@ -509,6 +511,11 @@ fn create_fifo(path: &Path, mode: u32) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(windows)]
+fn create_fifo(path: &Path, mode: u32) -> io::Result<()> {
+    crate::platform::create_fifo(path, mode)
 }
 
 fn unique_staging_path(parent: &Path, destination_name: &std::ffi::OsStr) -> PathBuf {
@@ -655,11 +662,8 @@ fn apply_metadata(
         set_symlink_file_times(destination, accessed, modified)
             .with_context(|| format!("set symlink times on {}", destination.display()))?;
     } else {
-        fs::set_permissions(
-            destination,
-            fs::Permissions::from_mode(metadata.permissions().mode()),
-        )
-        .with_context(|| format!("set mode on {}", destination.display()))?;
+        crate::platform::set_mode(destination, metadata.mode())
+            .with_context(|| format!("set mode on {}", destination.display()))?;
         set_file_times(destination, accessed, modified)
             .with_context(|| format!("set times on {}", destination.display()))?;
     }
@@ -667,13 +671,13 @@ fn apply_metadata(
 }
 
 fn copy_xattrs(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    let names = xattr::list(source)
+    let names = crate::platform::xattr::list(source)
         .with_context(|| format!("list extended attributes on {}", source.display()))?;
     for name in names {
-        if let Some(value) = xattr::get(source, &name).with_context(|| {
+        if let Some(value) = crate::platform::xattr::get(source, &name).with_context(|| {
             format!("read extended attribute {:?} on {}", name, source.display())
         })? {
-            if xattr::get(destination, &name).with_context(|| {
+            if crate::platform::xattr::get(destination, &name).with_context(|| {
                 format!(
                     "read existing extended attribute {:?} on {}",
                     name,
@@ -683,7 +687,7 @@ fn copy_xattrs(source: &Path, destination: &Path) -> anyhow::Result<()> {
             {
                 continue;
             }
-            xattr::set(destination, &name, &value).with_context(|| {
+            crate::platform::xattr::set(destination, &name, &value).with_context(|| {
                 format!(
                     "set extended attribute {:?} on {}",
                     name,
@@ -695,7 +699,7 @@ fn copy_xattrs(source: &Path, destination: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

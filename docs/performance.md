@@ -202,3 +202,66 @@ benchmark run. These instrumented timings are diagnostic, outside the medians:
 
 - off: 2 fsync, 2 fdatasync; 187.414 ms in sync calls, 46.982 ms CPU, 288.162 ms wall.
 - on: 2 fsync, 2 fdatasync; 221.961 ms in sync calls, 47.634 ms CPU, 325.970 ms wall.
+
+## Merged shared-store and Windows validation (2026-10-23)
+
+F3 measures the merged shared-store/Windows source against 7660d4f, using the same explicit 10,000-file fixture profile as the preceding F1 round. Samples alternate base then merged throughout one sitting. Cold capture, delta capture and fork have fifteen samples per version; every other scenario has five. All raw samples are retained in the default-on handoff lane f3. No lane build, test or native execution overlapped these timings.
+
+| Scenario | n/version | Base median ms (min–max) | Merged median ms (min–max) | Ratio |
+|---|---:|---:|---:|---:|
+| chunk | 5 | 225.904 (223.756–227.413) | 224.582 (222.909–236.409) | 0.9941× |
+| tree-diff | 5 | 21460.004 (21198.197–22775.674) | 21901.562 (21049.863–22508.391) | 1.0206× |
+| refs | 5 | 118.284 (113.425–130.702) | 114.696 (113.909–118.443) | 0.9697× |
+| cold-seal | 15 | 2361.009 (1761.149–6904.542) | 2080.354 (1631.436–3126.213) | 0.8811× |
+| delta-seal | 15 | 145.997 (24.262–329.643) | 133.649 (22.232–537.385) | 0.9154× |
+| fork | 15 | 9698.674 (4977.692–21966.423) | 9466.246 (4969.603–41428.317) | 0.9760× |
+| universes | 5 | 40272.372 (28694.177–55040.569) | 32405.814 (22805.917–41078.142) | 0.8047× |
+| radar | 5 | 862.780 (662.902–1225.138) | 1395.714 (877.952–1546.254) | 1.6177× |
+| gc | 5 | 86.296 (57.729–109.303) | 100.361 (66.821–193.077) | 1.1630× |
+| unchanged-seal | 5 | 476.596 (420.888–1492.634) | 721.583 (394.051–4192.695) | 1.5140× |
+
+The G5 +10% bounds apply to cold capture, delta capture and fork.
+
+- cold-seal: PASS, 0.881129× versus 1.1×.
+- delta-seal: PASS, 0.915425× versus 1.1×.
+- fork: PASS, 0.976035× versus 1.1×.
+
+Policy-specific comparisons use fifteen alternating pairs per case on the same merged executable. G2 compares 20,000 ignored files with the ignored directory deleted. G3 compares a 100-path delta seal with the directive off/on.
+
+| Gate | Variant | Median ms | Min ms | Max ms | CPU median ms |
+|---|---|---:|---:|---:|---:|
+| G2 | deleted | 2905.156 | 1763.360 | 5697.997 | 814.441 |
+| G2 | ignored | 2915.295 | 2610.144 | 6188.896 | 807.202 |
+| G3 | off | 27.024 | 18.273 | 88.167 | 10.649 |
+| G3 | on | 34.872 | 16.302 | 182.022 | 11.462 |
+
+- G2: PASS, 1.003490× versus 1.2×.
+- G3: FAIL, 1.290425× versus 1.1×.
+
+A separate instrumented G3 pair counts operations strictly between the benchmark’s getrusage endpoints. It is diagnostic and excluded from the medians:
+
+- off: 181.400 ms wall, 46.798 ms CPU, 65.875 ms in sync calls; fsync=2, fdatasync=2, flock=30, fcntl=92, openat=146, statx=430, read=232, pread64=189.
+- on: 263.230 ms wall, 55.411 ms CPU, 119.013 ms in sync calls; fsync=2, fdatasync=2, flock=30, fcntl=92, openat=153, statx=551, read=240, pread64=191.
+
+The other slower wall-time medians also have equal or lower uninstrumented CPU medians:
+
+- radar: base/merged CPU 290.128/289.923 ms (0.999293×).
+- gc: base/merged CPU 42.826/42.613 ms (0.995026×).
+- unchanged-seal: base/merged CPU 134.834/130.422 ms (0.967278×).
+
+Separate instrumented sync/lock diagnostics for those cases (excluded from medians):
+
+| Case | Version | Wall ms | CPU ms | Sync wait ms | fsync | fdatasync | flock | fcntl |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| radar | base | 3669.119 | 1462.881 | 60.795 | 22 | 0 | 8340 | 8578 |
+| radar | head | 3707.703 | 1485.160 | 75.779 | 22 | 0 | 8345 | 8578 |
+| gc | base | 2193.807 | 710.982 | 174.674 | 5 | 1 | 10 | 14701 |
+| gc | head | 2114.146 | 703.920 | 96.844 | 5 | 1 | 10 | 14718 |
+| unchanged-seal | base | 2492.518 | 674.451 | 1058.004 | 7 | 2 | 8 | 104 |
+| unchanged-seal | head | 2140.043 | 685.649 | 681.881 | 7 | 2 | 8 | 104 |
+
+Four timelines use 33,521,664 allocated bytes versus 32,899,072 for one (1.018924×, limit 1.15×). Changing one MiB adds 1,150,976 allocated bytes. Six syscall cases confirm zero ignored-directory enumeration and zero ignored-content opens, including ordinary and packed sparse-index tracked exceptions.
+
+Functional gates pass: Linux 268 tests and Windows 249 tests, with one existing ignored vector generator on each platform. Every Windows executable runs in one native request (final-native-all-01, 20 executables). Both release builds, fmt, both clippy gates and ARM64 check pass. Native Windows-to-Linux fixture return, old v0.1.0/v0.2.0 writers and 53 local relay vectors pass.
+
+Unmet measured bounds: G3. These failed wall-time bounds are retained as failures. The shared host has variable filesystem waits; CPU medians and syscall diagnostics are supporting evidence, not substitutes for the required wall-time limits. No durability sync, assertion, ceiling or sample is removed to obtain a pass.

@@ -1,11 +1,11 @@
 //! Bytewise directory ordering with bounded memory for very large directories.
 
+use crate::platform::{OsStrExt, OsStringExt};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 const NAMES_PER_RUN: usize = 8 * 1024;

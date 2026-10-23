@@ -7,11 +7,13 @@ use furrow::exchange::frame;
 use furrow::exchange::ledger::Ledger;
 use furrow::exchange::open_store;
 use furrow::model::{id_hex, ObjectId, SnapshotTrigger};
+#[cfg(unix)]
+use furrow::platform::symlink;
+use furrow::platform::MetadataExt;
 use furrow::repository::{FurrowRepository, SealOptions};
 use furrow::sealer::{CellSealer, Keys};
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -85,11 +87,15 @@ fn write_tree(tree: &Path, cell: &Path) {
     fs::write(tree.join("src/deep/notes.txt"), b"notes\n").unwrap();
     fs::write(tree.join("big.bin"), pseudo_random(3 << 20)).unwrap();
     fs::write(tree.join("run.sh"), b"#!/bin/sh\n").unwrap();
-    fs::set_permissions(tree.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-    fs::set_permissions(tree.join("src/main.rs"), fs::Permissions::from_mode(0o640)).unwrap();
+    furrow::platform::set_mode(tree.join("run.sh"), 0o755).unwrap();
+    furrow::platform::set_mode(tree.join("src/main.rs"), 0o640).unwrap();
+    // P2/W4: Unix fixture links require privileges Windows does not guarantee.
+    #[cfg(unix)]
     symlink("src/main.rs", tree.join("link")).unwrap();
+    // P2/W4: Unix fixture links require privileges Windows does not guarantee.
+    #[cfg(unix)]
     symlink("nowhere", tree.join("dangling")).unwrap();
-    let _ = xattr::set(tree.join("run.sh"), "user.exchange", b"kept");
+    let _ = furrow::platform::xattr::set(tree.join("run.sh"), "user.exchange", b"kept");
     fs::create_dir_all(cell.join("sub")).unwrap();
     fs::write(cell.join("meta.json"), b"{\"v\":1}").unwrap();
     fs::write(cell.join("sub/note"), b"cell note").unwrap();
@@ -203,7 +209,10 @@ pub fn dump(root: &Path) -> BTreeMap<String, Node> {
 fn dump_into(root: &Path, dir: &Path, nodes: &mut BTreeMap<String, Node>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
-        let name = path.strip_prefix(root).unwrap().display().to_string();
+        let name = String::from_utf8(furrow::platform::path_bytes(
+            path.strip_prefix(root).unwrap(),
+        ))
+        .unwrap();
         nodes.insert(name, node_of(&path));
         if fs::symlink_metadata(&path).unwrap().is_dir() {
             dump_into(root, &path, nodes);
@@ -223,13 +232,13 @@ fn node_of(path: &Path) -> Node {
             blake3::hash(&fs::read(path).unwrap()).to_hex().to_string(),
         )
     };
-    let mut xattrs: Vec<_> = xattr::list(path)
+    let mut xattrs: Vec<_> = furrow::platform::xattr::list(path)
         .map(|names| {
             names
                 .map(|n| {
                     (
                         n.to_string_lossy().into_owned(),
-                        xattr::get(path, &n).unwrap().unwrap(),
+                        furrow::platform::xattr::get(path, &n).unwrap().unwrap(),
                     )
                 })
                 .collect()
@@ -240,7 +249,7 @@ fn node_of(path: &Path) -> Node {
         kind,
         mode: meta.mode(),
         mtime: (meta.mtime(), meta.mtime_nsec()),
-        size: meta.size(),
+        size: meta.len(),
         content,
         xattrs,
     }
@@ -332,4 +341,31 @@ pub fn import_partial(data: &Path, head: ObjectId, inbox: &Path) -> anyhow::Resu
 pub fn want_of(data: &Path, head: ObjectId) -> Vec<ObjectId> {
     let store = open_store(data).unwrap();
     furrow::exchange::fetch::want(&store, &sealer(), head).unwrap()
+}
+
+/// P2/W2: stable file identity proves warm materialization spares held files.
+#[cfg(windows)]
+pub fn file_identity(path: &Path) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut std::ffi::c_void,
+            class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let file = fs::File::open(path).unwrap();
+    let mut info = [0u64; 3];
+    // SAFETY: FileIdInfo writes a volume id and a 128-bit file id to this buffer.
+    assert_ne!(
+        unsafe {
+            GetFileInformationByHandleEx(file.as_raw_handle(), 18, info.as_mut_ptr().cast(), 24)
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    info[1]
 }

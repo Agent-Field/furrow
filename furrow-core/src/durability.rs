@@ -6,6 +6,7 @@
 //! them durable together, so a crash before this call leaves the restore
 //! intent to roll back and a crash after it leaves every file on disk.
 
+#[cfg(unix)]
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
@@ -44,7 +45,7 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 mod platform {
     use super::*;
     use std::os::fd::AsRawFd;
@@ -58,7 +59,7 @@ mod platform {
         for path in written.files.iter().chain(&written.directories) {
             hand_to_drive(path)?;
         }
-        File::open(&written.root)?.sync_all()
+        crate::platform::sync_path(&written.root)
     }
 
     fn hand_to_drive(path: &Path) -> io::Result<()> {
@@ -102,5 +103,17 @@ mod tests {
         // Linux flushes the whole filesystem and names no path; the other
         // platforms hand each named path to the drive, so a vanished one fails.
         assert_eq!(result.is_err(), !cfg!(target_os = "linux"));
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    pub fn flush(written: &Written) -> io::Result<()> {
+        for path in &written.files {
+            crate::platform::sync_path(path)?;
+        }
+        // Windows directory sync is a no-op; each file uses FlushFileBuffers.
+        Ok(())
     }
 }

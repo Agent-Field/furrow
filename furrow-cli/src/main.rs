@@ -5,7 +5,6 @@ use furrow::{FurrowRepository, SealOptions, SyncDisposition, SyncFollowOutcome};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 mod exchange;
@@ -286,7 +285,7 @@ enum Command {
         /// against this workspace's own lineage.
         #[arg(long, requires = "snapshot")]
         base: Option<String>,
-        /// Project verification command executed through /bin/sh in the scratch workspace.
+        /// Project check run through the native shell in the scratch workspace.
         #[arg(long)]
         check: Option<String>,
         /// Plan and report changes/conflicts without materializing or checking them.
@@ -557,7 +556,7 @@ fn watch_selected(
 }
 
 fn read_changed_stdin() -> anyhow::Result<Vec<PathBuf>> {
-    use std::os::unix::ffi::OsStrExt;
+    use furrow::platform::OsStrExt;
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     Ok(input
@@ -762,14 +761,14 @@ fn main() -> anyhow::Result<()> {
                 .rewind(&target, &paths, sqlite_consistent)
                 .context("rewind failed")?;
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "restored": applied.target,
-                        "pre_rewind_snapshot": id_hex(&pre),
-                        "changes": applied.changes.len(),
-                    })
-                );
+                let answer = serde_json::json!({
+                    "restored": applied.target,
+                    "pre_rewind_snapshot": id_hex(&pre),
+                    "changes": applied.changes.len(),
+                });
+                #[cfg(windows)]
+                let answer = furrow::platform::with_held(answer, &applied.held)?;
+                println!("{answer}");
             } else {
                 println!("Restored {} paths", applied.changes.len());
                 println!("Undo snapshot: {}", id_hex(&pre));
@@ -2199,6 +2198,7 @@ fn write_ndjson(value: &impl serde::Serialize) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn redirect_stdout_to_stderr(command: &mut std::process::Command) -> anyhow::Result<()> {
     use std::os::fd::FromRawFd;
 
@@ -2331,13 +2331,13 @@ fn install_hook_adapters(root: &std::path::Path) -> anyhow::Result<Vec<PathBuf>>
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
         temporary.write_all(script.as_bytes())?;
         temporary.as_file().sync_all()?;
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o755))?;
+        furrow::platform::set_mode(temporary.path(), 0o755)?;
         temporary
             .persist(&destination)
             .map_err(|error| error.error)?;
         installed.push(destination);
     }
-    std::fs::File::open(&directory)?.sync_all()?;
+    furrow::platform::sync_path(&directory)?;
     Ok(installed)
 }
 
@@ -2400,7 +2400,7 @@ fn hook_value(explicit: Option<String>, environment: &str) -> anyhow::Result<Opt
 }
 
 fn exit_with_status(status: std::process::ExitStatus) -> ! {
-    use std::os::unix::process::ExitStatusExt;
+    use furrow::platform::ExitStatusExt;
 
     let code = status
         .code()
@@ -2414,7 +2414,7 @@ fn spawn_background_watcher(repository: &FurrowRepository, debounce_ms: u64) -> 
     let pid_path = daemon_dir.join("daemon.pid");
     if let Ok(pid) = std::fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid.trim().parse::<i32>() {
-            if unsafe { libc::kill(pid, 0) } == 0 {
+            if furrow::platform::process_alive(pid as u32) {
                 println!("Watcher already running with PID {pid}");
                 return Ok(());
             }
@@ -2440,6 +2440,12 @@ fn spawn_background_watcher(repository: &FurrowRepository, debounce_ms: u64) -> 
     std::fs::write(&pid_path, format!("{}\n", child.id()))?;
     println!("Watcher started with PID {}", child.id());
     println!("Log {}", log_path.display());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn redirect_stdout_to_stderr(command: &mut std::process::Command) -> anyhow::Result<()> {
+    command.stdout(std::process::Stdio::from(std::io::stderr()));
     Ok(())
 }
 

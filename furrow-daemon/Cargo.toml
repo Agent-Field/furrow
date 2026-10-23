@@ -19,3 +19,6 @@ serde_json.workspace = true
 tempfile.workspace = true
 blake3.workspace = true
 hex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "=1.1.0"

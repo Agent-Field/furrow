@@ -45,12 +45,16 @@ tiny_http.workspace = true
 unicode-normalization.workspace = true
 ureq.workspace = true
 url.workspace = true
-xattr.workspace = true
 zeroize.workspace = true
 
 [[bench]]
 name = "engine"
 harness = false
 
+[target.'cfg(unix)'.dependencies]
+xattr.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 same-file = "=1.0.6"
+# MSVC intrinsics avoid a dependency on ml64 when cross-building from Unix.
+blake3 = { workspace = true, features = ["prefer_intrinsics"] }

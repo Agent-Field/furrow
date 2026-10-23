@@ -2,6 +2,7 @@
 
 use crate::chunker::ChunkStream;
 use crate::model::ObjectKind;
+use crate::platform::MetadataExt;
 use crate::policy::CapturePolicy;
 use crate::store::{object_id, ObjectStore};
 use anyhow::Context;
@@ -9,8 +10,6 @@ use rusqlite::{params, Connection, Transaction};
 use serde::Serialize;
 use std::fs::{self, File, ReadDir};
 use std::io::BufReader;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const MAX_DEPTH: usize = 1_024;
@@ -69,7 +68,8 @@ pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEsti
         };
         let entry = entry?;
         let path = entry.path();
-        let relative = path.strip_prefix(&root)?.as_os_str().as_bytes();
+        let relative_bytes = crate::platform::path_bytes(path.strip_prefix(&root)?);
+        let relative = relative_bytes.as_slice();
         if relative == b".furrow/workspace-id" {
             continue;
         }

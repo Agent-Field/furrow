@@ -361,10 +361,12 @@ impl Repository {
                 .or_else(|| home.map(|p| p.join(".config")))
                 .map(|p| p.join("git/ignore")),
         };
-        let case_insensitive = config
-            .boolean("core.ignoreCase")
-            .and_then(Result::ok)
-            .unwrap_or(false);
+        let case_insensitive = config.boolean("core.ignoreCase").and_then(Result::ok);
+        #[cfg(windows)]
+        let case_insensitive =
+            case_insensitive.unwrap_or_else(|| crate::name_fold::NameFolding::probe(root).case);
+        #[cfg(not(windows))]
+        let case_insensitive = case_insensitive.unwrap_or(false);
         let mut low_priority = Vec::new();
         if let Some(global) = global {
             low_priority.push(matcher(root, &root.join(global), case_insensitive));

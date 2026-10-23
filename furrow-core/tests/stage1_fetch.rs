@@ -6,10 +6,10 @@ use common::*;
 use furrow::exchange::materialize::materialize;
 use furrow::exchange::open_store;
 use furrow::model::{id_hex, ObjectId, ObjectKind, SnapshotTrigger};
+use furrow::platform::OsStrExt;
 use furrow::repository::{FurrowRepository, SealOptions};
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 const SMALL_FRAME: usize = 300 * 1024;
@@ -60,6 +60,7 @@ fn rids(objects: &[(ObjectId, Vec<u8>)]) -> BTreeSet<ObjectId> {
 
 const STRUCTURE: [ObjectKind; 3] = [ObjectKind::Snapshot, ObjectKind::Tree, ObjectKind::Xattrs];
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn export_import_materialize_byte_identical() {
     let src = source();
@@ -99,6 +100,7 @@ fn export_import_materialize_byte_identical() {
 /// An object a store handed us is already in that store, so the next export to
 /// it must not send it back: a take followed by a publish would otherwise
 /// upload again everything the other device just sent.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn imported_objects_are_recorded_as_published_for_that_store() {
     let src = source();
@@ -141,6 +143,7 @@ fn imported_objects_are_recorded_as_published_for_that_store() {
 /// folder into place. The workspace must follow the move, or the folder at its
 /// final path is one the engine has never heard of; a folder that was already
 /// registered at that path is the old tree and steps aside.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_moved_workspace_is_found_at_its_new_path() {
     let src = source();
@@ -183,6 +186,7 @@ fn a_moved_workspace_is_found_at_its_new_path() {
     assert_eq!(store.workspace_head(&id.unwrap()).unwrap(), Some(src.head));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn materialize_without_a_cell_dir_puts_dot_cell_in_the_tree() {
     let src = source();
@@ -209,6 +213,7 @@ fn materialize_without_a_cell_dir_puts_dot_cell_in_the_tree() {
     assert_eq!(restored, original);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn import_resumes_after_crash() {
     let src = source();
@@ -267,6 +272,7 @@ fn import_resumes_after_crash() {
     assert!(want_of(&dst.data, src.head).is_empty());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn tampered_object_refused() {
     let src = source();
@@ -313,6 +319,7 @@ fn tampered_object_refused() {
 /// rolls the whole call back: either everything or nothing is catalogued,
 /// never a partial catalog. The inbox files are deleted only after the batch
 /// commits, so every file is left for the next attempt.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn a_tampered_child_rolls_the_whole_import_back() {
     let src = source();
@@ -347,6 +354,7 @@ fn a_tampered_child_rolls_the_whole_import_back() {
 /// A priming take knows its inbox holds more than this head wants: the files
 /// no pass wanted are deleted and counted instead of being an error. The
 /// strict import keeps its rule.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn primed_import_deletes_the_extras_and_reports_them() {
     let src = source();
@@ -389,6 +397,7 @@ fn inbox_count(inbox: &std::path::Path) -> usize {
 /// parents have not arrived cannot be opened, so they stay; once the parents
 /// land a second call stores everything reachable; a final primed call then
 /// deletes only a true extra.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn partial_import_waits_for_parents_then_takes_everything() {
     let src = source();
@@ -419,6 +428,7 @@ fn partial_import_waits_for_parents_then_takes_everything() {
 
 /// A partial call never refuses: an unwanted file is not an error and stays,
 /// where the strict import of the same inbox is refused.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn partial_import_keeps_unwanted_files_without_error() {
     let src = source();
@@ -438,6 +448,7 @@ fn partial_import_keeps_unwanted_files_without_error() {
     assert!(import_all(&dst.data, src.head, &dst.inbox).is_err());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn unwanted_file_refused() {
     let src = source();
@@ -464,6 +475,7 @@ fn unwanted_file_refused() {
     assert!(error.to_string().contains("readme.txt"), "{error:#}");
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn want_is_empty_when_complete() {
     let src = source();
@@ -474,6 +486,7 @@ fn want_is_empty_when_complete() {
     assert!(want_of(&dst.data, src.head).is_empty());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn want_starts_at_the_snapshot_and_is_bounded() {
     let src = source();
@@ -516,6 +529,7 @@ fn wide_source(files: usize) -> Source {
     }
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn materialize_refuses_an_incomplete_head_and_leaves_the_folder_empty() {
     let src = source();
@@ -569,6 +583,7 @@ fn parent_of(data: &std::path::Path, id: &ObjectId) -> Option<ObjectId> {
         .parent
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn the_next_seal_after_materialize_descends_from_the_imported_head() {
     let src = source();
@@ -582,6 +597,7 @@ fn the_next_seal_after_materialize_descends_from_the_imported_head() {
     assert_ne!(Some(first), parent_of(&dst.data, &next));
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn the_word_head_names_the_imported_head_and_then_the_next_seal() {
     let src = source();
@@ -595,6 +611,7 @@ fn the_word_head_names_the_imported_head_and_then_the_next_seal() {
     assert_eq!(repo.resolve_snapshot("head").unwrap(), next);
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn log_marks_the_imported_head_shallow() {
     let src = source();
@@ -621,6 +638,7 @@ fn log_marks_the_imported_head_shallow() {
     );
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn gc_keeps_everything_reachable_and_ignores_the_missing_parent() {
     let src = source();
@@ -643,6 +661,7 @@ fn gc_keeps_everything_reachable_and_ignores_the_missing_parent() {
         .is_empty());
 }
 
+// P2/W2/W6: the behavioural contract also runs on native Windows.
 #[test]
 fn restore_to_an_id_from_the_senders_older_history_refuses_cleanly() {
     let src = source();

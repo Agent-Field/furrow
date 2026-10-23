@@ -8,8 +8,8 @@
 //! rewrote the whole tree. They are left out of what is captured and what is
 //! restored, so the same content gives the same tree on every platform.
 
+use crate::platform::OsStrExt;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 
 /// Whole names the system manages.
 const MANAGED_NAMES: [&[u8]; 4] = [

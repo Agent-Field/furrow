@@ -1,10 +1,10 @@
 use crate::model::{ObjectId, SnapshotTrigger};
+use crate::platform::MetadataExt;
 use anyhow::Context;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"AGRF";
@@ -410,8 +410,8 @@ impl RefLog {
             )?;
         }
         index.sync_all()?;
-        fs::rename(temporary, &self.index_path)?;
-        File::open(self.index_path.parent().context("index has no parent")?)?.sync_all()?;
+        crate::platform::rename(temporary, &self.index_path)?;
+        crate::platform::sync_path(self.index_path.parent().context("index has no parent")?)?;
         Ok(())
     }
 
