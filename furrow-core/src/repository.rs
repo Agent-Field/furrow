@@ -63,6 +63,8 @@ pub struct FurrowRepository {
     overlay: Option<Overlay>,
     path_index: std::cell::RefCell<Option<PathIndex>>,
     capture_scope: std::cell::RefCell<Option<capture_plan::PreparedPlan>>,
+    // One-shot callers have no tracker; a failed daemon watch remains an explicit full-walk fallback.
+    change_tracker: std::cell::RefCell<Option<Option<change_tracking::ChangeTracker>>>,
 }
 
 /// What a seal is told beyond its label and trigger.
@@ -529,6 +531,7 @@ impl FurrowRepository {
                 .map(Overlay::new),
             path_index: Default::default(),
             capture_scope: Default::default(),
+            change_tracker: Default::default(),
         };
         repository.recover_interrupted_rewind()?;
         Ok(repository)
@@ -629,6 +632,7 @@ impl FurrowRepository {
                 .map(Overlay::new),
             path_index: Default::default(),
             capture_scope: Default::default(),
+            change_tracker: Default::default(),
         };
         repository.recover_interrupted_rewind()?;
         Ok(repository)
@@ -741,6 +745,14 @@ impl FurrowRepository {
             None => self.store.workspace_head(&self.workspace_id)?,
         };
         let policy = self.load_policy()?;
+        let (tracked, watermark) = self.tracked_changes()?;
+        let trusted_baseline = tracked.is_some();
+        let selected = self.select_tracked_changes(changed_paths, tracked);
+        let changed_paths = if self.capture_scope.borrow().is_some() {
+            changed_paths
+        } else {
+            selected.as_deref()
+        };
         let (id, secs) = self.store.batched(|| {
             let root_tree = self.capture_tree(changed_paths, &policy)?;
             // Continuous watcher seals keep raw database/WAL/SHM bytes (L0) and
@@ -785,6 +797,7 @@ impl FurrowRepository {
         })?;
         self.store
             .publish_snapshot(&self.workspace_id, id, secs, label, trigger)?;
+        self.finish_tracked_capture(id, watermark, changed_paths, trusted_baseline)?;
         Ok(id)
     }
 
@@ -2000,6 +2013,7 @@ impl FurrowRepository {
             overlay: None,
             path_index: Default::default(),
             capture_scope: Default::default(),
+            change_tracker: Default::default(),
         })
     }
 
@@ -3472,8 +3486,7 @@ impl FurrowRepository {
         {
             return self.capture_root_retry_with_policy(policy);
         }
-        #[cfg(windows)]
-        if self.windows_delta_needs_link_walk(paths, policy)? {
+        if self.delta_needs_link_walk(paths, policy)? {
             anyhow::ensure!(
                 self.capture_scope.borrow().is_none(),
                 "capture plan needs a full hard-link walk; re-plan"
@@ -3486,8 +3499,7 @@ impl FurrowRepository {
 
     /// Listing IDs do not include link counts. A changed identity needs a walk to
     /// discover new aliases; an existing group needs all of its members captured together.
-    #[cfg(windows)]
-    fn windows_delta_needs_link_walk(
+    fn delta_needs_link_walk(
         &self,
         paths: &[PathBuf],
         policy: &CapturePolicy,
@@ -3509,7 +3521,16 @@ impl FurrowRepository {
                 continue;
             };
             if metadata.is_file() {
+                #[cfg(unix)]
+                if metadata.nlink() > 1
+                    || (index.link_identity(&relative)?.is_some()
+                        && !index.link_has_no_known_sibling(&relative)?)
+                {
+                    return Ok(true);
+                }
+                #[cfg(windows)]
                 let before = index.link_identity(&relative)?;
+                #[cfg(windows)]
                 if crate::platform::path_identity(&path)? != before
                     || (before.is_some() && !index.link_has_no_known_sibling(&relative)?)
                 {
@@ -6083,6 +6104,7 @@ mod windows_tests;
 
 mod capture_plan;
 pub use capture_plan::CapturePlan;
+mod change_tracking;
 
 #[cfg(test)]
 mod perf_tests;
@@ -6092,4 +6114,9 @@ fn capture_rules_changed(root: &Path, path: &Path) -> bool {
         || path.file_name().is_some_and(|name| name == ".gitignore")
         || changed_path_matches(root, path, b".git/index")
         || changed_path_matches(root, path, b".git/info/exclude")
+        || path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .components()
+            .any(|c| c.as_os_str() == ".git")
 }

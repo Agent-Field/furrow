@@ -43,6 +43,8 @@ pub(super) struct PreparedPlan {
     policy: Vec<u8>,
     changed: Option<Vec<PathBuf>>,
     full: bool,
+    #[serde(default)]
+    watched: bool,
     candidates: BTreeMap<PathBuf, Option<Stamp>>,
 }
 
@@ -51,14 +53,16 @@ impl FurrowRepository {
     pub fn capture_plan(&self, changed: Option<&[PathBuf]>) -> anyhow::Result<CapturePlan> {
         let _operation = crate::writer_wait::Operation::start();
         let policy = self.load_policy()?;
+        let (tracked, _) = self.tracked_changes()?;
+        let watched = changed.is_none() && tracked.is_some();
+        let selected = self.select_tracked_changes(changed, tracked);
+        let changed = selected.as_deref();
         let generation = self.store_generation()?;
         let full = changed.is_none()
             || changed
                 .is_some_and(|paths| paths.iter().any(|p| capture_rules_changed(&self.root, p)))
             || !self.index_matches_head(&*self.open_path_index()?, &generation, &policy)?;
-        #[cfg(windows)]
-        let full =
-            full || self.windows_delta_needs_link_walk(changed.unwrap_or_default(), &policy)?;
+        let full = full || self.delta_needs_link_walk(changed.unwrap_or_default(), &policy)?;
         let mut prepared = PreparedPlan {
             root: self.root.clone(),
             workspace: self.workspace_id.clone(),
@@ -72,6 +76,7 @@ impl FurrowRepository {
                 changed.map(|p| p.to_vec())
             },
             full,
+            watched,
             candidates: BTreeMap::new(),
         };
         if full {
@@ -148,6 +153,28 @@ impl FurrowRepository {
                 && plan.policy == self.plan_policy_identity()?,
             "capture plan is stale; re-plan"
         );
+        if !plan.full {
+            let (dirty, _) = self.tracked_changes()?;
+            if plan.watched {
+                anyhow::ensure!(
+                    self.change_tracker.borrow().is_some(),
+                    "capture plan needs its watcher; re-plan"
+                );
+                let dirty = dirty.context("watcher needs a full capture; re-plan")?;
+                let covered = plan.changed.as_deref().unwrap_or_default();
+                anyhow::ensure!(
+                    dirty.iter().all(|path| covered.iter().any(|p| {
+                        let p = if p.is_absolute() {
+                            p.clone()
+                        } else {
+                            self.root.join(p)
+                        };
+                        path.starts_with(p)
+                    })),
+                    "new changes outside capture plan; re-plan"
+                );
+            }
+        }
         let changed = plan.changed.clone();
         *self.capture_scope.borrow_mut() = Some(plan);
         let result = self.seal(label, trigger, changed.as_deref());
@@ -156,13 +183,25 @@ impl FurrowRepository {
         result
     }
 
-    fn plan_policy_identity(&self) -> anyhow::Result<Vec<u8>> {
+    pub(super) fn plan_policy_identity(&self) -> anyhow::Result<Vec<u8>> {
         let own = fs::read(self.root.join(".furrowpolicy")).unwrap_or_default();
         let composed = self
             .overlay
             .as_ref()
             .map(|o| fs::read(o.source().join(".furrowpolicy")).unwrap_or_default());
-        Ok(blake3::hash(&serde_json::to_vec(&(own, composed))?)
+        let git = if CapturePolicy::load(&self.root)?.uses_gitignore()
+            || self
+                .overlay
+                .as_ref()
+                .map(|o| CapturePolicy::load(o.source()).map(|p| p.uses_gitignore()))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            crate::gitignore::control_identity(&self.root)?
+        } else {
+            Vec::new()
+        };
+        Ok(blake3::hash(&serde_json::to_vec(&(own, composed, git))?)
             .as_bytes()
             .to_vec())
     }

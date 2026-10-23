@@ -375,3 +375,279 @@ fn p3_overlay_exclusion_changes_force_a_full_screenable_capture() {
         .unwrap()
         .is_some());
 }
+
+fn snapshot_bytes(repo: &FurrowRepository, id: &ObjectId, path: &str) -> Option<Vec<u8>> {
+    let snap: Snapshot = repo.store.read_struct(id, ObjectKind::Snapshot).unwrap();
+    let entry = repo
+        .lookup_tree_path(&snap.root_tree, path.as_bytes())
+        .unwrap()?;
+    let blob: Blob = repo
+        .store
+        .read_struct(&entry.target?, ObjectKind::Blob)
+        .unwrap();
+    Some(
+        blob.chunks
+            .iter()
+            .flat_map(|c| repo.store.read_bytes(&c.id, ObjectKind::Chunk).unwrap())
+            .collect(),
+    )
+}
+
+#[test]
+fn q3_immediate_writes_plans_and_captures_never_lose_a_change() {
+    // Q3/C9: a deterministic property sequence interleaves external writes, removals, renames, plans and captures.
+    let f = Fixture::new();
+    let mut repo = f.attach("watch");
+    repo.defer_durability().unwrap();
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    let mut expected = BTreeMap::from([("a".to_owned(), b"first".to_vec())]);
+    let mut random = 0x6f31_27d5_u64;
+    for iteration in 0..160 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let name = format!("p{}", random % 12);
+        match random % 5 {
+            0 => {
+                let _ = fs::remove_file(f.root.join(&name));
+                expected.remove(&name);
+            }
+            1 if expected.contains_key(&name) => {
+                let renamed = format!("p{}", (random + 1) % 12);
+                fs::rename(f.root.join(&name), f.root.join(&renamed)).unwrap();
+                let value = expected.remove(&name).unwrap();
+                expected.insert(renamed, value);
+            }
+            _ => {
+                let bytes = format!("value {iteration} {random}").into_bytes();
+                fs::write(f.root.join(&name), &bytes).unwrap();
+                expected.insert(name, bytes);
+            }
+        }
+        let id = if iteration % 2 == 0 {
+            let plan = repo.capture_plan(None).unwrap();
+            repo.seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+                .unwrap()
+        } else {
+            seal(&mut repo)
+        };
+        for n in std::iter::once("a".to_owned()).chain((0..12).map(|i| format!("p{i}"))) {
+            assert_eq!(
+                snapshot_bytes(&repo, &id, &n),
+                expected.get(&n).cloned(),
+                "iteration {iteration}, {n}"
+            );
+        }
+    }
+}
+
+#[test]
+fn q3_cold_restart_and_guard_scope_cannot_miss_external_edits() {
+    // Q3/P3/C9: downtime forces a walk, and a new path after screening refuses a narrowed token.
+    let f = Fixture::new();
+    let mut repo = f.attach("watch");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    drop(repo);
+    fs::write(f.root.join("a"), b"while down").unwrap();
+    let mut repo = f.attach("watch");
+    repo.enable_change_tracking();
+    assert!(repo.capture_plan(None).unwrap().full);
+    let id = seal(&mut repo);
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "a"),
+        Some(b"while down".to_vec())
+    );
+    let plan = repo.capture_plan(None).unwrap();
+    fs::write(f.root.join("outside"), b"needs screening").unwrap();
+    if !plan.full {
+        assert!(repo
+            .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+            .is_err());
+    }
+    let plan = repo.capture_plan(None).unwrap();
+    assert!(
+        plan.paths.contains(&repo.root().join("outside")),
+        "{:?}",
+        plan.paths
+    );
+    let id = repo
+        .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+        .unwrap();
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "outside"),
+        Some(b"needs screening".to_vec())
+    );
+}
+
+#[test]
+fn q3_known_hints_do_not_clear_unrelated_editor_changes() {
+    // Q3/C9: an executor's known hints cannot consume another writer's pending paths without capturing them.
+    let f = Fixture::new();
+    let mut repo = f.attach("watch");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    fs::write(f.root.join("outside"), b"editor").unwrap();
+    fs::write(f.root.join("a"), b"executor").unwrap();
+    let plan = repo.capture_plan(Some(&[PathBuf::from("a")])).unwrap();
+    assert!(!plan.full);
+    assert_eq!(plan.paths, vec![repo.root().join("a")]);
+    let known = repo
+        .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+        .unwrap();
+    assert_eq!(snapshot_bytes(&repo, &known, "outside"), None);
+    let id = seal(&mut repo);
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "outside"),
+        Some(b"editor".to_vec())
+    );
+}
+
+#[test]
+fn q2_unchanged_full_capture_never_updates_nonracy_stat_rows() {
+    // Q2/R1: a full walk may publish a snapshot, but unchanged stable file identities cause no cache writes.
+    let f = Fixture::new();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let mut repo = f.attach("cache");
+    seal(&mut repo);
+    let catalog = rusqlite::Connection::open(repo.store.root().join("catalog.sqlite3")).unwrap();
+    catalog.execute_batch("CREATE TABLE cache_writes (n); INSERT INTO cache_writes VALUES (0);
+        CREATE TRIGGER count_cache_writes AFTER UPDATE ON stat_cache BEGIN UPDATE cache_writes SET n=n+1; END;").unwrap();
+    seal(&mut repo);
+    let writes: i64 = catalog
+        .query_row("SELECT n FROM cache_writes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(writes, 0);
+}
+
+#[test]
+fn q3_directory_topology_and_hardlink_edits_widen_the_plan() {
+    // Q3/P3: registration changes and aliases require a full screened walk, preserving every linked name.
+    let f = Fixture::new();
+    let mut repo = f.attach("links");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    fs::create_dir(f.root.join("new")).unwrap();
+    fs::write(f.root.join("new/a"), b"in new directory").unwrap();
+    assert!(repo.capture_plan(None).unwrap().full);
+    seal(&mut repo);
+    seal(&mut repo);
+    fs::hard_link(f.root.join("a"), f.root.join("alias")).unwrap();
+    assert!(repo.capture_plan(None).unwrap().full);
+    seal(&mut repo);
+    fs::write(f.root.join("alias"), b"through alias").unwrap();
+    assert!(repo.capture_plan(None).unwrap().full);
+    let id = seal(&mut repo);
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "a"),
+        Some(b"through alias".to_vec())
+    );
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "alias"),
+        Some(b"through alias".to_vec())
+    );
+}
+
+#[test]
+fn q3_ignore_rule_changes_register_previously_ignored_directories() {
+    // Q3/G1: changing exclusion rules must install newly relevant watches before trusting another delta.
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join(".git/objects")).unwrap();
+    fs::write(f.root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(f.root.join(".furrowpolicy"), b"gitignore\n").unwrap();
+    fs::write(f.root.join(".gitignore"), b"hidden/\n").unwrap();
+    fs::create_dir(f.root.join("hidden")).unwrap();
+    fs::write(f.root.join("hidden/a"), b"was ignored").unwrap();
+    let mut repo = f.attach("rules");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    fs::write(f.root.join(".gitignore"), b"").unwrap();
+    assert!(repo.capture_plan(None).unwrap().full);
+    seal(&mut repo);
+    seal(&mut repo);
+    fs::write(f.root.join("hidden/a"), b"now included").unwrap();
+    let id = seal(&mut repo);
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "hidden/a"),
+        Some(b"now included".to_vec())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn q3_unknown_single_file_edits_have_narrow_plans() {
+    // Q3: a healthy native watcher visits only the edited regular file, without enumerating unchanged siblings.
+    let f = Fixture::new();
+    fs::write(f.root.join("untouched"), b"sibling").unwrap();
+    let mut repo = f.attach("narrow");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    for iteration in 0..8 {
+        fs::write(f.root.join("a"), format!("edit {iteration}")).unwrap();
+        let plan = repo.capture_plan(None).unwrap();
+        assert!(
+            !plan.full,
+            "ordinary non-linked files do not require a fallback"
+        );
+        assert_eq!(plan.paths, vec![f.root.join("a")]);
+        repo.seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+            .unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn q3_writes_through_new_external_hardlinks_are_not_missed() {
+    // Q3/M2: a new alias outside watched directories must not hide a subsequent write to an included inode.
+    let f = Fixture::new();
+    let mut repo = f.attach("external-alias");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    let alias = f.data.join("outside-alias");
+    fs::hard_link(f.root.join("a"), &alias).unwrap();
+    fs::write(&alias, b"outside alias write").unwrap();
+    let plan = repo.capture_plan(None).unwrap();
+    assert!(plan.full);
+    let id = repo
+        .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+        .unwrap();
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "a"),
+        Some(b"outside alias write".to_vec())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn q3_completed_mapped_writes_are_captured_after_the_writer_closes() {
+    // Q3: a command that updates a mapped file and exits must be captured even without an IN_MODIFY event.
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    let mut repo = f.attach("mapped");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.root.join("a"))
+        .unwrap();
+    // The mapping spans this known five-byte fixture and remains live until its writes are flushed.
+    unsafe {
+        let address = libc::mmap(
+            std::ptr::null_mut(),
+            5,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        assert_ne!(address, libc::MAP_FAILED);
+        std::ptr::copy_nonoverlapping(b"other".as_ptr(), address.cast::<u8>(), 5);
+        assert_eq!(libc::msync(address, 5, libc::MS_SYNC), 0);
+        assert_eq!(libc::munmap(address, 5), 0);
+    }
+    drop(file);
+    let id = seal(&mut repo);
+    assert_eq!(snapshot_bytes(&repo, &id, "a"), Some(b"other".to_vec()));
+}

@@ -2,6 +2,8 @@ use crate::model::{ObjectId, ObjectKind};
 use anyhow::Context;
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,9 @@ fn writer_error(error: anyhow::Error) -> anyhow::Error {
 
 pub struct Catalog {
     conn: Connection,
+    files: RefCell<HashMap<String, HashMap<Vec<u8>, CachedFile>>>,
+    data_version: Cell<i64>,
+    retain_files: Cell<bool>,
 }
 
 impl Catalog {
@@ -129,7 +134,12 @@ impl Catalog {
             ) WITHOUT ROWID;
             ",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            files: Default::default(),
+            data_version: Cell::new(-1),
+            retain_files: Cell::new(false),
+        })
     }
 
     pub(crate) fn forget_workspace_refs(&self, id: &str) -> anyhow::Result<()> {
@@ -143,6 +153,7 @@ impl Catalog {
 
     pub(crate) fn forget_capture_caches(&self) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
+        self.files.borrow_mut().clear();
         self.conn
             .execute_batch("DELETE FROM stat_cache; DELETE FROM directory_cache;")?;
         Ok(())
@@ -160,6 +171,7 @@ impl Catalog {
         folder: &str,
     ) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
+        self.files.borrow_mut().clear();
         let update = &UPSERT_STAT[UPSERT_STAT
             .find("ON CONFLICT")
             .expect("stat upsert has a conflict clause")..];
@@ -183,12 +195,61 @@ impl Catalog {
         path: &[u8],
     ) -> anyhow::Result<Option<CachedFile>> {
         let _operation = crate::writer_wait::Operation::start();
-        let mut statement = self.conn.prepare_cached(SELECT_STAT)?;
-        statement
-            .query_row(params![workspace_id, path], read_stat_row)
-            .optional()?
-            .map(CachedFile::try_from)
-            .transpose()
+        if !self.retain_files.get() {
+            return self
+                .conn
+                .prepare_cached(SELECT_STAT)?
+                .query_row(params![workspace_id, path], read_stat_row)
+                .optional()?
+                .map(CachedFile::try_from)
+                .transpose();
+        }
+        if self.conn.is_autocommit() {
+            self.refresh_file_cache()?;
+        }
+        if !self.files.borrow().contains_key(workspace_id) {
+            let sql = SELECT_STAT.replace(
+                "FROM stat_cache WHERE workspace_id = ?1 AND path = ?2",
+                ", path FROM stat_cache WHERE workspace_id = ?1",
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map([workspace_id], |row| {
+                Ok((row.get::<_, Vec<u8>>(12)?, read_stat_row(row)?))
+            })?;
+            let mut files = HashMap::new();
+            for row in rows {
+                let (path, row) = row?;
+                files.insert(path, CachedFile::try_from(row)?);
+            }
+            self.files
+                .borrow_mut()
+                .insert(workspace_id.to_owned(), files);
+        }
+        Ok(self
+            .files
+            .borrow()
+            .get(workspace_id)
+            .and_then(|files| files.get(path))
+            .cloned())
+    }
+
+    /// Only retained daemon sessions keep folder-sized caches; one-shot walks retain bounded memory.
+    pub(crate) fn retain_file_cache(&self) {
+        self.retain_files.set(true);
+    }
+
+    /// An external commit invalidates retained rows before the next operation's snapshot is read.
+    fn refresh_file_cache(&self) -> anyhow::Result<()> {
+        if !self.retain_files.get() {
+            return Ok(());
+        }
+        let version = self
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))?;
+        if self.data_version.replace(version) != version {
+            self.files.borrow_mut().clear();
+        }
+        Ok(())
     }
 
     pub fn cached_files(
@@ -210,6 +271,18 @@ impl Catalog {
         file: &CachedFile,
     ) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
+        if self.conn.is_autocommit() {
+            self.refresh_file_cache()?;
+        }
+        if self
+            .files
+            .borrow()
+            .get(workspace_id)
+            .and_then(|rows| rows.get(path))
+            == Some(file)
+        {
+            return Ok(());
+        }
         self.conn.prepare_cached(UPSERT_STAT)?.execute(params![
             workspace_id,
             path,
@@ -226,6 +299,9 @@ impl Catalog {
             file.sqlite,
             file.cached_at_nanos,
         ])?;
+        if let Some(rows) = self.files.borrow_mut().get_mut(workspace_id) {
+            rows.insert(path.to_vec(), file.clone());
+        }
         Ok(())
     }
 
@@ -250,13 +326,19 @@ impl Catalog {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| writer_error(error.into()))?;
+        self.refresh_file_cache()?;
         match write() {
             Ok(value) => {
-                self.conn.execute_batch("COMMIT")?;
+                if let Err(error) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.files.borrow_mut().clear();
+                    return Err(error.into());
+                }
                 Ok(value)
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
+                self.files.borrow_mut().clear();
                 Err(error)
             }
         }
@@ -338,6 +420,7 @@ impl Catalog {
 
     pub fn remove_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
+        self.files.borrow_mut().clear();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM stat_cache WHERE workspace_id = ?1",
@@ -361,6 +444,7 @@ impl Catalog {
 
     pub fn detach_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
+        self.files.borrow_mut().clear();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM stat_cache WHERE workspace_id = ?1",
@@ -385,6 +469,7 @@ impl Catalog {
         checkpoint: &PackCheckpoint,
     ) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
+        self.files.borrow_mut().clear();
         self.conn.execute(
             "ATTACH DATABASE ?1 AS gcmark",
             params![mark_database.as_os_str().to_string_lossy().as_ref()],
@@ -644,7 +729,7 @@ pub struct TimelineRow {
 /// and what reading it produced. A file whose stat still matches (and was not
 /// touched within [`RACY_WINDOW_NANOS`] of being read) needs neither open nor
 /// read nor xattr calls to be captured again.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedFile {
     pub device: u64,
     pub inode: crate::platform::FileId,
@@ -818,5 +903,65 @@ mod tests {
         assert!(row(100_500_000_000).is_racy());
         assert!(row(99_000_000_000).is_racy());
         assert!(!row(102_000_000_001).is_racy());
+    }
+}
+
+#[cfg(test)]
+mod q2_tests {
+    use super::*;
+
+    fn row() -> CachedFile {
+        CachedFile {
+            device: 1,
+            inode: 2,
+            size: 3,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            ctime_secs: 1,
+            ctime_nanos: 0,
+            mode: 0o100644,
+            blob_id: [1; 32],
+            xattrs: None,
+            sqlite: false,
+            cached_at_nanos: 10_000_000_000,
+        }
+    }
+
+    #[test]
+    fn q2_unchanged_rows_do_not_write_and_external_commits_invalidate_memory() {
+        // Q2/P4: retained folder rows never rewrite identical data and cannot hide another process's commit.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog");
+        let catalog = Catalog::open(&path).unwrap();
+        catalog.retain_file_cache();
+        let first = row();
+        catalog.cache_file("folder", b"a", &first).unwrap();
+        catalog
+            .batch(|| {
+                assert_eq!(catalog.cached_file("folder", b"a")?, Some(first.clone()));
+                let changes = catalog.conn.total_changes();
+                for _ in 0..10 {
+                    catalog.cache_file("folder", b"a", &first)?;
+                }
+                assert_eq!(catalog.conn.total_changes(), changes);
+                Ok(())
+            })
+            .unwrap();
+        let other = Catalog::open(&path).unwrap();
+        let mut second = first.clone();
+        second.blob_id = [2; 32];
+        other.cache_file("folder", b"a", &second).unwrap();
+        catalog
+            .batch(|| {
+                assert_eq!(catalog.cached_file("folder", b"a")?, Some(second.clone()));
+                Ok(())
+            })
+            .unwrap();
+        let result: anyhow::Result<()> = catalog.batch(|| {
+            catalog.cache_file("folder", b"a", &first)?;
+            anyhow::bail!("abort capture")
+        });
+        assert!(result.is_err());
+        assert_eq!(catalog.cached_file("folder", b"a").unwrap(), Some(second));
     }
 }

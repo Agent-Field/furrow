@@ -36,7 +36,9 @@ impl Handle {
                 &self.target.data_dir,
             ))?);
         }
-        Ok(self.store.as_ref().expect("opened above"))
+        let store = self.store.as_ref().expect("opened above");
+        store.retain_file_cache();
+        Ok(store)
     }
 
     pub fn target(&self) -> &Target {
@@ -59,6 +61,10 @@ impl Handle {
                 target.cell_dir.clone(),
                 target.timeline.as_deref(),
             )?);
+            self.repo
+                .as_ref()
+                .expect("opened above")
+                .enable_change_tracking();
         }
         Ok(self.repo.as_mut().expect("opened above"))
     }
@@ -73,6 +79,10 @@ impl Handle {
                 t.timeline.as_deref(),
                 t.cell_dir.clone(),
             )?);
+            self.repo
+                .as_ref()
+                .expect("attached above")
+                .enable_change_tracking();
         }
         Ok(self.repo.as_mut().expect("attached above"))
     }

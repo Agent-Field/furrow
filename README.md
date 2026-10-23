@@ -349,7 +349,7 @@ eligibility. Known SQLite databases and their existing sidecars are included
 because consistent backups may read them even on a delta. Tokens are scoped to
 one timeline, folder, composed directory, and head, and are consumed by capture.
 
-The daemon verbs are `capture-plan` (`args.changed`, absent/null for a full walk),
+The daemon verbs are `capture-plan` (`args.changed`, absent/null for unknown changes),
 `seal` (`args.changed`, optional `args.plan`, optional `args.durable`), and `sync`
 (no arguments). `seal` adds `durable: false` until an explicitly requested flush
 completes; `durable: true` acknowledges a completed flush. `sync` returns
@@ -362,3 +362,21 @@ A spawned turn-end CLI connects to the local daemon, starting it when needed.
 synchronous operation. Shared-folder stat rows require no new option: timelines
 with the same canonical folder reuse file identities, while `.cell/` rows and
 heads remain private to each timeline. Old stores open without migration.
+
+On Linux, retained daemon sessions watch included directories and use an ordered
+inotify fence to plan unknown changes from pending paths. A new session, lost
+watch, overflow, directory rename, policy change or uncertain event widens the
+plan to `full:true`; callers must screen every path returned by that plan.
+Changes arriving after screening remain pending or refuse the token if they
+expand its read scope. Composed `.cell/` state is visited on every request.
+Windows and macOS currently use full walks for unknown changes because their
+notify backends do not expose an equivalent ordered fence across pruned watches.
+`FURROW_NO_DAEMON=1` also uses full walks and retains bounded stat-cache memory.
+
+Linux watches also cover included regular-file inodes so an external hard-link
+alias cannot hide a write. Watch exhaustion, uncertain filesystem/mount state,
+linked ignore files, and nested Git control scopes use `full:true`. The kernel
+watch limit can therefore affect large or numerous simultaneously served trees.
+A live shared writable memory mapping can change bytes without a notification
+or a new timestamp; completed mappings are detected on writable close. The
+unrestricted no-missed-change guarantee for still-live mappings remains open.

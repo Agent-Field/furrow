@@ -661,6 +661,75 @@ fn is_git_control_path(relative: &[u8]) -> bool {
         .any(|part| part == b".git" || (cfg!(windows) && part.eq_ignore_ascii_case(b".git")))
 }
 
+/// Includes, global excludes and environment overrides can change without an event inside the worktree.
+pub(crate) fn control_identity(root: &Path) -> anyhow::Result<Vec<u8>> {
+    let Some(gitdir) = root.ancestors().find_map(git_dir) else {
+        return Ok(Vec::new());
+    };
+    let common = fs::read_to_string(gitdir.join("commondir"))
+        .ok()
+        .map(|s| gitdir.join(s.trim()))
+        .unwrap_or_else(|| gitdir.clone());
+    let config = config(&common, &gitdir)?;
+    let mut files = BTreeSet::from([
+        common.join("config"),
+        gitdir.join("config.worktree"),
+        gitdir.join("HEAD"),
+        gitdir.join("index"),
+        common.join("info/exclude"),
+    ]);
+    for section in config.sections() {
+        if let Some(path) = &section.meta().path {
+            files.insert(path.clone());
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let excludes = match config.path("core.excludesFile") {
+        Some(path) => Some(
+            path.interpolate(gix_config::path::interpolate::Context {
+                home_dir: home.as_deref(),
+                ..Default::default()
+            })?
+            .into_owned(),
+        ),
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|p| p.join(".config")))
+            .map(|p| p.join("git/ignore")),
+    };
+    if let Some(path) = excludes {
+        files.insert(root.join(path));
+    }
+    let mut result = Vec::new();
+    for path in files {
+        result.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        let stamp = fs::metadata(&path)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok(), m.created().ok()));
+        result.extend_from_slice(format!("{stamp:?}").as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let stamp = fs::metadata(&path)
+                .ok()
+                .map(|m| (m.dev(), m.ino(), m.ctime(), m.ctime_nsec()));
+            result.extend_from_slice(format!("{stamp:?}").as_bytes());
+        }
+        #[cfg(windows)]
+        result.extend_from_slice(
+            format!("{:?}", crate::platform::path_identity(&path).ok()).as_bytes(),
+        );
+    }
+    let mut env: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| key.to_string_lossy().starts_with("GIT_CONFIG"))
+        .collect();
+    env.sort();
+    result.extend_from_slice(format!("{env:?}").as_bytes());
+    Ok(blake3::hash(&result).as_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

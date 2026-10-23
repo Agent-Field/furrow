@@ -703,6 +703,11 @@ impl ObjectStore {
         RetentionLog::open(&self.root, workspace_id)?.unpin(snapshot_id)
     }
 
+    /// A retained daemon shares folder rows across its timeline handles.
+    pub fn retain_file_cache(&self) {
+        self.catalog.retain_file_cache();
+    }
+
     pub fn cached_file(
         &self,
         workspace_id: &str,

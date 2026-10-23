@@ -32,6 +32,10 @@ pub struct CapturePolicy {
 }
 
 impl CapturePolicy {
+    pub(crate) fn uses_gitignore(&self) -> bool {
+        self.gitignore
+    }
+
     pub fn load(root: &Path) -> anyhow::Result<Self> {
         let path = root.join(POLICY_FILE);
         let metadata = match fs::symlink_metadata(&path) {
