@@ -458,7 +458,14 @@ pub fn shell(command: &str) -> std::process::Command {
     #[cfg(windows)]
     let mut shell = std::process::Command::new("cmd.exe");
     #[cfg(windows)]
-    shell.args(["/D", "/S", "/C", command]);
+    {
+        use std::os::windows::process::CommandExt;
+        // cmd.exe does not understand the backslash quoting used for normal
+        // Windows argv. Its /S switch removes this one outer quote pair.
+        shell
+            .args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""));
+    }
     shell
 }
 

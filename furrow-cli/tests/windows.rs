@@ -238,3 +238,71 @@ fn r0_windows_debug_cli_parses_and_captures_a_deep_ten_thousand_entry_tree() {
         start.elapsed()
     );
 }
+
+#[test]
+fn p1_cli_restore_spares_unchanged_sibling() {
+    // P1/W2: separate CLI invocations must preview only the edited file and
+    // preserve unchanged sibling bytes and exact last-write times on NTFS.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    std::fs::create_dir_all(root.join("src/deep")).unwrap();
+    std::fs::write(root.join("app.txt"), b"original\n").unwrap();
+    std::fs::write(root.join("src/lib.rs"), b"untouched\r\n\0\xff").unwrap();
+    std::fs::write(root.join("README.md"), b"readme\n").unwrap();
+    std::fs::write(root.join("src/deep/nested.rs"), b"nested unchanged\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(
+            std::env::var_os("CARGO_BIN_EXE_furrow")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_furrow").into()),
+        )
+        .env("FURROW_DATA_DIR", temp.path().join("data"))
+        .env("FURROW_NO_DAEMON", "1")
+        .env("FURROW_P1_DIAG", "1")
+        .arg("--repo")
+        .arg(&root)
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        out
+    };
+    let initial = run(&["watch", "--no-daemon"]);
+    let head = serde_json::from_slice::<serde_json::Value>(&initial.stdout).unwrap()["snapshot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let times = || {
+        [
+            "src",
+            "src/deep",
+            "src/deep/nested.rs",
+            "src/lib.rs",
+            "README.md",
+        ]
+        .map(|p| std::fs::metadata(root.join(p)).unwrap().modified().unwrap())
+    };
+    let before = times();
+    std::fs::write(root.join("app.txt"), b"edited\n").unwrap();
+    let preview = run(&["rewind", &head, "--dry-run"]);
+    let plan: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        plan["changes"].as_array().unwrap().len(),
+        1,
+        "{plan}: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert_eq!(plan["changes"][0]["path"], "app.txt");
+    run(&["rewind", &head, "--yes"]);
+    assert_eq!(times(), before);
+    assert_eq!(
+        std::fs::read(root.join("src/deep/nested.rs")).unwrap(),
+        b"nested unchanged\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("src/lib.rs")).unwrap(),
+        b"untouched\r\n\0\xff"
+    );
+    assert_eq!(std::fs::read(root.join("README.md")).unwrap(), b"readme\n");
+    assert_eq!(std::fs::read(root.join("app.txt")).unwrap(), b"original\n");
+}

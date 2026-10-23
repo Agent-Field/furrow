@@ -278,7 +278,8 @@ fn mission_control_pins_and_refuses_a_stale_rewind_preview() {
     );
     assert_eq!(preview.status, 200);
     let preview = preview.json();
-    assert_eq!(preview["changes"].as_array().unwrap().len(), 1);
+    // P1: an untouched directory cannot appear in a restore preview.
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 1, "{preview}");
     fs::write(fixture.repo.join("app.txt"), b"newer writer bytes\n").unwrap();
 
     let apply = ui.request(

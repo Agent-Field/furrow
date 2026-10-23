@@ -109,3 +109,96 @@ fn w4_names_windows_refuses_are_identified_before_filesystem_access() {
         );
     }
 }
+
+#[test]
+fn p1_restore_spares_unchanged_sibling_files_and_directories() {
+    // P1/W2: restoring one file must neither report nor touch an unchanged
+    // sibling directory or its contents, including their exact NTFS times.
+    use furrow::model::{EntryKind, ObjectId, ObjectKind, Snapshot, SnapshotTrigger};
+    use furrow::repository::FurrowRepository;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir_all(root.join("src/deep")).unwrap();
+    fs::write(root.join("app.txt"), b"original\n").unwrap();
+    fs::write(root.join("src/lib.rs"), b"unchanged\r\n\0\xff").unwrap();
+    fs::write(root.join("src/deep/nested.rs"), b"nested unchanged\n").unwrap();
+    fs::write(root.join("README.md"), b"readme\n").unwrap();
+    let (repo, first) = FurrowRepository::attach_and_seal_in(
+        &temp.path().join("data"),
+        &root,
+        None,
+        SnapshotTrigger::Manual,
+        Default::default(),
+    )
+    .unwrap();
+    // P1: an older snapshot can contain stale listing times at several levels.
+    // Give its directory records older times without touching the live tree.
+    fn older_directory_times(store: &furrow::store::ObjectStore, root: ObjectId) -> ObjectId {
+        let mut entries = Vec::new();
+        furrow::tree::for_each_entry(store, &root, |mut entry| {
+            if entry.kind == EntryKind::Directory {
+                entry.mtime_secs -= 1;
+                entry.target = Some(older_directory_times(store, entry.target.unwrap()));
+            }
+            entries.push(entry);
+            Ok(())
+        })
+        .unwrap();
+        furrow::tree::write(store, entries).unwrap()
+    }
+    let store = furrow::exchange::open_store(&temp.path().join("data")).unwrap();
+    let mut snapshot: Snapshot = store.read_struct(&first, ObjectKind::Snapshot).unwrap();
+    snapshot.root_tree = older_directory_times(&store, snapshot.root_tree);
+    let first = store.put_struct(ObjectKind::Snapshot, &snapshot).unwrap();
+    drop(store);
+    let paths = [
+        "src",
+        "src/deep",
+        "src/deep/nested.rs",
+        "src/lib.rs",
+        "README.md",
+    ];
+    let before: Vec<_> = paths
+        .iter()
+        .map(|p| fs::metadata(root.join(p)).unwrap().modified().unwrap())
+        .collect();
+    fs::write(root.join("app.txt"), b"changed\n").unwrap();
+    drop(repo);
+    let mut repo =
+        FurrowRepository::open_composed_in(&temp.path().join("data"), &root, None).unwrap();
+    let plan = repo.plan_rewind(&first, &[]).unwrap();
+    assert_eq!(plan.changes.len(), 1, "{plan:?}");
+    assert_eq!(plan.changes[0].path, "app.txt");
+    repo.rewind(&first, &[], false).unwrap();
+    assert_eq!(fs::read(root.join("app.txt")).unwrap(), b"original\n");
+    assert_eq!(
+        fs::read(root.join("src/lib.rs")).unwrap(),
+        b"unchanged\r\n\0\xff"
+    );
+    assert_eq!(fs::read(root.join("README.md")).unwrap(), b"readme\n");
+    assert_eq!(
+        fs::read(root.join("src/deep/nested.rs")).unwrap(),
+        b"nested unchanged\n"
+    );
+    let after: Vec<_> = paths
+        .iter()
+        .map(|p| fs::metadata(root.join(p)).unwrap().modified().unwrap())
+        .collect();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn p2_native_shell_preserves_quotes_and_failure_status() {
+    // P2/W2: quoted paths and failed checks must execute through cmd.exe,
+    // rather than echoing a quoted script and falsely reporting success.
+    let temp = tempfile::tempdir().unwrap();
+    let result = platform::shell(r#"(echo exact)> "file with spaces.txt" & exit /b 17"#)
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(17), "{result:?}");
+    assert_eq!(
+        fs::read(temp.path().join("file with spaces.txt")).unwrap(),
+        b"exact\r\n"
+    );
+}

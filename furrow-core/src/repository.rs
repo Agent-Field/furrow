@@ -1085,7 +1085,7 @@ impl FurrowRepository {
                 .restore(&remote_snapshot.claims)?;
         }
 
-        if local_snapshot.root_tree == remote_snapshot.root_tree {
+        if self.working_trees_match(&local_snapshot.root_tree, &remote_snapshot.root_tree)? {
             // Nothing to materialize, but the whole graph must still land and be
             // verified before the local identity adopts the remote snapshot.
             let pulled = pull.finish()?;
@@ -1101,12 +1101,15 @@ impl FurrowRepository {
             ));
         }
 
-        let can_fast_forward = pull.base_root() == Some(local_snapshot.root_tree)
-            || prior_sync.as_ref().is_some_and(|state| {
-                pull.base_root() == Some(state.remote_root)
-                    && state.local_root == Some(local_snapshot.root_tree)
-            })
-            || bootstrap;
+        let follows_prior = match prior_sync.as_ref() {
+            Some(state) if pull.base_root() == Some(state.remote_root) => match state.local_root {
+                Some(root) => self.working_trees_match(&root, &local_snapshot.root_tree)?,
+                None => false,
+            },
+            _ => false,
+        };
+        let can_fast_forward =
+            pull.base_root() == Some(local_snapshot.root_tree) || follows_prior || bootstrap;
 
         if !can_fast_forward {
             // Divergence: land and verify the whole remote graph so it can be
@@ -1349,16 +1352,20 @@ impl FurrowRepository {
             .context("workspace has no sealed snapshot")?;
         let local_snapshot: Snapshot = self.store.read_struct(&local_head, ObjectKind::Snapshot)?;
         let last_synced = self.read_sync_state()?;
+        let matches_synced = match last_synced.as_ref().and_then(|state| state.local_root) {
+            Some(root) => self.working_trees_match(&root, &local_snapshot.root_tree)?,
+            None => false,
+        };
 
         match remote_root {
             None => Ok(SyncFollowOutcome::Published {
                 report: self.sync_push_on(true, &session.config, &mut session.remote)?,
             }),
             Some(remote_root)
-                if last_synced.as_ref().is_some_and(|state| {
-                    state.remote_root == remote_root
-                        && state.local_root == Some(local_snapshot.root_tree)
-                }) || (last_synced.is_none() && local_snapshot.root_tree == remote_root) =>
+                if last_synced
+                    .as_ref()
+                    .is_some_and(|state| state.remote_root == remote_root && matches_synced)
+                    || (last_synced.is_none() && local_snapshot.root_tree == remote_root) =>
             {
                 if last_synced.is_none() {
                     self.write_sync_state(remote_root, local_snapshot.root_tree)?;
@@ -2437,7 +2444,7 @@ impl FurrowRepository {
         let ours_snapshot: Snapshot = self.store.read_struct(&ours, ObjectKind::Snapshot)?;
         let current_root = self.capture_root_retry()?;
         anyhow::ensure!(
-            current_root == ours_snapshot.root_tree,
+            self.working_trees_match(&current_root, &ours_snapshot.root_tree)?,
             "source workspace changed while the merge was being verified; retry"
         );
         self.write_restore_intent(&RestoreIntent {
@@ -3458,6 +3465,14 @@ impl FurrowRepository {
                 continue;
             }
             let metadata = child.metadata()?;
+            // NTFS listing timestamps can predate the directory's last child
+            // creation. Refresh directories so a first seal records their true
+            // time, while regular files keep the listing-only stat-cache path.
+            let metadata = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::symlink_metadata(&child_path)?
+            } else {
+                metadata
+            };
             if let Some(entry) =
                 self.capture_path_entry_with_metadata(&child_path, index, policy, &metadata)?
             {
@@ -3921,6 +3936,22 @@ impl FurrowRepository {
         Ok(result)
     }
 
+    /// Windows directory timestamps must not turn an unchanged working tree
+    /// into a divergence or invalidate a merge's content precondition.
+    fn working_trees_match(&self, left: &ObjectId, right: &ObjectId) -> anyhow::Result<bool> {
+        if left == right {
+            return Ok(true);
+        }
+        #[cfg(windows)]
+        {
+            let mut changes = Vec::new();
+            self.diff_directory(Some(*left), Some(*right), Vec::new(), &[], &mut changes)?;
+            Ok(changes.is_empty())
+        }
+        #[cfg(unix)]
+        Ok(false)
+    }
+
     fn diff_directory(
         &self,
         before: Option<ObjectId>,
@@ -3966,7 +3997,10 @@ impl FurrowRepository {
         }
         path.extend_from_slice(&name);
 
-        if selected(&path, selections) {
+        let parent_selected = selected(&path, selections);
+        #[cfg(windows)]
+        let change_start = changes.len();
+        if parent_selected {
             changes.push(RewindChange {
                 path: display_relative(&path),
                 action: match (&before, &after) {
@@ -3991,6 +4025,16 @@ impl FurrowRepository {
             if before_tree.is_some() || after_tree.is_some() {
                 self.diff_directory(before_tree, after_tree, path, selections, changes)?;
             }
+        }
+        // A changed child needs its container's recorded time restored too.
+        // Prune the container only when recursive comparison found no actual
+        // child changes, including when nested stale times changed tree IDs.
+        #[cfg(windows)]
+        if parent_selected
+            && changes.len() == change_start + 1
+            && directory_metadata_matches(before.as_ref(), after.as_ref())
+        {
+            changes.pop();
         }
         Ok(())
     }
@@ -4763,6 +4807,24 @@ fn stable_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
         && crate::platform::cache_mode(before) == crate::platform::cache_mode(after)
 }
 
+// NTFS directory listings can retain an earlier last-write time until another
+// process opens the directory. Compare children recursively instead of replacing
+// their container: child trees can differ solely through stale directory times.
+#[cfg(windows)]
+fn directory_metadata_matches(before: Option<&TreeEntry>, after: Option<&TreeEntry>) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    if before.kind != EntryKind::Directory || after.kind != EntryKind::Directory {
+        return false;
+    }
+    let mut comparable = before.clone();
+    comparable.target = after.target;
+    comparable.mtime_secs = after.mtime_secs;
+    comparable.mtime_nanos = after.mtime_nanos;
+    comparable == *after
+}
+
 fn directory_target_only_difference(before: Option<&TreeEntry>, after: Option<&TreeEntry>) -> bool {
     let (Some(before), Some(after)) = (before, after) else {
         return false;
@@ -5365,6 +5427,22 @@ fn is_identity_path(path: &[u8]) -> bool {
 }
 
 fn test_pause(variable: &str) {
+    if let Some(ready) = std::env::var_os(format!("{variable}_GATE")) {
+        // The interference harness must rendezvous at the real boundary;
+        // sampling a short sleep can miss it on a loaded machine.
+        let ready = PathBuf::from(ready);
+        fs::write(&ready, b"ready").expect("publish test boundary");
+        let release = ready.with_extension("release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !release.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test boundary was not released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        return;
+    }
     let Some(milliseconds) = std::env::var_os(variable)
         .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
     else {
