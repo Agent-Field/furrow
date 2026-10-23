@@ -15,13 +15,16 @@ use crate::model::{
     Snapshot, SnapshotTrigger, SqliteBackup, TreeEntry, XattrEntry, Xattrs,
 };
 use crate::name_fold::NameFolding;
-use crate::overlay::{self, Overlay, WithOverlay};
+#[cfg(unix)]
+use crate::overlay::WithOverlay;
+use crate::overlay::{self, Overlay};
 use crate::path_index::{PathIndex, CHILD_BATCH};
 use crate::platform::{FileTypeExt, MetadataExt};
 use crate::platform::{OsStrExt, OsStringExt};
 use crate::policy::{CapturePolicy, POLICY_FILE_BYTES};
 use crate::radar::{EventPage, Radar, UniverseRegistration};
 use crate::self_write::ApplyGuard;
+#[cfg(unix)]
 use crate::sorted_dir::SortedDirectory;
 use crate::sqlite_adapter;
 use crate::store::ObjectStore;
@@ -3373,6 +3376,7 @@ impl FurrowRepository {
             && index.link_has_no_known_sibling(relative)?)
     }
 
+    #[cfg(unix)]
     fn capture_directory_impl(
         &self,
         path: &Path,
@@ -3416,9 +3420,67 @@ impl FurrowRepository {
         Ok(tree_id)
     }
 
+    #[cfg(windows)]
+    fn capture_directory_impl(
+        &self,
+        path: &Path,
+        index: &PathIndex,
+        policy: &CapturePolicy,
+    ) -> anyhow::Result<ObjectId> {
+        let relative = self
+            .logical_path(path)
+            .context("directory is outside the tree")?;
+        // Windows supplies metadata with FindFirstFile/FindNextFile. Feed the
+        // existing disk-backed index directly, then build in its byte order;
+        // sorting names first would discard that metadata and reopen each file.
+        let overlay = self
+            .overlay
+            .as_ref()
+            .filter(|overlay| path == self.root && overlay.source().is_dir());
+        for child in fs::read_dir(path)? {
+            let child = child?;
+            if overlay.is_some() && child.file_name().as_bytes() == overlay::NAME {
+                continue;
+            }
+            let child_path = child.path();
+            if child_path.starts_with(self.store.root())
+                || child_path == self.root.join(".furrow")
+                || child_path == self.root.join(WORKSPACE_FILE)
+                || child_path == self.root.join(FAMILY_FILE)
+                || child_path == self.root.join(FORK_FILE)
+            {
+                continue;
+            }
+            let child_relative = self
+                .logical_path(&child_path)
+                .context("child is outside the tree")?;
+            if policy.excludes_bytes(&child_relative) {
+                continue;
+            }
+            let metadata = child.metadata()?;
+            if let Some(entry) =
+                self.capture_path_entry_with_metadata(&child_path, index, policy, &metadata)?
+            {
+                index.upsert(&child_relative, &relative, &entry)?;
+            }
+        }
+        if let Some(overlay) = overlay {
+            if !policy.excludes_bytes(overlay::NAME) {
+                if let Some(entry) = self.capture_path_entry(overlay.source(), index, policy)? {
+                    index.upsert(overlay::NAME, &relative, &entry)?;
+                }
+            }
+        }
+        let tree_id = self.rebuild_indexed_directory(index, &relative)?;
+        self.store
+            .cache_directory(&self.workspace_id, &relative, &tree_id)?;
+        Ok(tree_id)
+    }
+
     /// The sorted child names of a directory of the tree; the root's include
     /// the overlay's when its directory exists (an absent one is not a tree
     /// that changed under the walk, it is an entry that is not there).
+    #[cfg(unix)]
     fn children(
         &self,
         path: &Path,
@@ -3433,6 +3495,7 @@ impl FurrowRepository {
         })
     }
 
+    #[cfg(unix)]
     fn child_path(&self, directory: &Path, name: &OsStr) -> PathBuf {
         match &self.overlay {
             Some(overlay) if directory == self.root && name.as_bytes() == overlay::NAME => {
@@ -3474,8 +3537,18 @@ impl FurrowRepository {
     ) -> anyhow::Result<Option<TreeEntry>> {
         let metadata =
             fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        self.capture_path_entry_with_metadata(path, index, policy, &metadata)
+    }
+
+    fn capture_path_entry_with_metadata(
+        &self,
+        path: &Path,
+        index: &PathIndex,
+        policy: &CapturePolicy,
+        metadata: &fs::Metadata,
+    ) -> anyhow::Result<Option<TreeEntry>> {
         let file_type = metadata.file_type();
-        let (secs, nanos) = metadata_time(&metadata);
+        let (secs, nanos) = metadata_time(metadata);
         let relative = self
             .logical_path(path)
             .context("captured path is outside the tree")?;
@@ -3487,9 +3560,9 @@ impl FurrowRepository {
         let mode = self.recorded_mode(&relative, metadata.mode())?;
         let class = content_class::classify(&relative);
         if file_type.is_file() {
-            index.note_link(&relative, hardlink::identity(&metadata))?;
+            index.note_link(&relative, hardlink::identity(metadata))?;
             return self
-                .capture_file_entry(path, &relative, name, class, &metadata)
+                .capture_file_entry(path, &relative, name, class, metadata)
                 .map(Some);
         }
         let xattrs = if file_type.is_dir() {
@@ -3659,7 +3732,7 @@ impl FurrowRepository {
         Ok(self
             .store
             .cached_file(&self.workspace_id, relative)?
-            .filter(|row| !cfg!(windows) && cached_matches(row, metadata) && !row.is_racy()))
+            .filter(|row| cached_matches(row, metadata) && !row.is_racy()))
     }
 
     fn cache_read(&self, relative: &[u8], read: FileRead) -> anyhow::Result<CachedFile> {
@@ -3674,6 +3747,8 @@ impl FurrowRepository {
 
     /// Reads a file into the store, retrying while it changes underneath.
     fn read_file(&self, path: &Path) -> anyhow::Result<FileRead> {
+        #[cfg(all(test, windows))]
+        windows_tests::CONTENT_READS.with(|count| count.set(count.get() + 1));
         for _ in 0..3 {
             let (secs, nanos) = now();
             let read_at_nanos = secs.saturating_mul(1_000_000_000) + i64::from(nanos);
@@ -4685,7 +4760,7 @@ fn stable_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {
         && before.mtime_nsec() == after.mtime_nsec()
         && before.ctime() == after.ctime()
         && before.ctime_nsec() == after.ctime_nsec()
-        && before.mode() == after.mode()
+        && crate::platform::cache_mode(before) == crate::platform::cache_mode(after)
 }
 
 fn directory_target_only_difference(before: Option<&TreeEntry>, after: Option<&TreeEntry>) -> bool {
@@ -4780,6 +4855,15 @@ fn restorable_xattrs(entries: Vec<XattrEntry>) -> impl Iterator<Item = XattrEntr
         .filter(|entry| !system_attrs::is_system_managed(OsStr::from_bytes(&entry.name)))
 }
 
+#[cfg(windows)]
+fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
+    cached.size == metadata.len()
+        && cached.mtime_secs == metadata.mtime()
+        && cached.mtime_nanos == metadata.mtime_nsec()
+        && cached.mode == crate::platform::cache_mode(metadata)
+}
+
+#[cfg(unix)]
 fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
     cached.device == metadata.dev()
         && cached.inode == metadata.ino()
@@ -4832,7 +4916,7 @@ fn cached_from_read(read: &FileRead) -> CachedFile {
         mtime_nanos: metadata.mtime_nsec(),
         ctime_secs: metadata.ctime(),
         ctime_nanos: metadata.ctime_nsec(),
-        mode: metadata.mode(),
+        mode: crate::platform::cache_mode(metadata),
         blob_id: read.blob,
         xattrs: read.xattrs,
         sqlite: read.sqlite,
@@ -4846,7 +4930,7 @@ fn file_entry(name: Vec<u8>, class: ContentClass, row: &CachedFile) -> TreeEntry
         kind: EntryKind::File,
         target: Some(row.blob_id),
         link_target: Vec::new(),
-        mode: row.mode,
+        mode: crate::platform::snapshot_mode(row.mode),
         size: row.size,
         mtime_secs: row.mtime_secs,
         mtime_nanos: row.mtime_nanos.max(0) as u32,

@@ -36,6 +36,33 @@ pub fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+/// Flush previously appended pack bytes. Windows requires a writable handle
+/// for FlushFileBuffers; Unix retains its data-only flush.
+pub fn sync_data(path: impl AsRef<Path>) -> io::Result<()> {
+    #[cfg(windows)]
+    return fs::OpenOptions::new().write(true).open(path)?.sync_data();
+    #[cfg(unix)]
+    File::open(path)?.sync_data()
+}
+
+/// Cache only attributes that affect capture, without changing snapshot modes.
+pub fn cache_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.mode() | ((metadata.file_attributes() & 0x401) << 20)
+    }
+    #[cfg(unix)]
+    metadata.mode()
+}
+
+pub fn snapshot_mode(cached_mode: u32) -> u32 {
+    #[cfg(windows)]
+    return cached_mode & 0o177777;
+    #[cfg(unix)]
+    cached_mode
+}
+
 /// Mode changes are absent on Windows, where captured POSIX modes live only
 /// in the snapshot. In particular, POSIX read-only bits must not set NTFS ACLs.
 pub fn set_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
@@ -212,8 +239,8 @@ mod windows {
         fn blocks(&self) -> u64;
     }
     impl MetadataExt for fs::Metadata {
-        // std does not expose stable Windows file IDs. Disable identity-based
-        // capture caches and link grouping instead of inventing an identity.
+        // Stable std metadata has no Windows file IDs. Cache matching ignores
+        // identity, and native hardlink grouping remains absent.
         fn dev(&self) -> u64 {
             0
         }
