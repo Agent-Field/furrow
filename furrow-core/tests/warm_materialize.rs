@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! A warm `materialize` restores a head over a tree that already holds an
 //! older one, and writes only what differs between the two. The staging folder
 //! of a take is such a tree: it starts as a copy of the root made of hard

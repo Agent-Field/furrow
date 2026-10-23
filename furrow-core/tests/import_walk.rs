@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! A cold primed import explores the graph incrementally: each pass learns
 //! only what the objects it stored opened up, instead of re-walking all of it.
 

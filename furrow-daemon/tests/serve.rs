@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use furrow_daemon::{Config, Server, Stop};
 use serde_json::{json, Value};
 use std::fs;

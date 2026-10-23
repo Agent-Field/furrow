@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The exchange verbs through the real binary: two data directories, frames
 //! carried between them as inbox files, and the secrets only in the environment.
 

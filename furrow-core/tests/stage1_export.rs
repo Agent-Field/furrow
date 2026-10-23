@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Stage 1 contract 5.2 and 5.4: `export` and `published`.
 
 mod common;

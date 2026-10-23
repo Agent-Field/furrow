@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Stage 1 contract 5.2 and 5.4: `want`, `import` and `materialize`.
 
 mod common;

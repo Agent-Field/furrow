@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Stage 1 contract 5.2: the five sync verbs over the daemon's socket.
 
 use furrow::exchange::frame;

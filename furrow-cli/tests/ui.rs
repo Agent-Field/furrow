@@ -32,7 +32,7 @@ impl Fixture {
     }
 
     fn watch(&self) -> String {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+        let output = std::process::Command::new(binary())
             .env("FURROW_DATA_DIR", &self.data)
             .env("FURROW_NO_DAEMON", "1")
             .arg("--repo")
@@ -52,7 +52,7 @@ impl Fixture {
     }
 
     fn ui_with_merge_check(&self, merge_check: Option<&str>) -> RunningUi {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"));
+        let mut command = std::process::Command::new(binary());
         command
             .env("FURROW_DATA_DIR", &self.data)
             .env("FURROW_NO_DAEMON", "1")
@@ -305,7 +305,7 @@ fn mission_control_applies_a_real_verified_merge() {
     let fixture = Fixture::new();
     fixture.watch();
     let fork = fixture.repo.parent().unwrap().join("review");
-    let fork_output = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let fork_output = std::process::Command::new(binary())
         .env("FURROW_DATA_DIR", &fixture.data)
         .env("FURROW_NO_DAEMON", "1")
         .arg("--repo")
@@ -316,7 +316,7 @@ fn mission_control_applies_a_real_verified_merge() {
         .unwrap();
     assert!(fork_output.status.success());
     fs::write(fork.join("app.txt"), b"verified merge bytes\n").unwrap();
-    let snap = std::process::Command::new(env!("CARGO_BIN_EXE_furrow"))
+    let snap = std::process::Command::new(binary())
         .env("FURROW_DATA_DIR", &fixture.data)
         .env("FURROW_NO_DAEMON", "1")
         .arg("--repo")
@@ -373,4 +373,13 @@ fn git(root: &Path, arguments: &[&str]) {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+// W2/W7: cross-built tests must find the engine beside the relocated test
+// binaries on the native Windows host instead of using the Linux build path.
+fn binary() -> PathBuf {
+    #[cfg(windows)]
+    return assert_cmd::cargo::cargo_bin("furrow");
+    #[cfg(unix)]
+    PathBuf::from(env!("CARGO_BIN_EXE_furrow"))
 }
