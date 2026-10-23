@@ -141,14 +141,16 @@ mod tests {
     #[test]
     fn spills_and_merges_large_directories_in_byte_order() {
         let temporary = tempfile::tempdir().unwrap();
-        for index in (0..20_000).rev() {
+        // F8 S3 requires bytewise directory ordering; the resumed fixture cap still crosses the spill boundary.
+        for index in (0..10_000).rev() {
             File::create(temporary.path().join(format!("entry-{index:08}"))).unwrap();
         }
-        let names: Vec<_> = SortedDirectory::open(temporary.path())
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(names.len(), 20_000);
+        let directory = SortedDirectory::open(temporary.path()).unwrap();
+        assert!(
+            matches!(&directory.inner, SortedDirectoryInner::Merge(merge) if merge.runs.len() == 2)
+        );
+        let names: Vec<_> = directory.collect::<Result<_, _>>().unwrap();
+        assert_eq!(names.len(), 10_000);
         assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }
