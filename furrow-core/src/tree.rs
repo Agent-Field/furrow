@@ -6,6 +6,8 @@ use anyhow::Context;
 
 /// Leaves and branches stay comfortably below the pack object's global limit.
 pub const MAX_TREE_PAGE_BYTES: usize = 64 * 1024;
+// A one-file edit replaces small ordinary pages while unusually long names remain supported.
+const TARGET_TREE_PAGE_BYTES: usize = 4 * 1024;
 const LEAF_OVERHEAD: usize = b"{\"entries\":[]}".len();
 const BRANCH_OVERHEAD: usize = b"{\"pages\":[]}".len();
 
@@ -48,7 +50,9 @@ impl<'a> Builder<'a> {
         }
         let item_bytes = serde_json::to_vec(&entry)?.len();
         let separator = usize::from(!self.page.is_empty());
-        if self.page_bytes + separator + item_bytes > MAX_TREE_PAGE_BYTES && !self.page.is_empty() {
+        if self.page_bytes + separator + item_bytes > TARGET_TREE_PAGE_BYTES
+            && !self.page.is_empty()
+        {
             self.flush_leaf()?;
         }
         let separator = usize::from(!self.page.is_empty());
@@ -294,7 +298,7 @@ fn write_branch_level(store: &ObjectStore, pages: Vec<TreePage>) -> anyhow::Resu
     for page in pages {
         let item_bytes = serde_json::to_vec(&page)?.len();
         let separator = usize::from(!branch.is_empty());
-        if encoded_bytes + separator + item_bytes > MAX_TREE_PAGE_BYTES && !branch.is_empty() {
+        if encoded_bytes + separator + item_bytes > TARGET_TREE_PAGE_BYTES && !branch.is_empty() {
             output.push(store_branch(store, branch)?);
             branch = Vec::new();
             encoded_bytes = BRANCH_OVERHEAD;

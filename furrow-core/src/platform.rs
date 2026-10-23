@@ -519,7 +519,9 @@ pub(crate) fn read_file_id(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::
 #[path = "platform/windows_identity.rs"]
 mod windows_identity;
 #[cfg(windows)]
-pub use windows_identity::{directory_identities, entry_identity, handle_identity, path_identity};
+pub use windows_identity::{
+    directory_identities, entry_identity, handle_identity, path_identity, path_link_count,
+};
 
 #[cfg(all(test, windows))]
 pub(crate) fn reset_identity_opens() {

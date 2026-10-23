@@ -21,7 +21,7 @@ hex = "=0.4.3"
 getrandom = "=0.2.17"
 libc = "=0.2.169"
 notify = "=7.0.0"
-rusqlite = { version = "=0.32.1", features = ["backup", "bundled"] }
+rusqlite = { version = "=0.32.1", features = ["backup", "bundled", "functions"] }
 rusty-s3 = { version = "=0.8.1", default-features = false }
 serde = { version = "=1.0.217", features = ["derive"] }
 serde_bytes = "=0.11.15"

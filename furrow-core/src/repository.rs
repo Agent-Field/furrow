@@ -63,6 +63,8 @@ pub struct FurrowRepository {
     overlay: Option<Overlay>,
     path_index: std::cell::RefCell<Option<PathIndex>>,
     capture_scope: std::cell::RefCell<Option<capture_plan::PreparedPlan>>,
+    #[cfg(windows)]
+    previous_modes: std::cell::RefCell<BTreeMap<Vec<u8>, (EntryKind, u32)>>,
     // One-shot callers have no tracker; a failed daemon watch remains an explicit full-walk fallback.
     change_tracker: std::cell::RefCell<Option<Option<change_tracking::ChangeTracker>>>,
 }
@@ -531,6 +533,8 @@ impl FurrowRepository {
                 .map(Overlay::new),
             path_index: Default::default(),
             capture_scope: Default::default(),
+            #[cfg(windows)]
+            previous_modes: Default::default(),
             change_tracker: Default::default(),
         };
         repository.recover_interrupted_rewind()?;
@@ -632,6 +636,8 @@ impl FurrowRepository {
                 .map(Overlay::new),
             path_index: Default::default(),
             capture_scope: Default::default(),
+            #[cfg(windows)]
+            previous_modes: Default::default(),
             change_tracker: Default::default(),
         };
         repository.recover_interrupted_rewind()?;
@@ -799,6 +805,7 @@ impl FurrowRepository {
         })?;
         self.store
             .publish_snapshot(&self.workspace_id, id, secs, label, trigger)?;
+        self.remember_indexed_head(&id)?;
         self.finish_tracked_capture(id, watermark, changed_paths, trusted_baseline)?;
         Ok(id)
     }
@@ -1726,8 +1733,6 @@ impl FurrowRepository {
                 &destination,
                 base,
             )?;
-            self.open_path_index()?
-                .backup_to(&fork_repository.workspace_data_dir().join("paths.sqlite3"))?;
             (fork_repository, base)
         } else {
             let (fork_repository, fork_head) = self.capture_fork(&destination, base)?;
@@ -2015,6 +2020,8 @@ impl FurrowRepository {
             overlay: None,
             path_index: Default::default(),
             capture_scope: Default::default(),
+            #[cfg(windows)]
+            previous_modes: Default::default(),
             change_tracker: Default::default(),
         })
     }
@@ -3479,6 +3486,8 @@ impl FurrowRepository {
         changed_paths: Option<&[PathBuf]>,
         policy: &CapturePolicy,
     ) -> anyhow::Result<ObjectId> {
+        #[cfg(windows)]
+        self.prepare_recorded_modes()?;
         let Some(paths) = changed_paths else {
             return self.capture_root_retry_with_policy(policy);
         };
@@ -3533,7 +3542,7 @@ impl FurrowRepository {
                 #[cfg(windows)]
                 let before = index.link_identity(&relative)?;
                 #[cfg(windows)]
-                if crate::platform::path_identity(&path)? != before
+                if crate::platform::path_link_count(&path)? > 1
                     || (before.is_some() && !index.link_has_no_known_sibling(&relative)?)
                 {
                     return Ok(true);
@@ -3561,7 +3570,10 @@ impl FurrowRepository {
 
     fn capture_root_retry_with_policy(&self, policy: &CapturePolicy) -> anyhow::Result<ObjectId> {
         policy.begin_full_capture();
-        let mut index = self.open_path_index()?;
+        // A full walk used by inspection or a no-op rewind may never publish a
+        // snapshot. Keep that uncertainty across processes until a seal completes.
+        fs::write(self.workspace_data_dir().join("paths.head"), b"invalid\n")?;
+        let mut index = self.open_path_index_with_head(false)?;
         let mut last_error = None;
         for _ in 0..3 {
             index.begin()?;
@@ -3743,6 +3755,12 @@ impl FurrowRepository {
         relative: &[u8],
         linked_before: Option<crate::platform::FileIdentity>,
     ) -> anyhow::Result<bool> {
+        #[cfg(windows)]
+        if index.link_identity(relative)?.is_some()
+            && crate::platform::path_link_count(&self.physical_path(relative)?)? <= 1
+        {
+            return Ok(false);
+        }
         Ok(index.link_identity(relative)? != linked_before
             && index.link_has_no_known_sibling(relative)?)
     }
@@ -3799,8 +3817,6 @@ impl FurrowRepository {
             tree.push(entry)?;
         }
         let tree_id = tree.finish()?;
-        self.store
-            .cache_directory(&self.workspace_id, &relative, &tree_id)?;
         Ok(tree_id)
     }
 
@@ -3819,6 +3835,9 @@ impl FurrowRepository {
         // existing disk-backed index directly, then build in its byte order;
         // sorting names first would discard that metadata and reopen each file.
         if let Some(names) = policy.tracked_children(&relative) {
+            let listed = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| (entry.file_name(), entry)))
+                .collect::<std::io::Result<std::collections::HashMap<_, _>>>()?;
             for name in names {
                 let child_path = path.join(name);
                 let child_relative = self
@@ -3827,10 +3846,22 @@ impl FurrowRepository {
                 if policy.excludes_bytes(&child_relative) {
                     continue;
                 }
-                let metadata = match fs::symlink_metadata(&child_path) {
+                // Git's logical case can differ from NTFS's spelling. Exact
+                // listing matches use enumeration metadata; aliases retain the safe query.
+                let metadata =
+                    match listed.get(child_path.file_name().context("child has no name")?) {
+                        Some(entry) => entry.metadata(),
+                        None => fs::symlink_metadata(&child_path),
+                    };
+                let metadata = match metadata {
                     Ok(metadata) => metadata,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
+                };
+                let metadata = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    fs::symlink_metadata(&child_path)?
+                } else {
+                    metadata
                 };
                 if let Some(entry) = self.capture_path_entry_with_metadata(
                     &child_path,
@@ -3846,8 +3877,6 @@ impl FurrowRepository {
                 }
             }
             let tree_id = self.rebuild_indexed_directory(index, &relative)?;
-            self.store
-                .cache_directory(&self.workspace_id, &relative, &tree_id)?;
             return Ok(tree_id);
         }
         let overlay = self
@@ -3904,8 +3933,6 @@ impl FurrowRepository {
             }
         }
         let tree_id = self.rebuild_indexed_directory(index, &relative)?;
-        self.store
-            .cache_directory(&self.workspace_id, &relative, &tree_id)?;
         Ok(tree_id)
     }
 
@@ -4017,7 +4044,6 @@ impl FurrowRepository {
             .next()
             .context("captured path has no filename")?
             .to_vec();
-        let mode = self.recorded_mode(&relative, metadata.mode())?;
         let class = content_class::classify(&relative);
         if file_type.is_file() {
             index.note_link(&relative, identity)?;
@@ -4025,6 +4051,7 @@ impl FurrowRepository {
                 .capture_file_entry(path, &relative, name, class, metadata, identity)
                 .map(Some);
         }
+        let mode = self.recorded_mode(&relative, metadata.mode())?;
         let xattrs = if file_type.is_dir() {
             self.capture_xattrs(path)
                 .with_context(|| format!("capture xattrs for {}", path.display()))?
@@ -4117,23 +4144,76 @@ impl FurrowRepository {
             }
         }
         let tree_id = tree.finish()?;
-        self.store
-            .cache_directory(&self.workspace_id, relative, &tree_id)?;
         Ok(tree_id)
     }
 
     fn open_path_index(&self) -> anyhow::Result<std::cell::RefMut<'_, PathIndex>> {
+        self.open_path_index_with_head(true)
+    }
+
+    fn open_path_index_with_head(
+        &self,
+        load_head: bool,
+    ) -> anyhow::Result<std::cell::RefMut<'_, PathIndex>> {
         let mut index = self.path_index.borrow_mut();
         if index.is_none() {
-            let opened = PathIndex::open(&self.workspace_data_dir().join("paths.sqlite3"))?;
-            if self.change_tracker.borrow().is_some() {
-                opened.defer_checkpoints()?;
+            // Trees are the persistent path record. A timeline keeps only a working
+            // index in memory, so opening another chat never copies the folder's paths.
+            let mut opened = PathIndex::open(Path::new(":memory:"))?;
+            if let Some(head) = self
+                .store
+                .workspace_head(&self.workspace_id)?
+                .filter(|_| load_head)
+            {
+                if !self.indexed_head_matches(&head)? {
+                    *index = Some(opened);
+                    return Ok(std::cell::RefMut::map(index, |index| {
+                        index.as_mut().expect("opened above")
+                    }));
+                }
+                let snapshot: Snapshot = self.store.read_struct(&head, ObjectKind::Snapshot)?;
+                opened.begin()?;
+                self.load_tree_index(&opened, &snapshot.root_tree, &[])?;
+                // Snapshot link groups describe relationships, not this machine's
+                // inode numbers. Synthetic identities preserve those relationships;
+                // touching a member widens capture before consulting local identities.
+                for (number, group) in snapshot.hardlinks.iter().enumerate() {
+                    for path in &group.paths {
+                        opened.note_link(path, Some((u64::MAX, number as _)))?;
+                    }
+                }
+                opened.set_root(&snapshot.root_tree, &self.store_generation()?)?;
+                opened.commit()?;
             }
             *index = Some(opened);
         }
         Ok(std::cell::RefMut::map(index, |index| {
             index.as_mut().expect("opened above")
         }))
+    }
+
+    fn load_tree_index(
+        &self,
+        index: &PathIndex,
+        root: &ObjectId,
+        parent: &[u8],
+    ) -> anyhow::Result<()> {
+        tree::for_each_entry(&self.store, root, |entry| {
+            let mut path = parent.to_vec();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&entry.name);
+            index.upsert(&path, parent, &entry)?;
+            if entry.kind == EntryKind::Directory {
+                self.load_tree_index(
+                    index,
+                    &entry.target.context("directory has no tree")?,
+                    &path,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     fn index_matches_head(
@@ -4149,7 +4229,8 @@ impl FurrowRepository {
             return Ok(false);
         };
         let snapshot: Snapshot = self.store.read_struct(&head, ObjectKind::Snapshot)?;
-        Ok(root == snapshot.root_tree
+        Ok(self.indexed_head_matches(&head)?
+            && root == snapshot.root_tree
             && snapshot.excluded_paths == policy.rule_strings()
             && snapshot.ignored.is_some() == policy.ignored_summary().is_some())
     }
@@ -4162,8 +4243,35 @@ impl FurrowRepository {
         ))
     }
 
+    /// A head and generation token keeps full-screen boundaries across process
+    /// replacement without storing a second copy of the snapshot's paths.
+    fn indexed_head_token(&self, head: &ObjectId) -> anyhow::Result<String> {
+        Ok(format!("{}:{}\n", id_hex(head), self.store_generation()?))
+    }
+
+    fn indexed_head_matches(&self, head: &ObjectId) -> anyhow::Result<bool> {
+        match fs::read(self.workspace_data_dir().join("paths.head")) {
+            Ok(bytes) => Ok(bytes == self.indexed_head_token(head)?.as_bytes()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remember_indexed_head(&self, head: &ObjectId) -> anyhow::Result<()> {
+        // This cache hint needs no flush: loss or a torn write only forces a
+        // full plan. The token also fences head rollback and store recovery.
+        fs::write(
+            self.workspace_data_dir().join("paths.head"),
+            self.indexed_head_token(head)?,
+        )?;
+        Ok(())
+    }
+
     fn invalidate_path_index(&self) -> anyhow::Result<()> {
-        let mut index = self.open_path_index()?;
+        let directory = self.workspace_data_dir();
+        atomic_write(&directory.join("paths.head"), b"invalid\n")?;
+        crate::platform::sync_path(&directory)?;
+        let mut index = self.open_path_index_with_head(false)?;
         index.begin()?;
         index.reset()?;
         index.commit()
@@ -4197,21 +4305,54 @@ impl FurrowRepository {
     /// core.fileMode=false does. A newly created regular file starts at 0644.
     fn recorded_mode(&self, relative: &[u8], local: u32) -> anyhow::Result<u32> {
         #[cfg(windows)]
-        if let Some(head) = self.store.workspace_head(&self.workspace_id)? {
-            let snapshot: Snapshot = self.store.read_struct(&head, ObjectKind::Snapshot)?;
-            if let Some(entry) = self.lookup_tree_path(&snapshot.root_tree, relative)? {
-                if matches!(
-                    (entry.kind, local & 0o170000),
-                    (EntryKind::File, 0o100000)
-                        | (EntryKind::Directory, 0o040000)
-                        | (EntryKind::Symlink, 0o120000)
-                ) {
-                    return Ok(entry.mode);
-                }
+        if let Some((kind, mode)) = self.previous_modes.borrow().get(relative) {
+            if matches!(
+                (kind, local & 0o170000),
+                (EntryKind::File, 0o100000)
+                    | (EntryKind::Directory, 0o040000)
+                    | (EntryKind::Symlink, 0o120000)
+            ) {
+                return Ok(*mode);
             }
         }
         let _ = relative;
         Ok(local)
+    }
+
+    #[cfg(windows)]
+    fn prepare_recorded_modes(&self) -> anyhow::Result<()> {
+        let mut modes = self.previous_modes.borrow_mut();
+        modes.clear();
+        if let Some(head) = self.store.workspace_head(&self.workspace_id)? {
+            let snapshot: Snapshot = self.store.read_struct(&head, ObjectKind::Snapshot)?;
+            self.load_recorded_modes(&snapshot.root_tree, &[], &mut modes)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn load_recorded_modes(
+        &self,
+        root: &ObjectId,
+        parent: &[u8],
+        modes: &mut BTreeMap<Vec<u8>, (EntryKind, u32)>,
+    ) -> anyhow::Result<()> {
+        tree::for_each_entry(&self.store, root, |entry| {
+            let mut path = parent.to_vec();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&entry.name);
+            if entry.kind == EntryKind::Directory {
+                self.load_recorded_modes(
+                    &entry.target.context("directory has no tree")?,
+                    &path,
+                    modes,
+                )?;
+            }
+            modes.insert(path, (entry.kind, entry.mode));
+            Ok(())
+        })
     }
 
     fn unchanged_row(

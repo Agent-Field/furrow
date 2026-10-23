@@ -183,6 +183,21 @@ pub fn entry_identity(
     })
 }
 
+/// A hinted path needs its link count after an index is reconstructed from
+/// portable trees, which deliberately carry no local inode numbers. Full walks
+/// discover aliases from enumeration identities and never call this helper.
+pub fn path_link_count(path: &Path) -> io::Result<u32> {
+    let file = fs::OpenOptions::new().read(true).share_mode(7).open(path)?;
+    // SAFETY: the structure is writable and the file handle remains live.
+    unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.nNumberOfLinks)
+    }
+}
+
 /// Delta captures enumerate the parent once rather than opening the changed entry for identity.
 pub fn path_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
     let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;

@@ -62,6 +62,16 @@ impl Catalog {
         let conn =
             Connection::open(path).with_context(|| format!("open catalog {}", path.display()))?;
         crate::writer_wait::configure(&conn)?;
+        // Older writers must stop before binding a workspace to their obsolete
+        // path index. The function name makes SQLite's refusal identify the format.
+        conn.create_scalar_function(
+            "requires_furrow_shared_paths_v1",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+            |_| Ok(1_i32),
+        )?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // The catalog indexes the packs and the reference log, which are the
         // durable record: a commit lost to a crash is rebuilt at the next
@@ -90,6 +100,10 @@ impl Catalog {
                 root BLOB NOT NULL UNIQUE,
                 head BLOB
             );
+            CREATE TRIGGER IF NOT EXISTS shared_paths_writer_version
+                BEFORE INSERT ON workspaces BEGIN
+                    SELECT requires_furrow_shared_paths_v1();
+                END;
             CREATE TABLE IF NOT EXISTS timeline (
                 workspace_id TEXT NOT NULL,
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,

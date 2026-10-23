@@ -57,7 +57,7 @@ Still unproven and therefore not claimed as achieved:
 - Idle watcher `<1% CPU / <=150 MiB RSS` across 10 repos and 2M entries.
 - The complete Btrfs/ZFS/overlayfs/APFS/XFS platform matrix.
 - Ten-universe physical-memory/page-cache sharing. The harness measures startup wall time, CPU, and process RSS, but the `~1.0x` shared-page-cache goal remains unclaimed until resident pages are measured on Linux CoW filesystems.
-- Generic flat-directory Merkle diff is proportional to root page count; agent delta sealing avoids that path through the disk-backed changed-path index.
+- Generic flat-directory Merkle diff is proportional to root page count; agent delta sealing avoids that path through the in-memory changed-path index.
 - Fork verification remains O(entries) without a true immutable filesystem snapshot, even when hierarchy creation is atomic.
 
 ## Warm SSH Session Smoke Baseline: 2026-07-10
@@ -384,3 +384,28 @@ Release profile measurements retained Git/index/sparse/config behavior: s+thin g
 | macOS amd64 | SDK link blocked | unavailable |
 
 Both macOS cross-builds reached linking but require missing CoreFoundation/CoreServices framework SDK definitions. No stub or unresolved-symbol artifact substitutes for a working binary.
+
+## Shared path records (F8)
+
+Persistent paths now live only in shared, content-addressed Tree objects. The
+per-timeline working index is reconstructed in memory. Ordinary leaves and
+branches target 4 KiB; the maximum accepted object page stays 64 KiB for long
+entries. There is no new exchange schema. Unused directory-cache updates and
+fork-time index backups have been removed. A constant-size workspace head token
+preserves restore invalidation across process replacement; stale or torn tokens
+force a full capture plan, and legacy indexes require one full baseline. Advancing
+this advisory token adds no capture fsync. Windows mode preservation resolves
+the previous snapshot once per capture and reads its entries once, retaining the
+existing full-walk and screening fallbacks.
+
+Size-based page packing can reflow pages within a changed directory; worst-case
+metadata growth for arbitrary flat directories is not bounded by changed-path
+count. The in-memory working index still scales with the timeline's path count.
+
+This does not establish the complete F8 latency/disk contract. The catalog still
+commits SQLite WAL transactions on the capture writer. Those transactions can
+flush a WAL header and grow the WAL by more than 20 KB per edit. Removing that
+wait safely requires a staged catalog read view and asynchronous persistent
+index commits; disabling synchronous SQLite writes without recovery changes is
+not equivalent. Measurements and gate results are recorded in the F8 lane's
+NOTES.md and raw artifacts, including host I/O pressure.

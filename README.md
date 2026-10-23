@@ -322,10 +322,23 @@ message asking you to retry; a second wait cannot restart that budget.
 Windows capture enumerates directory file IDs to preserve hard-link groups and
 distinguish replaced files in the stat cache without opening each file for its ID.
 
+Each snapshot names a content-addressed directory tree shared by all timelines.
+Opening another timeline on the same saved folder does not copy its path index
+to disk. Ordinary tree pages target 4 KiB, so a small edit replaces small pages
+on its directory ancestry. A working index is reconstructed in memory from the
+saved tree when needed. Old `paths.sqlite3` files remain untouched. A constant-size
+head token preserves the full-capture boundary after restore across process
+replacement; an invalid, stale or torn token widens the next plan.
+
+This local catalog requires a writer that supports shared path indexes. Older
+engines stop with `no such function: requires_furrow_shared_paths_v1` before
+binding the workspace. Snapshot objects and exchange frames keep their existing
+format; importing older snapshots remains supported.
+
 ### Screened captures and group durability
 
 `hook turn-end` writes the complete capture before returning. The local daemon
-keeps the store, catalog, pack and timeline path indexes open and flushes pending
+keeps the store, catalog and pack open, and keeps working path indexes in memory. It flushes pending
 captures in a group every 250 ms. A terminated caller or daemon leaves completed
 captures recoverable. A power failure can lose the pending group; checksummed
 pack records and a durable frontier let recovery remove an incomplete suffix

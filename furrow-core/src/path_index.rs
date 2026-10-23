@@ -1,4 +1,4 @@
-//! Rebuildable disk-backed path state for delta-only directory sealing.
+//! Rebuildable working path state for delta-only directory sealing.
 
 use crate::model::{EntryKind, ObjectId, TreeEntry};
 use anyhow::Context;
@@ -78,12 +78,6 @@ impl PathIndex {
         })
     }
 
-    pub(crate) fn defer_checkpoints(&self) -> anyhow::Result<()> {
-        self.connection
-            .pragma_update(None, "wal_autocheckpoint", 0)?;
-        Ok(())
-    }
-
     pub fn checkpoint(&self) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
         self.connection
@@ -99,6 +93,7 @@ impl PathIndex {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn backup_to(&self, path: &Path) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
         let mut destination = Connection::open(path)?;
@@ -138,14 +133,20 @@ impl PathIndex {
 
     pub fn upsert(&self, path: &[u8], parent: &[u8], entry: &TreeEntry) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
-        self.connection.execute(
-            "INSERT INTO entries(path, parent, name, entry) VALUES(?1, ?2, ?3, ?4)
+        self.connection
+            .prepare_cached(
+                "INSERT INTO entries(path, parent, name, entry) VALUES(?1, ?2, ?3, ?4)
              ON CONFLICT(path) DO UPDATE SET
                 parent=excluded.parent,
                 name=excluded.name,
                 entry=excluded.entry",
-            params![path, parent, &entry.name, serde_json::to_vec(entry)?],
-        )?;
+            )?
+            .execute(params![
+                path,
+                parent,
+                &entry.name,
+                serde_json::to_vec(entry)?
+            ])?;
         Ok(())
     }
 
@@ -194,13 +195,20 @@ impl PathIndex {
     ) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
         match identity {
-            Some((device, inode)) => self.connection.execute(
-                "INSERT OR REPLACE INTO links(path, device, inode) VALUES(?1, ?2, ?3)",
-                params![path, device as i64, crate::platform::sql_file_id(inode)],
-            )?,
+            Some((device, inode)) => self
+                .connection
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO links(path, device, inode) VALUES(?1, ?2, ?3)",
+                )?
+                .execute(params![
+                    path,
+                    device as i64,
+                    crate::platform::sql_file_id(inode)
+                ])?,
             None => self
                 .connection
-                .execute("DELETE FROM links WHERE path = ?1", params![path])?,
+                .prepare_cached("DELETE FROM links WHERE path = ?1")?
+                .execute(params![path])?,
         };
         Ok(())
     }

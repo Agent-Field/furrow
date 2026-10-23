@@ -237,7 +237,7 @@ fn p4_second_timeline_reuses_folder_rows_but_not_composed_private_rows() {
 
 #[test]
 fn p1_p3_a_stale_advisory_index_cannot_drop_a_completed_capture() {
-    // P1/C28/P3: a lost advisory index forces a screened full plan and preserves the authoritative head.
+    // F8 S1/S4/C28/C9: a stale legacy index cannot replace the authoritative tree or drop a completed capture.
     let f = Fixture::new();
     let mut repo = f.attach("chat");
     seal(&mut repo);
@@ -254,7 +254,10 @@ fn p1_p3_a_stale_advisory_index_cannot_drop_a_completed_capture() {
     fs::copy(saved, index).unwrap();
     fs::write(f.root.join("b"), b"next delta").unwrap();
     let plan = repo.capture_plan(Some(&[PathBuf::from("b")])).unwrap();
-    assert!(plan.full, "the guard must screen the full fallback");
+    assert!(plan
+        .paths
+        .contains(&f.root.canonicalize().unwrap().join("b")));
+    assert_eq!(repo.status().unwrap().head, Some(id_hex(&second)));
     let third = repo
         .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
         .unwrap();
@@ -751,14 +754,220 @@ fn p4_sync_and_independent_index_folding_preserve_completed_captures() {
             Some(format!("committed {i}").into_bytes())
         );
     }
-    // P5/P6: a live durability worker must not pin a retired advisory index on Windows.
+    // F8 S1/S4/C28: a live durability worker retains no per-timeline path database on either platform.
     let index = repo.workspace_data_dir().join("paths.sqlite3");
     drop(repo);
-    fs::remove_file(index).unwrap();
+    assert!(!index.exists());
     let mut reopened = f.attach("checkpoint-worker");
     let id = seal(&mut reopened);
     assert_eq!(
         snapshot_bytes(&reopened, &id, "a"),
         Some(b"committed 2".to_vec())
     );
+}
+
+#[test]
+fn f8_s1_s4_reopening_reconstructs_delta_paths_and_preserves_link_groups() {
+    // F8 S1/S4/C28: trees alone reconstruct paths after reopen, including unchanged hard-link groups.
+    let f = Fixture::new();
+    fs::create_dir(f.root.join("nested")).unwrap();
+    fs::write(f.root.join("nested/b"), b"unchanged").unwrap();
+    fs::hard_link(f.root.join("nested/b"), f.root.join("nested/c")).unwrap();
+    let mut repo = f.attach("shared-paths");
+    let first = seal(&mut repo);
+    assert!(!repo.workspace_data_dir().join("paths.sqlite3").exists());
+    let first_snapshot: Snapshot = repo
+        .store
+        .read_struct(&first, ObjectKind::Snapshot)
+        .unwrap();
+    assert_eq!(first_snapshot.hardlinks.len(), 1);
+    drop(repo);
+    let mut repo = f.attach("shared-paths");
+    fs::write(f.root.join("a"), b"edited").unwrap();
+    let next = repo
+        .snapshot_changed_paths(None, SnapshotTrigger::AgentRun, &[PathBuf::from("a")])
+        .unwrap();
+    let next_snapshot: Snapshot = repo.store.read_struct(&next, ObjectKind::Snapshot).unwrap();
+    assert_eq!(first_snapshot.hardlinks, next_snapshot.hardlinks);
+    assert_eq!(
+        repo.lookup_tree_path(&first_snapshot.root_tree, b"nested/b")
+            .unwrap(),
+        repo.lookup_tree_path(&next_snapshot.root_tree, b"nested/b")
+            .unwrap()
+    );
+    assert_eq!(snapshot_bytes(&repo, &next, "a"), Some(b"edited".to_vec()));
+}
+
+#[test]
+fn f8_s1_s2_identical_chats_share_every_tree_and_edits_replace_small_pages() {
+    // F8 S1/S2: identical folders add no trees, and a single-file edit stages at most 20 KB of objects.
+    let f = Fixture::new();
+    for d in 0..10 {
+        let dir = f.root.join(format!("d{d:03}"));
+        fs::create_dir(&dir).unwrap();
+        for n in 0..100 {
+            fs::write(dir.join(format!("f{n:03}")), b"content").unwrap();
+        }
+    }
+    let mut first = f.attach("first");
+    let original = seal(&mut first);
+    let original_tree: Snapshot = first
+        .store
+        .read_struct(&original, ObjectKind::Snapshot)
+        .unwrap();
+    let mut second = f.attach("second");
+    let before = fs::metadata(second.store_root().join("packs/pack-000001.agp"))
+        .unwrap()
+        .len();
+    let shared = seal(&mut second);
+    let shared_tree: Snapshot = second
+        .store
+        .read_struct(&shared, ObjectKind::Snapshot)
+        .unwrap();
+    let after = fs::metadata(second.store_root().join("packs/pack-000001.agp"))
+        .unwrap()
+        .len();
+    assert_eq!(original_tree.root_tree, shared_tree.root_tree);
+    assert!(after - before <= 100_000, "{} bytes", after - before);
+    assert!(!second.workspace_data_dir().join("paths.sqlite3").exists());
+    fs::write(f.root.join("d000/f000"), b"changed").unwrap();
+    second
+        .snapshot_changed_paths(
+            None,
+            SnapshotTrigger::AgentRun,
+            &[PathBuf::from("d000/f000")],
+        )
+        .unwrap();
+    let edited = fs::metadata(second.store_root().join("packs/pack-000001.agp"))
+        .unwrap()
+        .len();
+    assert!(edited - after <= 20_000, "{} bytes", edited - after);
+}
+
+#[test]
+fn f8_s4_c25_legacy_indexes_are_never_removed_or_used_as_snapshot_truth() {
+    // F8 S4/C25: an old index is preserved byte for byte, while the saved tree remains authoritative.
+    let f = Fixture::new();
+    let mut repo = f.attach("legacy-index");
+    let saved = seal(&mut repo);
+    let path = repo.workspace_data_dir().join("paths.sqlite3");
+    fs::write(&path, b"legacy index left untouched").unwrap();
+    drop(repo);
+    let mut repo = f.attach("legacy-index");
+    let next = repo
+        .snapshot_changed_paths(None, SnapshotTrigger::AgentRun, &[])
+        .unwrap();
+    assert_eq!(
+        snapshot_bytes(&repo, &saved, "a"),
+        snapshot_bytes(&repo, &next, "a")
+    );
+    assert_eq!(fs::read(path).unwrap(), b"legacy index left untouched");
+}
+
+#[test]
+#[cfg(windows)]
+fn f8_s6_native_full_walk_measurement() {
+    // F8 S6: native full walks report cold, unchanged and one-edit cost with exact restored bytes.
+    let f = Fixture::new();
+    // Exclude the helper's seed so future runs contain exactly 10,000 files.
+    fs::remove_file(f.root.join("a")).unwrap();
+    for d in 0..100 {
+        let dir = f.root.join(format!("d{d:03}"));
+        fs::create_dir(&dir).unwrap();
+        for n in 0..100 {
+            fs::write(dir.join(format!("f{n:03}")), b"content").unwrap();
+        }
+    }
+    let mut repo = f.attach("native-perf");
+    repo.store.retain_file_cache();
+    let mut measurements = Vec::new();
+    let start = Instant::now();
+    seal(&mut repo);
+    measurements
+        .push(serde_json::json!({"kind": "first", "ms": start.elapsed().as_secs_f64() * 1000.0}));
+    for sample in 0..5 {
+        let start = Instant::now();
+        seal(&mut repo);
+        measurements.push(serde_json::json!({"kind": "unchanged", "sample": sample, "ms": start.elapsed().as_secs_f64() * 1000.0}));
+        fs::write(f.root.join("d000/f000"), format!("edit {sample}")).unwrap();
+        let start = Instant::now();
+        let saved = seal(&mut repo);
+        measurements.push(serde_json::json!({"kind": "edit", "sample": sample, "ms": start.elapsed().as_secs_f64() * 1000.0}));
+        assert_eq!(
+            snapshot_bytes(&repo, &saved, "d000/f000"),
+            Some(format!("edit {sample}").into_bytes())
+        );
+    }
+    if let Some(output) = std::env::var_os("FURROW_PORTABLE_OUT") {
+        let output = PathBuf::from(output);
+        fs::create_dir_all(&output).unwrap();
+        fs::write(
+            output.join("f8-native-perf.json"),
+            serde_json::to_vec_pretty(&measurements).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn f8_s4_older_writer_cannot_bind_an_upgraded_store() {
+    // F8 S4: a connection without the new format capability refuses workspace binding before any file restore.
+    let f = Fixture::new();
+    let mut repo = f.attach("writer-version");
+    seal(&mut repo);
+    let old = rusqlite::Connection::open(repo.store_root().join("catalog.sqlite3")).unwrap();
+    let error = old
+        .execute(
+            "INSERT OR IGNORE INTO workspaces(id, root) VALUES('old', x'6f6c64')",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires_furrow_shared_paths_v1"),
+        "{error}"
+    );
+    assert_eq!(fs::read(f.root.join("a")).unwrap(), b"first");
+    seal(&mut repo);
+}
+
+#[test]
+fn f8_c9_restore_invalidation_survives_reopening_and_stale_head_hints() {
+    // F8 S4/C9/C28: even no-op rewind inspection preserves a full-screen boundary across processes.
+    for apply in [false, true] {
+        let f = Fixture::new();
+        let mut repo = f.attach("restored");
+        let original = seal(&mut repo);
+        if apply {
+            repo.rewind(&original, &[], false).unwrap();
+        } else {
+            assert!(repo.plan_rewind(&original, &[]).unwrap().changes.is_empty());
+        }
+        drop(repo);
+        fs::write(f.root.join(".env"), b"new candidate after restore").unwrap();
+        let mut repo = f.attach("restored");
+        let plan = repo.capture_plan(Some(&[])).unwrap();
+        assert!(plan.full);
+        assert!(plan
+            .paths
+            .contains(&f.root.join(".env").canonicalize().unwrap()));
+        let next = seal(&mut repo);
+        let marker = repo.workspace_data_dir().join("paths.head");
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            repo.indexed_head_token(&next).unwrap().as_bytes()
+        );
+        drop(repo);
+        #[cfg(not(windows))]
+        assert!(!f.attach("restored").capture_plan(Some(&[])).unwrap().full);
+        for stale in [
+            b"invalid\n".to_vec(),
+            b"torn".to_vec(),
+            format!("{}\n", id_hex(&original)).into_bytes(),
+        ] {
+            fs::write(&marker, stale).unwrap();
+            assert!(f.attach("restored").capture_plan(Some(&[])).unwrap().full);
+        }
+    }
 }
