@@ -140,13 +140,28 @@ impl ChangeTracker {
                 if read_access(&event) {
                     return;
                 }
-                // Directory topology and renames can invalidate nonrecursive registrations and hard-link aliases.
+                // A regular create needs an inode watch before narrowing, including writes through outside aliases.
+                // Directory topology and renames still invalidate registrations and widen the scope.
+                let regular_create = matches!(
+                    event.kind,
+                    EventKind::Create(notify::event::CreateKind::File)
+                ) && !event.paths.is_empty()
+                    && cfg!(target_os = "linux")
+                    && event.paths.iter().all(|path| {
+                        fs::symlink_metadata(path)
+                            .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+                            && self
+                                .watcher
+                                .watch(path, RecursiveMode::NonRecursive)
+                                .is_ok()
+                    });
                 if matches!(
                     event.kind,
                     EventKind::Modify(notify::event::ModifyKind::Name(_))
                         | EventKind::Create(_)
                         | EventKind::Remove(_)
-                ) {
+                ) && !regular_create
+                {
                     self.uncertain = true;
                 }
                 for path in event.paths {
@@ -255,6 +270,19 @@ impl FurrowRepository {
     pub fn enable_change_tracking(&self) {
         self.store.retain_file_cache();
         *self.change_tracker.borrow_mut() = Some(ChangeTracker::new(self).ok());
+    }
+
+    // A replacement earns its baseline only from a full capture AFTER registration.
+    pub(super) fn prepare_full_tracking(&self) -> bool {
+        let rebuild = self
+            .change_tracker
+            .borrow()
+            .as_ref()
+            .is_some_and(|t| t.as_ref().is_some_and(|t| t.uncertain));
+        if rebuild {
+            self.enable_change_tracking();
+        }
+        rebuild
     }
 
     pub(super) fn select_tracked_changes(

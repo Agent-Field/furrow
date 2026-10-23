@@ -159,6 +159,11 @@ impl Catalog {
         Ok(())
     }
 
+    pub(crate) fn defer_checkpoints(&self) -> anyhow::Result<()> {
+        self.conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        Ok(())
+    }
+
     pub(crate) fn checkpoint(&self) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
         self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;

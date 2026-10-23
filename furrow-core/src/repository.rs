@@ -651,8 +651,7 @@ impl FurrowRepository {
     /// Makes all captures in this data directory durable before returning.
     pub fn sync(&self) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
-        self.store.sync()?;
-        self.checkpoint_capture_index()
+        self.store.sync()
     }
 
     /// Bounds the advisory WAL without putting checkpoints on the capture path.
@@ -745,7 +744,10 @@ impl FurrowRepository {
             None => self.store.workspace_head(&self.workspace_id)?,
         };
         let policy = self.load_policy()?;
-        let (tracked, watermark) = self.tracked_changes()?;
+        let (mut tracked, mut watermark) = self.tracked_changes()?;
+        if changed_paths.is_none() && self.prepare_full_tracking() {
+            (tracked, watermark) = self.tracked_changes()?;
+        }
         let trusted_baseline = tracked.is_some();
         let selected = self.select_tracked_changes(changed_paths, tracked);
         let changed_paths = if self.capture_scope.borrow().is_some() {
@@ -4123,9 +4125,11 @@ impl FurrowRepository {
     fn open_path_index(&self) -> anyhow::Result<std::cell::RefMut<'_, PathIndex>> {
         let mut index = self.path_index.borrow_mut();
         if index.is_none() {
-            *index = Some(PathIndex::open(
-                &self.workspace_data_dir().join("paths.sqlite3"),
-            )?);
+            let opened = PathIndex::open(&self.workspace_data_dir().join("paths.sqlite3"))?;
+            if self.change_tracker.borrow().is_some() {
+                opened.defer_checkpoints()?;
+            }
+            *index = Some(opened);
         }
         Ok(std::cell::RefMut::map(index, |index| {
             index.as_mut().expect("opened above")

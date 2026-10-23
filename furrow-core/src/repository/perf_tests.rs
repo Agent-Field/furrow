@@ -651,3 +651,114 @@ fn q3_completed_mapped_writes_are_captured_after_the_writer_closes() {
     let id = seal(&mut repo);
     assert_eq!(snapshot_bytes(&repo, &id, "a"), Some(b"other".to_vec()));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn p3_new_regular_files_do_not_repeat_the_cold_walk() {
+    // P3/P5: a new regular file must be screened and captured without discarding healthy directory watches.
+    let f = Fixture::new();
+    let mut repo = f.attach("new-files");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    for i in 0..8 {
+        let path = f.root.join(format!("created-{i}"));
+        fs::write(&path, format!("new bytes {i}")).unwrap();
+        let plan = repo.capture_plan(None).unwrap();
+        assert!(!plan.full, "regular-file creation must not restart warm-up");
+        assert!(plan.paths.contains(&path));
+        let id = repo
+            .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+            .unwrap();
+        assert_eq!(
+            snapshot_bytes(&repo, &id, &format!("created-{i}")),
+            Some(format!("new bytes {i}").into_bytes())
+        );
+    }
+    // P5: the newly registered inode still reports a write through an alias outside the workspace.
+    let alias = f.data.join("outside-new-alias");
+    fs::hard_link(f.root.join("created-7"), &alias).unwrap();
+    fs::write(alias, b"outside change").unwrap();
+    let plan = repo.capture_plan(None).unwrap();
+    assert!(plan.full);
+    let id = repo
+        .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+        .unwrap();
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "created-7"),
+        Some(b"outside change".to_vec())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn p3_one_full_capture_reestablishes_a_changed_directory_baseline() {
+    // P3/P5: topology uncertainty widens once, and the replacement watches precede the full screened capture.
+    let f = Fixture::new();
+    let mut repo = f.attach("topology");
+    repo.enable_change_tracking();
+    seal(&mut repo);
+    fs::create_dir(f.root.join("new-directory")).unwrap();
+    fs::write(f.root.join("new-directory/a"), b"new child").unwrap();
+    let plan = repo.capture_plan(None).unwrap();
+    assert!(plan.full);
+    repo.seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+        .unwrap();
+    let plan = repo.capture_plan(None).unwrap();
+    assert!(
+        !plan.full,
+        "one complete capture after watch registration establishes the baseline"
+    );
+    fs::write(f.root.join("new-directory/a"), b"later child").unwrap();
+    let plan = repo.capture_plan(None).unwrap();
+    assert!(!plan.full);
+    assert!(plan.paths.contains(&f.root.join("new-directory/a")));
+    let id = repo
+        .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+        .unwrap();
+    assert_eq!(
+        snapshot_bytes(&repo, &id, "new-directory/a"),
+        Some(b"later child".to_vec())
+    );
+}
+
+#[test]
+fn p4_sync_and_independent_index_folding_preserve_completed_captures() {
+    // P4/P5/C28: checkpointing advisory indexes separately never loses an acknowledged head or its bytes.
+    let f = Fixture::new();
+    for i in 0..4096 {
+        fs::write(f.root.join(format!("{i:04}-{}", "x".repeat(92))), b"small").unwrap();
+    }
+    let mut repo = f.attach("checkpoint-worker");
+    repo.store.defer_checkpoints().unwrap();
+    repo.enable_change_tracking();
+    let first = seal(&mut repo);
+    let root = repo.store_root().to_owned();
+    let mut group = crate::store::GroupCommit::open(&root).unwrap();
+    for i in 0..3 {
+        fs::write(f.root.join("a"), format!("committed {i}")).unwrap();
+        repo.defer_durability().unwrap();
+        let plan = repo.capture_plan(None).unwrap();
+        let id = repo
+            .seal_plan(None, SnapshotTrigger::AgentRun, &plan.token)
+            .unwrap();
+        assert_ne!(first, id);
+        repo.sync().unwrap();
+        group.checkpoint_indexes().unwrap();
+        let reopened = f.attach("checkpoint-worker");
+        assert_eq!(reopened.status().unwrap().head, Some(id_hex(&id)));
+        assert_eq!(
+            snapshot_bytes(&reopened, &id, "a"),
+            Some(format!("committed {i}").into_bytes())
+        );
+    }
+    // P5/P6: a live durability worker must not pin a retired advisory index on Windows.
+    let index = repo.workspace_data_dir().join("paths.sqlite3");
+    drop(repo);
+    fs::remove_file(index).unwrap();
+    let mut reopened = f.attach("checkpoint-worker");
+    let id = seal(&mut reopened);
+    assert_eq!(
+        snapshot_bytes(&reopened, &id, "a"),
+        Some(b"committed 2".to_vec())
+    );
+}

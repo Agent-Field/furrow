@@ -78,6 +78,53 @@ impl GroupCommit {
         self.sync_locked()
     }
 
+    /// Advisory indexes checkpoint independently; durability is carried by packs and references.
+    pub fn checkpoint_indexes(&mut self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
+        let maintenance = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("locks/maintenance.lock"))?;
+        wait_lock(&maintenance, false)?;
+        let mut paths = vec![self.root.join("catalog.sqlite3")];
+        for entry in fs::read_dir(self.root.join("workspaces"))? {
+            let path = entry?.path().join("paths.sqlite3");
+            if path.exists() {
+                paths.push(path);
+            }
+        }
+        for path in paths {
+            let mut wal = path.as_os_str().to_owned();
+            wal.push("-wal");
+            if fs::metadata(wal).map_or(0, |m| m.len()) <= crate::sqlite_adapter::WAL_BUDGET {
+                continue;
+            }
+            // Release each connection after folding so Windows can retire or replace a timeline's index.
+            let connection = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+            crate::writer_wait::configure(&connection)?;
+            connection.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+            // PASSIVE never waits for an active writer or reader. Its next tick carries unfinished pages.
+            let result = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+            if let Err(error) = result {
+                if !matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) {
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn sync_locked(&mut self) -> anyhow::Result<()> {
         let root = &self.root;
         let initial = !root.join("group-commit.json").exists();
@@ -878,6 +925,11 @@ impl ObjectStore {
         self.deferred.set(false);
     }
 
+    /// Retained writers leave advisory WAL folding to the independent group worker.
+    pub fn defer_checkpoints(&self) -> anyhow::Result<()> {
+        self.catalog.defer_checkpoints()
+    }
+
     pub(crate) fn checkpoint_catalog(&self) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
         self.catalog.checkpoint()
@@ -891,7 +943,7 @@ impl ObjectStore {
         if let Some(run) = self.unsynced.take() {
             self.catalog.batch(|| self.advance_checkpoint(&run))?;
         }
-        self.catalog.checkpoint()
+        Ok(())
     }
 
     fn sync_files_locked(&self) -> anyhow::Result<()> {

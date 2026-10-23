@@ -78,6 +78,12 @@ impl PathIndex {
         })
     }
 
+    pub(crate) fn defer_checkpoints(&self) -> anyhow::Result<()> {
+        self.connection
+            .pragma_update(None, "wal_autocheckpoint", 0)?;
+        Ok(())
+    }
+
     pub fn checkpoint(&self) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
         self.connection

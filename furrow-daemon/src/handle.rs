@@ -38,6 +38,7 @@ impl Handle {
         }
         let store = self.store.as_ref().expect("opened above");
         store.retain_file_cache();
+        store.defer_checkpoints()?;
         Ok(store)
     }
 

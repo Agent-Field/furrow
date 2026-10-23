@@ -10,7 +10,7 @@ pub struct ConsistentBackup {
 }
 
 /// The most log a WAL-mode index may carry into an open.
-const WAL_BUDGET: u64 = 1 << 20;
+pub(crate) const WAL_BUDGET: u64 = 1 << 20;
 
 /// Folds the log of a database whose connections skip the close-time
 /// checkpoint. A skipped checkpoint never lets the log restart, and every open
