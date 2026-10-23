@@ -7,13 +7,16 @@ use anyhow::Context;
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::BufReader;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 const TICK: Duration = Duration::from_millis(50);
 
@@ -71,13 +74,13 @@ impl Server {
     pub fn bind(config: Config) -> anyhow::Result<Option<Self>> {
         let dir = config.socket.parent().context("socket has no directory")?;
         fs::create_dir_all(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        furrow::platform::set_mode(dir, 0o700)?;
         let Some(lock) = take_lock(&config.socket)? else {
             return Ok(None);
         };
         let _ = fs::remove_file(&config.socket);
         let listener = UnixListener::bind(&config.socket).context("bind socket")?;
-        fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
+        furrow::platform::set_mode(&config.socket, 0o600)?;
         listener.set_nonblocking(true)?;
         Ok(Some(Self {
             listener,
@@ -104,7 +107,11 @@ impl Server {
             self.accept_pending();
         }
         self.router.close();
+        #[cfg(windows)]
+        drop(self.listener);
         let _ = fs::remove_file(&self.config.socket);
+        #[cfg(windows)]
+        crate::signals::finished();
         Ok(())
     }
 
@@ -116,6 +123,7 @@ impl Server {
     /// Sleeps until a client connects or a tick passes, whichever is first, so
     /// a connection is accepted at once and the exit conditions are still
     /// looked at every tick.
+    #[cfg(unix)]
     fn wait_for_client(&self) {
         let mut waiting = libc::pollfd {
             fd: self.listener.as_raw_fd(),
@@ -124,6 +132,11 @@ impl Server {
         };
         // SAFETY: one valid pollfd, and the descriptor outlives the call.
         unsafe { libc::poll(&mut waiting, 1, TICK.as_millis() as libc::c_int) };
+    }
+
+    #[cfg(windows)]
+    fn wait_for_client(&self) {
+        std::thread::sleep(TICK);
     }
 
     fn accept_pending(&self) {

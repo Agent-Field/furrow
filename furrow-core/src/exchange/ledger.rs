@@ -60,9 +60,7 @@ impl Ledger {
     /// A new ledger file is only durable once its directory entry is.
     fn sync_directory(&self) -> anyhow::Result<()> {
         let parent = self.path.parent().context("ledger has no directory")?;
-        fs::File::open(parent)?
-            .sync_all()
-            .context("sync ledger directory")
+        crate::platform::sync_path(parent).context("sync ledger directory")
     }
 }
 

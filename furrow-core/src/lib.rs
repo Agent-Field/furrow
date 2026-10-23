@@ -18,6 +18,7 @@ pub mod model;
 pub mod name_fold;
 pub mod overlay;
 pub mod path_index;
+pub mod platform;
 pub mod policy;
 pub mod radar;
 pub mod refs;

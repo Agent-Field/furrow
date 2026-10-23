@@ -1,6 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -141,7 +141,7 @@ fn clear_pressure(store_root: &Path) -> anyhow::Result<()> {
     let path = store_root.join(PRESSURE_FILE);
     if path.exists() {
         fs::remove_file(path)?;
-        File::open(store_root)?.sync_all()?;
+        crate::platform::sync_path(store_root)?;
     }
     Ok(())
 }
@@ -161,8 +161,8 @@ fn atomic_write(store_root: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<(
         .open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(temporary, path)?;
-    File::open(store_root)?.sync_all()?;
+    crate::platform::rename(temporary, path)?;
+    crate::platform::sync_path(store_root)?;
     Ok(())
 }
 

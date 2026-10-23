@@ -9,11 +9,11 @@
 //! snapshot to one another, never to anything else.
 
 use crate::model::LinkGroup;
+use crate::platform::MetadataExt;
+use crate::platform::OsStrExt;
 use anyhow::Context;
 use serde_bytes::ByteBuf;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,9 +71,17 @@ pub fn restore(
     Ok(unlinked)
 }
 
+#[cfg(unix)]
 fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
     let (left, right) = (fs::symlink_metadata(left)?, fs::symlink_metadata(right)?);
     Ok((left.dev(), left.ino()) == (right.dev(), right.ino()))
+}
+
+#[cfg(windows)]
+fn same_file(_: &Path, _: &Path) -> anyhow::Result<bool> {
+    // Relinking an already linked pair is safe; never claim two unknown file
+    // IDs are equal and accidentally leave separate copies unlinked.
+    Ok(false)
 }
 
 fn relink(anchor: &Path, member: &Path) -> anyhow::Result<()> {
@@ -89,7 +97,7 @@ fn relink(anchor: &Path, member: &Path) -> anyhow::Result<()> {
             String::from_utf8_lossy(member.as_os_str().as_bytes())
         )
     })?;
-    fs::rename(&beside, member).inspect_err(|_| {
+    crate::platform::rename(&beside, member).inspect_err(|_| {
         let _ = fs::remove_file(&beside);
     })?;
     Ok(())

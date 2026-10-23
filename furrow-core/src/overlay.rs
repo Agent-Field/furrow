@@ -5,8 +5,8 @@
 //! Everything that walks the tree asks the overlay to translate between a
 //! tree-relative path and the place that path really lives.
 
+use crate::platform::{OsStrExt, OsStringExt};
 use std::ffi::OsString;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 /// Name of the composed entry at the top of the sealed tree.
@@ -32,7 +32,7 @@ impl Overlay {
         let mut logical = NAME.to_vec();
         if !rest.as_os_str().is_empty() {
             logical.push(b'/');
-            logical.extend_from_slice(rest.as_os_str().as_bytes());
+            logical.extend_from_slice(&crate::platform::path_bytes(rest));
         }
         Some(logical)
     }

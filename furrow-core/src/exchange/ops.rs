@@ -8,10 +8,10 @@ use super::ledger::Ledger;
 use super::materialize::materialize_holding;
 use super::open_store;
 use crate::model::{id_hex, parse_id};
+use crate::platform::OsStrExt;
 use crate::sealer::{CellSealer, Keys};
 use anyhow::Context;
 use serde_json::{json, Value};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 pub fn export(

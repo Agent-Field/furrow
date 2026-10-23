@@ -417,8 +417,8 @@ fn compact(store: &mut ObjectStore, marks: &MarkDatabase) -> anyhow::Result<u64>
     }
     output.sync_all()?;
     drop(output);
-    fs::rename(&temporary, &final_path)?;
-    File::open(&packs)?.sync_all()?;
+    crate::platform::rename(&temporary, &final_path)?;
+    crate::platform::sync_path(&packs)?;
 
     if std::env::var_os("FURROW_GC_FAILPOINT").as_deref()
         == Some(std::ffi::OsStr::new("after_pack_publish"))
@@ -453,7 +453,7 @@ fn compact(store: &mut ObjectStore, marks: &MarkDatabase) -> anyhow::Result<u64>
             fs::remove_file(entry.path())?;
         }
     }
-    File::open(&packs)?.sync_all()?;
+    crate::platform::sync_path(&packs)?;
     Ok(fs::metadata(final_path)?.len())
 }
 

@@ -750,6 +750,7 @@ impl Read for PatternReader {
     }
 }
 
+#[cfg(unix)]
 fn usage() -> anyhow::Result<Usage> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -784,4 +785,9 @@ fn environment_u64(name: &str, default: u64) -> anyhow::Result<u64> {
             .parse()
             .with_context(|| format!("parse environment variable {name}"))
     })
+}
+
+#[cfg(windows)]
+fn usage() -> anyhow::Result<Usage> {
+    anyhow::bail!("process resource measurements are unavailable on Windows")
 }

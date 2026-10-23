@@ -1,12 +1,11 @@
 //! Streaming discovery and removal of regenerable workspace caches.
 
+use crate::platform::MetadataExt;
 use crate::policy::CapturePolicy;
 use anyhow::Context;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::fs::{self, ReadDir};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 const MAX_CANDIDATES: usize = 10_000;
@@ -42,7 +41,7 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
         let relative = validate_relative(include)?;
         refuse_internal_path(&relative)?;
         anyhow::ensure!(
-            !policy.excludes_bytes(relative.as_os_str().as_bytes()),
+            !policy.excludes_bytes(&crate::platform::path_bytes(&relative)),
             "cannot shrink policy-excluded path {}; its undo bytes are not captured",
             include.display()
         );
@@ -73,7 +72,7 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
         if is_internal_root(&relative) {
             continue;
         }
-        if policy.excludes_bytes(relative.as_os_str().as_bytes()) {
+        if policy.excludes_bytes(&crate::platform::path_bytes(&relative)) {
             continue;
         }
         if let Some(class) = classify(&entry.path()) {
@@ -277,7 +276,7 @@ fn ensure_safe_ancestors(root: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

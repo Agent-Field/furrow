@@ -973,7 +973,7 @@ fn atomic_write_relaxed(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     ensure_durable_directory(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    crate::platform::persist(temporary, path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -1008,9 +1008,9 @@ fn write_packed_frame(
         );
     }
     for parent in parents {
-        fs::File::open(parent)?.sync_all()?;
+        crate::platform::sync_path(parent)?;
     }
-    fs::File::open(root)?.sync_all()?;
+    crate::platform::sync_path(root)?;
     Ok(())
 }
 
@@ -1055,8 +1055,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    fs::File::open(parent)?.sync_all()?;
+    crate::platform::persist(temporary, path).map_err(|error| error.error)?;
+    crate::platform::sync_path(parent)?;
     Ok(())
 }
 
@@ -1071,8 +1071,8 @@ fn ensure_durable_directory(path: &Path) -> anyhow::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
         Err(error) => return Err(error.into()),
     }
-    fs::File::open(path)?.sync_all()?;
-    fs::File::open(parent)?.sync_all()?;
+    crate::platform::sync_path(path)?;
+    crate::platform::sync_path(parent)?;
     Ok(())
 }
 

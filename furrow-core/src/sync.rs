@@ -2,6 +2,8 @@
 
 use crate::bundle;
 use crate::model::{Blob, ObjectId, ObjectKind, Snapshot};
+#[cfg(all(test, unix))]
+use crate::platform::PermissionsExt;
 use crate::remote::{self, RemoteSpec, Session};
 use crate::remote_crypto::RemoteCrypto;
 use crate::store::ObjectStore;
@@ -9,7 +11,6 @@ use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -121,7 +122,7 @@ pub fn pair(
     let parent = config_path.parent().context("sync config has no parent")?;
     fs::create_dir_all(parent)?;
     local_atomic_write(config_path, &serde_json::to_vec_pretty(&config)?)?;
-    fs::set_permissions(config_path, fs::Permissions::from_mode(0o600))?;
+    crate::platform::set_mode(config_path, 0o600)?;
     // Opening verifies SSH availability and creates the namespace through the
     // same opaque helper protocol used by normal transfers.
     drop(Session::open(&config.remote, storage_namespace(&config))?);
@@ -838,8 +839,8 @@ fn local_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     std::io::Write::write_all(&mut temporary, bytes)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    fs::File::open(parent)?.sync_all()?;
+    crate::platform::persist(temporary, path).map_err(|error| error.error)?;
+    crate::platform::sync_path(parent)?;
     Ok(())
 }
 
@@ -1061,6 +1062,8 @@ mod tests {
         let config_one = temporary.path().join("one.json");
         let remote = temporary.path().join("remote");
         let first = pair(&config_one, &remote, "project", None).unwrap();
+        // W5/W6: POSIX mode assertions apply on Unix; Windows uses its ACLs.
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&config_one).unwrap().permissions().mode() & 0o777,
             0o600

@@ -155,8 +155,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         if std::env::var_os(TEST_ENV).is_none() {
             let found = NameFolding::probe(dir.path());
-            // tmpfs and ext4 keep both names; a developer on a Mac sees folding.
-            assert_eq!(found.is_active(), cfg!(target_os = "macos"));
+            // W4: the probe detects name folding on NTFS and default APFS.
+            assert_eq!(found.is_active(), cfg!(any(target_os = "macos", windows)));
         }
     }
 }

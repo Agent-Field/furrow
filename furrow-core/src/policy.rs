@@ -2,7 +2,6 @@
 
 use anyhow::Context;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub const POLICY_FILE: &str = ".furrowpolicy";
@@ -94,7 +93,7 @@ impl CapturePolicy {
     pub fn excludes_path(&self, root: &Path, path: &Path) -> bool {
         path.strip_prefix(root)
             .ok()
-            .is_some_and(|relative| self.excludes_bytes(relative.as_os_str().as_bytes()))
+            .is_some_and(|relative| self.excludes_bytes(&crate::platform::path_bytes(relative)))
     }
 
     pub fn rules(&self) -> impl Iterator<Item = &[u8]> {

@@ -126,7 +126,7 @@ fn write_frame(outbox: &Path, frame: &Frame) -> anyhow::Result<FrameInfo> {
     let mut file = fs::File::create(&partial)?;
     file.write_all(&frame.bytes)?;
     file.sync_all()?;
-    fs::rename(&partial, &path)?;
+    crate::platform::rename(&partial, &path)?;
     Ok(FrameInfo {
         path,
         objects: frame.rids.len(),
