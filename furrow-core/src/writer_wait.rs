@@ -102,6 +102,88 @@ mod tests {
     use std::fs::OpenOptions;
 
     #[test]
+    fn q1_released_sqlite_and_file_locks_wake_within_four_hundred_ms() {
+        // Q1: each real holder releases at 200 ms; no waiter may sleep until its 30-second deadline.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("db");
+        let owner = rusqlite::Connection::open(&path).unwrap();
+        owner
+            .execute_batch("CREATE TABLE a (id); BEGIN IMMEDIATE")
+            .unwrap();
+        let waiter = rusqlite::Connection::open(&path).unwrap();
+        configure(&waiter).unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            owner.execute_batch("ROLLBACK").unwrap();
+        });
+        let start = Instant::now();
+        let _operation = Operation::start();
+        waiter.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "SQLite: {:?}",
+            start.elapsed()
+        );
+        holder.join().unwrap();
+        let path = temp.path().join("lock");
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        owner.lock_exclusive().unwrap();
+        let waiter = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            FileExt::unlock(&owner).unwrap();
+        });
+        let start = Instant::now();
+        crate::store::wait_lock(&waiter, true).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "file: {:?}",
+            start.elapsed()
+        );
+        holder.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn q1_windows_replacement_proceeds_when_the_editor_releases() {
+        // Q1/M1: sharing retries poll the editor's handle and finish within 400 ms after a 200 ms hold.
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let from = temp.path().join("new");
+        let to = temp.path().join("old");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let owner = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&to)
+            .unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(owner);
+        });
+        let start = Instant::now();
+        crate::platform::rename(&from, &to).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            start.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(std::fs::read(to).unwrap(), b"new");
+    }
+
+    #[test]
     fn m1_catalog_then_pack_lock_share_one_thirty_second_deadline() {
         // M1/S3: a successful catalog wait must leave only the unused budget for a different pack wait.
         let temp = tempfile::tempdir().unwrap();

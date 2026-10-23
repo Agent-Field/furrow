@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 
 #[cfg(windows)]
-const REPLACE_DELAYS_MS: [u64; 7] = [10, 20, 40, 80, 160, 320, 640];
+const REPLACE_DELAYS_MS: [u64; 127] = [10; 127];
 
 #[cfg(unix)]
 pub use std::os::unix::{

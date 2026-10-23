@@ -172,3 +172,53 @@ fn m1_p1_running_work_is_not_reported_as_writer_contention() {
     }
     router.close();
 }
+
+#[test]
+fn q1_queue_proceeds_when_the_holder_releases() {
+    // Q1: a queued request wakes when a 200 ms holder completes, without spending WRITER_WAIT.
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    struct Holder;
+    impl Verb for Holder {
+        fn name(&self) -> &'static str {
+            "holder"
+        }
+        fn run(&self, _: &mut Handle, _: Value) -> anyhow::Result<Value> {
+            ENTERED.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(json!({}))
+        }
+    }
+    struct Probe;
+    impl Verb for Probe {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn run(&self, _: &mut Handle, _: Value) -> anyhow::Result<Value> {
+            Ok(json!({}))
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let target = Target {
+        data_dir: temp.path().join("data"),
+        tree: temp.path().join("tree"),
+        timeline: None,
+        cell_dir: None,
+    };
+    let router = Arc::new(Router::new());
+    let worker_router = router.clone();
+    let worker_target = target.clone();
+    let holder = std::thread::spawn(move || {
+        worker_router
+            .submit(worker_target, &Holder, json!({}))
+            .unwrap()
+    });
+    while !ENTERED.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    let start = Instant::now();
+    router.submit(target, &Probe, json!({})).unwrap();
+    assert!(start.elapsed() < Duration::from_millis(400));
+    eprintln!("Q1 released daemon queue: {:?}", start.elapsed());
+    holder.join().unwrap();
+    router.close();
+}
