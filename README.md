@@ -209,6 +209,14 @@ external directory composed as `.cell/`, replacing any root `.cell/` entry in
 the sealed tree. An explicitly empty changed list
 means nothing changed; omitting the list requests a full capture.
 
+Windows MSVC executables reserve 32 MiB of stack through `.cargo/config.toml`,
+for debug and release builds, including daemon and test helpers. The same
+configuration statically links the MSVC runtime so fresh machines need no runtime
+installer. Debug command parsing alone can use more than Windows' default 1 MiB stack; recursive capture
+also needs headroom. The reserve uses virtual address space and commits pages on
+use. Keep this workspace configuration when building Windows artifacts.
+
+
 The black-box suite runs against independent temporary Git repositories and isolated stores: secret recovery, reversible rewind, metadata fidelity, SQLite logical recovery, index reconstruction, truncated-pack recovery, path-escape rejection, interrupted-rewind recovery, and fork isolation.
 
 ## License

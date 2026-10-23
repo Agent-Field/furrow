@@ -124,8 +124,6 @@ jobs:
       - name: Build
         if: runner.os != 'Linux'
         # Include the Windows C runtime so a fresh machine needs no runtime installer.
-        env:
-          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --locked -p furrow-cli --bin furrow --target ${{ matrix.target }} -j 4
 
       - name: Check Linux glibc floor
