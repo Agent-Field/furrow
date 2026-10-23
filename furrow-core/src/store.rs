@@ -699,7 +699,7 @@ impl ObjectStore {
         };
         let path = self.root.join("packs").join(&run.pack);
         if path.exists() {
-            File::open(path)?.sync_data()?;
+            crate::platform::sync_data(path)?;
         }
         self.advance_checkpoint(&run)
     }
