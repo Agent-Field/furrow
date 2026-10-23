@@ -186,3 +186,55 @@ fn w2_serve_cli_idle_zero_exits_cleanly_and_removes_the_socket() {
         .success();
     assert!(!socket.exists());
 }
+
+#[test]
+fn r0_windows_debug_cli_parses_and_captures_a_deep_ten_thousand_entry_tree() {
+    // R0/W1: the native executable must parse on Windows' main thread and
+    // capture 10,000 files across 64 directory levels without stack overflow.
+    Command::cargo_bin("furrow")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    let data = temp.path().join("data");
+    fs::create_dir(&root).unwrap();
+    let mut directory = root.clone();
+    let mut written = 0;
+    for depth in 0..64 {
+        directory.push("d");
+        fs::create_dir(&directory).unwrap();
+        let count = if depth < 16 { 157 } else { 156 };
+        for number in 0..count {
+            fs::write(directory.join(format!("f{number:03}")), b"deep\r\n\0\xff").unwrap();
+            written += 1;
+        }
+    }
+    assert_eq!(written, 10_000);
+    let start = std::time::Instant::now();
+    let answer = run(&data, &root, &["hook", "turn-end", "--turn", "deep"]);
+    let store = furrow::exchange::open_store(&data).unwrap();
+    let head = furrow::model::parse_id(answer["snapshot"].as_str().unwrap()).unwrap();
+    let snapshot: furrow::model::Snapshot = store
+        .read_struct(&head, furrow::model::ObjectKind::Snapshot)
+        .unwrap();
+    let mut pending = vec![snapshot.root_tree];
+    let mut files = 0;
+    while let Some(tree) = pending.pop() {
+        furrow::tree::for_each_entry(&store, &tree, |entry| {
+            match entry.kind {
+                furrow::model::EntryKind::Directory => pending.push(entry.target.unwrap()),
+                furrow::model::EntryKind::File => files += 1,
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(files, 10_000);
+    eprintln!(
+        "R0: depth 64, {files} files captured in {:?}",
+        start.elapsed()
+    );
+}
