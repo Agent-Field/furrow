@@ -202,3 +202,25 @@ fn p2_native_shell_preserves_quotes_and_failure_status() {
         b"exact\r\n"
     );
 }
+
+#[test]
+fn m1_w5_replacement_retries_use_the_remaining_operation_budget() {
+    // M1/W5: editor-sharing backoff inherits an existing deadline and leaves both files intact.
+    let temp = tempfile::tempdir().unwrap();
+    let old = temp.path().join("old");
+    let new = temp.path().join("new");
+    fs::write(&old, b"old").unwrap();
+    fs::write(&new, b"new").unwrap();
+    let _editor = OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&old)
+        .unwrap();
+    let start = Instant::now();
+    let _operation = furrow::writer_wait::Operation::until(start + Duration::from_millis(50));
+    let error = platform::rename(&new, &old).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(fs::read(old).unwrap(), b"old");
+    assert_eq!(fs::read(new).unwrap(), b"new");
+}

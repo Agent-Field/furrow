@@ -49,12 +49,16 @@ pub(super) struct PreparedPlan {
 impl FurrowRepository {
     /// Plans enumerate names and metadata, never file contents to be captured.
     pub fn capture_plan(&self, changed: Option<&[PathBuf]>) -> anyhow::Result<CapturePlan> {
+        let _operation = crate::writer_wait::Operation::start();
         let policy = self.load_policy()?;
         let generation = self.store_generation()?;
         let full = changed.is_none()
             || changed
                 .is_some_and(|paths| paths.iter().any(|p| capture_rules_changed(&self.root, p)))
             || !self.index_matches_head(&*self.open_path_index()?, &generation, &policy)?;
+        #[cfg(windows)]
+        let full =
+            full || self.windows_delta_needs_link_walk(changed.unwrap_or_default(), &policy)?;
         let mut prepared = PreparedPlan {
             root: self.root.clone(),
             workspace: self.workspace_id.clone(),
@@ -120,6 +124,7 @@ impl FurrowRepository {
         trigger: SnapshotTrigger,
         token: &str,
     ) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         anyhow::ensure!(
             token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid capture plan token"

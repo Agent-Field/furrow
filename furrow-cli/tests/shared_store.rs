@@ -599,7 +599,7 @@ fn s5_s7_shrink_cannot_remove_ignored_undo_bytes() {
 
 #[test]
 fn s3_stalled_writer_times_out_with_a_bounded_retry_message() {
-    // S3 bounds catalog contention and reports the wait rather than leaking a SQLite lock failure.
+    // M1/S3 bound a one-shot CLI writer; retained daemon contention is covered by the daemon suite.
     let rig = Rig::new();
     fs::write(rig.tree.join("file"), "data").unwrap();
     rig.seal("a");
@@ -608,6 +608,7 @@ fn s3_stalled_writer_times_out_with_a_bounded_retry_message() {
     let started = std::time::Instant::now();
     let output = Command::new(furrow_exe())
         .env("FURROW_DATA_DIR", &rig.data)
+        .env("FURROW_NO_DAEMON", "1")
         .env("HOME", rig._temp.path().join("home"))
         .args(["--json", "--repo"])
         .arg(&rig.tree)

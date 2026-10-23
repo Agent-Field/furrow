@@ -2,7 +2,6 @@ use anyhow::Context;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
-use std::time::Duration;
 use tempfile::NamedTempFile;
 
 pub struct ConsistentBackup {
@@ -45,21 +44,23 @@ pub fn is_sqlite(path: &Path) -> bool {
 }
 
 pub fn consistent_backup(path: &Path, temp_dir: &Path) -> anyhow::Result<ConsistentBackup> {
+    let _operation = crate::writer_wait::Operation::start();
     std::fs::create_dir_all(temp_dir)?;
     let source = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open SQLite database {}", path.display()))?;
-    source.busy_timeout(Duration::from_secs(2))?;
+    crate::writer_wait::configure(&source)?;
 
     let file = NamedTempFile::new_in(temp_dir)?;
     let mut destination = Connection::open(file.path())?;
+    crate::writer_wait::configure(&destination)?;
     // The temporary image is captured into the ordered pack before publication; syncing it adds no durability.
     destination.pragma_update(None, "synchronous", "OFF")?;
     {
         let backup = Backup::new(&source, &mut destination)?;
-        backup.run_to_completion(128, Duration::from_millis(2), None)?;
+        crate::writer_wait::backup(&backup, 128)?;
     }
     let integrity: String =
         destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;

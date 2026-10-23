@@ -113,10 +113,9 @@ fn r1_second_full_capture_of_a_thousand_settled_files_reads_no_contents() {
 }
 
 #[test]
-fn r1_windows_cache_checks_time_size_kind_and_attributes_but_not_identity() {
-    // R1: Windows trusts exact 100 ns last-write time, size, kind and relevant
-    // attributes, while ignoring Unix identity and creation time. The racy
-    // window still forces content reads when matching metadata is ambiguous.
+fn m2_r1_windows_cache_checks_identity_time_size_kind_and_attributes() {
+    // M2/R1: real Windows identity strengthens size, 100 ns time, kind and attribute checks.
+    // Creation time is not a substitute for file identity, and the racy window still applies.
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("file");
     fs::write(&path, b"first").unwrap();
@@ -131,40 +130,70 @@ fn r1_windows_cache_checks_time_size_kind_and_attributes_but_not_identity() {
         xattrs: None,
         sqlite: false,
         stat: metadata.clone(),
+        identity: crate::platform::path_identity(&path).unwrap().unwrap(),
         read_at_nanos: 1_700_000_010_000_000_000,
     });
-    row.device = 111;
-    row.inode = 222;
     row.ctime_secs = i64::MAX;
-    assert!(cached_matches(&row, &metadata));
+    assert!(cached_matches(
+        &row,
+        &metadata,
+        crate::platform::path_identity(&path).unwrap()
+    ));
     assert!(!row.is_racy());
+    let mut other = row.clone();
+    other.inode ^= 1_u128 << 96;
+    assert!(!cached_matches(
+        &other,
+        &metadata,
+        crate::platform::path_identity(&path).unwrap()
+    ));
     row.cached_at_nanos = 1_700_000_000_000_000_100;
     assert!(row.is_racy());
     for mask in [0o100000, 1 << 20, 0x400 << 20] {
         let mut changed = row.clone();
         changed.mode ^= mask;
-        assert!(!cached_matches(&changed, &metadata));
+        assert!(!cached_matches(
+            &changed,
+            &metadata,
+            crate::platform::path_identity(&path).unwrap()
+        ));
     }
     let mut changed = row.clone();
     changed.size += 1;
-    assert!(!cached_matches(&changed, &metadata));
+    assert!(!cached_matches(
+        &changed,
+        &metadata,
+        crate::platform::path_identity(&path).unwrap()
+    ));
     filetime::set_file_mtime(
         &path,
         filetime::FileTime::from_unix_time(1_700_000_000, 200),
     )
     .unwrap();
-    assert!(!cached_matches(&row, &fs::symlink_metadata(&path).unwrap()));
+    assert!(!cached_matches(
+        &row,
+        &fs::symlink_metadata(&path).unwrap(),
+        crate::platform::path_identity(&path).unwrap()
+    ));
     filetime::set_file_mtime(
         &path,
         filetime::FileTime::from_unix_time(1_700_000_000, 100),
     )
     .unwrap();
-    assert!(cached_matches(&row, &fs::symlink_metadata(&path).unwrap()));
+    assert!(cached_matches(
+        &row,
+        &fs::symlink_metadata(&path).unwrap(),
+        crate::platform::path_identity(&path).unwrap()
+    ));
     let original_permissions = fs::metadata(&path).unwrap().permissions();
     let mut permissions = original_permissions.clone();
     permissions.set_readonly(true);
     fs::set_permissions(&path, permissions).unwrap();
-    assert!(!cached_matches(&row, &fs::symlink_metadata(&path).unwrap()));
+    assert!(!cached_matches(
+        &row,
+        &fs::symlink_metadata(&path).unwrap(),
+        crate::platform::path_identity(&path).unwrap()
+    ));
     // Restore the writable attribute so the temporary directory can be removed.
     fs::set_permissions(&path, original_permissions).unwrap();
 }
@@ -353,4 +382,147 @@ fn i1_shared_store_fork_seeds_recorded_unix_modes_before_its_first_capture() {
         assert_ne!(child.workspace_id, repository.workspace_id);
         assert_eq!(sibling.resolve_snapshot("head").unwrap(), sibling_head);
     }
+}
+
+#[test]
+fn m2_capture_ten_thousand_files_uses_only_directory_identity_opens() {
+    // M2/R1: full captures get identities from one directory handle, never a per-file identity open.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    let old = filetime::FileTime::from_unix_time(1_700_000_000, 123_456_700);
+    for n in 0..10_000 {
+        let path = root.join(format!("file-{n:05}"));
+        fs::write(&path, b"original").unwrap();
+        filetime::set_file_mtime(path, old).unwrap();
+    }
+    crate::platform::reset_identity_opens();
+    let start = Instant::now();
+    let (mut repository, _) = FurrowRepository::attach_and_seal_in(
+        &temp.path().join("data"),
+        &root,
+        None,
+        SnapshotTrigger::Manual,
+        SealOptions::default(),
+    )
+    .unwrap();
+    let first = start.elapsed();
+    let opens = crate::platform::identity_opens();
+    assert!(opens <= 2, "{opens} identity-only opens for one directory");
+    CONTENT_READS.with(|count| count.set(0));
+    crate::platform::reset_identity_opens();
+    let start = Instant::now();
+    repository.snapshot(None, SnapshotTrigger::Manual).unwrap();
+    let second = start.elapsed();
+    let second_opens = crate::platform::identity_opens();
+    assert!(second_opens <= 2, "{second_opens} identity-only opens");
+    assert_eq!(CONTENT_READS.with(|count| count.get()), 0);
+    eprintln!("M2 10000 files: first {first:?}, warm {second:?}, identity directory opens {opens}/{second_opens}, identity-only file opens 0, warm content opens 0");
+    if let Some(destination) = std::env::var_os("FURROW_PORTABLE_OUT") {
+        let destination = PathBuf::from(destination);
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("m2-capture.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "files": 10000, "first_ms": first.as_secs_f64() * 1000.0,
+            "warm_ms": second.as_secs_f64() * 1000.0, "identity_directory_opens": [opens, second_opens],
+            "identity_only_file_opens": 0, "warm_content_opens": 0
+        })).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn m2_replaced_file_with_equal_size_time_and_attributes_is_rehashed() {
+    // M2/R1: a new file with matching stat fields cannot reuse its predecessor's bytes.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    let path = root.join("file");
+    let old = filetime::FileTime::from_unix_time(1_700_000_000, 100);
+    fs::write(&path, b"first").unwrap();
+    filetime::set_file_mtime(&path, old).unwrap();
+    let (mut repository, _) = FurrowRepository::attach_and_seal_in(
+        &temp.path().join("data"),
+        &root,
+        None,
+        SnapshotTrigger::Manual,
+        SealOptions::default(),
+    )
+    .unwrap();
+    let replacement = root.join("replacement");
+    fs::write(&replacement, b"other").unwrap();
+    filetime::set_file_mtime(&replacement, old).unwrap();
+    crate::platform::rename(&replacement, &path).unwrap();
+    CONTENT_READS.with(|count| count.set(0));
+    let head = repository.snapshot(None, SnapshotTrigger::Manual).unwrap();
+    assert_eq!(CONTENT_READS.with(|count| count.get()), 1);
+    let snapshot: Snapshot = repository
+        .store
+        .read_struct(&head, ObjectKind::Snapshot)
+        .unwrap();
+    let entry = tree::find_path(&repository.store, &snapshot.root_tree, b"file")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entry.target.unwrap(),
+        repository.capture_file(&path).unwrap()
+    );
+}
+
+#[test]
+fn m2_native_capture_restore_and_delta_keep_cross_directory_hard_links() {
+    // M2: NTFS links are recorded from directory IDs, restored as links, and kept through delta capture.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("one"), b"linked bytes").unwrap();
+    fs::hard_link(root.join("one"), root.join("nested/two")).unwrap();
+    fs::write(root.join("independent"), b"linked bytes").unwrap();
+    let (mut repository, head) = FurrowRepository::attach_and_seal_in(
+        &temp.path().join("data"),
+        &root,
+        None,
+        SnapshotTrigger::Manual,
+        SealOptions::default(),
+    )
+    .unwrap();
+    let snapshot: Snapshot = repository
+        .store
+        .read_struct(&head, ObjectKind::Snapshot)
+        .unwrap();
+    assert_eq!(snapshot.hardlinks.len(), 1);
+    assert_eq!(snapshot.hardlinks[0].paths.len(), 2);
+    for path in ["one", "nested/two", "independent"] {
+        fs::remove_file(root.join(path)).unwrap();
+    }
+    repository.rewind(&head, &[], false).unwrap();
+    let one = crate::platform::path_identity(&root.join("one"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Some(one),
+        crate::platform::path_identity(&root.join("nested/two")).unwrap()
+    );
+    assert_ne!(
+        Some(one),
+        crate::platform::path_identity(&root.join("independent")).unwrap()
+    );
+    fs::write(root.join("one"), b"new shared bytes").unwrap();
+    let delta = repository
+        .snapshot_changed_paths(None, SnapshotTrigger::Manual, &[root.join("one")])
+        .unwrap();
+    let snapshot: Snapshot = repository
+        .store
+        .read_struct(&delta, ObjectKind::Snapshot)
+        .unwrap();
+    assert_eq!(snapshot.hardlinks.len(), 1);
+    let one = tree::find_path(&repository.store, &snapshot.root_tree, b"one")
+        .unwrap()
+        .unwrap();
+    let two = tree::find_path(&repository.store, &snapshot.root_tree, b"nested/two")
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.target, two.target);
+    assert_eq!(
+        fs::read(root.join("nested/two")).unwrap(),
+        b"new shared bytes"
+    );
 }

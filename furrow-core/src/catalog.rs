@@ -22,7 +22,7 @@ pub struct PackCheckpoint {
 
 /// Page cache for the catalog connection, in KiB.
 const CACHE_KIB: i64 = 32 * 1024;
-pub(crate) const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::writer_wait::WRITER_WAIT;
 
 fn writer_error(error: anyhow::Error) -> anyhow::Error {
     if error
@@ -49,13 +49,14 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::open_inner(path).map_err(writer_error)
     }
 
     fn open_inner(path: &Path) -> anyhow::Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("open catalog {}", path.display()))?;
-        conn.busy_timeout(WRITER_WAIT)?;
+        crate::writer_wait::configure(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // The catalog indexes the packs and the reference log, which are the
         // durable record: a commit lost to a crash is rebuilt at the next
@@ -132,6 +133,7 @@ impl Catalog {
     }
 
     pub(crate) fn forget_workspace_refs(&self, id: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn
             .execute("DELETE FROM timeline WHERE workspace_id = ?1", [id])?;
         self.conn
@@ -140,12 +142,14 @@ impl Catalog {
     }
 
     pub(crate) fn forget_capture_caches(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn
             .execute_batch("DELETE FROM stat_cache; DELETE FROM directory_cache;")?;
         Ok(())
     }
 
     pub(crate) fn checkpoint(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
         Ok(())
     }
@@ -155,6 +159,7 @@ impl Catalog {
         workspace: &str,
         folder: &str,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let update = &UPSERT_STAT[UPSERT_STAT
             .find("ON CONFLICT")
             .expect("stat upsert has a conflict clause")..];
@@ -177,6 +182,7 @@ impl Catalog {
         workspace_id: &str,
         path: &[u8],
     ) -> anyhow::Result<Option<CachedFile>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut statement = self.conn.prepare_cached(SELECT_STAT)?;
         statement
             .query_row(params![workspace_id, path], read_stat_row)
@@ -190,6 +196,7 @@ impl Catalog {
         workspace_id: &str,
         paths: &[Vec<u8>],
     ) -> anyhow::Result<Vec<Option<CachedFile>>> {
+        let _operation = crate::writer_wait::Operation::start();
         paths
             .iter()
             .map(|path| self.cached_file(workspace_id, path))
@@ -202,11 +209,12 @@ impl Catalog {
         path: &[u8],
         file: &CachedFile,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.prepare_cached(UPSERT_STAT)?.execute(params![
             workspace_id,
             path,
             file.device as i64,
-            file.inode as i64,
+            crate::platform::sql_file_id(file.inode),
             file.size as i64,
             file.mtime_secs,
             file.mtime_nanos,
@@ -223,6 +231,7 @@ impl Catalog {
 
     /// Paths whose cached content is a SQLite database, in path order.
     pub fn sqlite_paths(&self, workspace_id: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut statement = self.conn.prepare_cached(
             "SELECT path FROM stat_cache WHERE workspace_id = ?1 AND sqlite = 1 ORDER BY path",
         )?;
@@ -234,6 +243,7 @@ impl Catalog {
     /// one durable commit instead of one each. Inside an open transaction it
     /// simply runs, and the outer commit covers it.
     pub fn batch<T>(&self, write: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let _operation = crate::writer_wait::Operation::start();
         if !self.conn.is_autocommit() {
             return write();
         }
@@ -257,6 +267,7 @@ impl Catalog {
         workspace_id: &str,
         path: &[u8],
     ) -> anyhow::Result<Option<ObjectId>> {
+        let _operation = crate::writer_wait::Operation::start();
         let value: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -274,6 +285,7 @@ impl Catalog {
         path: &[u8],
         tree_id: &ObjectId,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute(
             "INSERT INTO directory_cache(workspace_id, path, tree_id) VALUES(?1, ?2, ?3)
              ON CONFLICT(workspace_id, path) DO UPDATE SET tree_id=excluded.tree_id",
@@ -283,6 +295,7 @@ impl Catalog {
     }
 
     pub fn object(&self, id: &ObjectId) -> anyhow::Result<Option<ObjectLocation>> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn
             .prepare_cached("SELECT kind, pack, offset, len FROM objects WHERE id = ?1")?
             .query_row(params![id.as_slice()], |row| {
@@ -306,6 +319,7 @@ impl Catalog {
     }
 
     pub fn object_count(&self) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM objects", [], |row| {
@@ -314,6 +328,7 @@ impl Catalog {
     }
 
     pub fn object_payload_bytes(&self) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self
             .conn
             .query_row("SELECT COALESCE(SUM(len), 0) FROM objects", [], |row| {
@@ -322,6 +337,7 @@ impl Catalog {
     }
 
     pub fn remove_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM stat_cache WHERE workspace_id = ?1",
@@ -344,6 +360,7 @@ impl Catalog {
     }
 
     pub fn detach_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM stat_cache WHERE workspace_id = ?1",
@@ -367,6 +384,7 @@ impl Catalog {
         pack: &str,
         checkpoint: &PackCheckpoint,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute(
             "ATTACH DATABASE ?1 AS gcmark",
             params![mark_database.as_os_str().to_string_lossy().as_ref()],
@@ -407,6 +425,7 @@ impl Catalog {
     }
 
     pub fn pack_checkpoint(&self, pack: &str) -> anyhow::Result<Option<PackCheckpoint>> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn
             .query_row(
                 "SELECT verified_len, object_count, last_object, last_record_start
@@ -441,6 +460,7 @@ impl Catalog {
         pack: &str,
         checkpoint: &PackCheckpoint,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute(
             "INSERT INTO pack_checkpoints(
                 pack, verified_len, object_count, last_object, last_record_start
@@ -462,6 +482,7 @@ impl Catalog {
     }
 
     pub fn pack_prefix_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM objects
              WHERE pack = ?1 AND offset + len + 4 <= ?2",
@@ -471,6 +492,7 @@ impl Catalog {
     }
 
     pub fn pack_crossing_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM objects
              WHERE pack = ?1 AND offset < ?2 AND offset + len + 4 > ?2",
@@ -480,6 +502,7 @@ impl Catalog {
     }
 
     pub(crate) fn pack_high_water(&self, pack: &str) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self.conn.query_row(
             "SELECT COALESCE(MAX(offset + len + 4), 0) FROM objects WHERE pack = ?1",
             [pack],
@@ -488,6 +511,7 @@ impl Catalog {
     }
 
     pub fn reset_pack_index(&self, pack: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.batch(|| {
             self.conn
                 .execute("DELETE FROM objects WHERE pack = ?1", params![pack])?;
@@ -507,6 +531,7 @@ impl Catalog {
         offset: u64,
         len: u64,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute(
             "INSERT OR IGNORE INTO objects(id, kind, pack, offset, len) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![id.as_slice(), kind as u8, pack, offset as i64, len as i64],
@@ -515,6 +540,7 @@ impl Catalog {
     }
 
     pub fn delete_pack_objects_from(&self, pack: &str, payload_offset: u64) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute(
             "DELETE FROM objects WHERE pack = ?1 AND offset >= ?2",
             params![pack, payload_offset as i64],
@@ -523,6 +549,7 @@ impl Catalog {
     }
 
     pub fn ensure_workspace(&self, id: &str, root: &[u8]) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute(
             "INSERT OR IGNORE INTO workspaces(id, root) VALUES(?1, ?2)",
             params![id, root],
@@ -531,6 +558,7 @@ impl Catalog {
     }
 
     pub fn rebind_workspace(&self, id: &str, root: &[u8]) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.conn.execute(
             "UPDATE workspaces SET root = ?2 WHERE id = ?1",
             params![id, root],
@@ -539,6 +567,7 @@ impl Catalog {
     }
 
     pub fn workspace_head(&self, id: &str) -> anyhow::Result<Option<ObjectId>> {
+        let _operation = crate::writer_wait::Operation::start();
         let value: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -559,6 +588,7 @@ impl Catalog {
         label: Option<&str>,
         trigger: &str,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO timeline(workspace_id, snapshot_id, sealed_at, label, trigger)
@@ -580,6 +610,7 @@ impl Catalog {
     }
 
     pub fn timeline(&self, workspace_id: &str, limit: usize) -> anyhow::Result<Vec<TimelineRow>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut stmt = self.conn.prepare(
             "SELECT snapshot_id, sealed_at, label, trigger FROM timeline
              WHERE workspace_id = ?1 ORDER BY sequence DESC LIMIT ?2",
@@ -616,7 +647,7 @@ pub struct TimelineRow {
 #[derive(Debug, Clone)]
 pub struct CachedFile {
     pub device: u64,
-    pub inode: u64,
+    pub inode: crate::platform::FileId,
     pub size: u64,
     pub mtime_secs: i64,
     pub mtime_nanos: i64,
@@ -686,7 +717,7 @@ fn read_stat_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StatRow> {
     Ok(StatRow {
         file: CachedFile {
             device: row.get::<_, i64>(0)? as u64,
-            inode: row.get::<_, i64>(1)? as u64,
+            inode: crate::platform::read_file_id(row, 1)?,
             size: row.get::<_, i64>(2)? as u64,
             mtime_secs: row.get(3)?,
             mtime_nanos: row.get(4)?,
@@ -707,6 +738,7 @@ impl TryFrom<StatRow> for CachedFile {
     type Error = anyhow::Error;
 
     fn try_from(row: StatRow) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(CachedFile {
             blob_id: vec_to_id(row.blob)?,
             xattrs: row.xattrs.map(vec_to_id).transpose()?,

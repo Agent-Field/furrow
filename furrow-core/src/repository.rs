@@ -375,6 +375,7 @@ impl SyncFollowSession {
         &mut self,
         fallback: std::time::Duration,
     ) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let change = self.remote.wait_for_head_change(fallback)?;
         if change.changed {
             self.pending_notify_ms = change.notify_ms;
@@ -404,6 +405,7 @@ struct SyncState {
 
 impl FurrowRepository {
     pub fn watch(root: &Path) -> anyhow::Result<(Self, ObjectId)> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::attach_and_snapshot(
             root,
             Some("initial protection".to_owned()),
@@ -416,6 +418,7 @@ impl FurrowRepository {
         label: Option<String>,
         existing_trigger: SnapshotTrigger,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::attach_and_seal(root, label, existing_trigger, SealOptions::default())
     }
 
@@ -425,6 +428,7 @@ impl FurrowRepository {
         existing_trigger: SnapshotTrigger,
         options: SealOptions,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::attach_and_seal_in(&data_root()?, root, label, existing_trigger, options)
     }
 
@@ -438,6 +442,7 @@ impl FurrowRepository {
         existing_trigger: SnapshotTrigger,
         options: SealOptions,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::attach_and_seal_timeline_in(data_dir, root, None, label, existing_trigger, options)
     }
 
@@ -450,6 +455,7 @@ impl FurrowRepository {
         existing_trigger: SnapshotTrigger,
         options: SealOptions,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut repository = Self::attach_timeline_in(data_dir, root, timeline, options.overlay)?;
         let id = repository.seal(label, existing_trigger, options.changed.as_deref())?;
         Ok((repository, id))
@@ -462,6 +468,7 @@ impl FurrowRepository {
         timeline: Option<&str>,
         overlay: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
@@ -481,6 +488,7 @@ impl FurrowRepository {
         timeline: Option<&str>,
         overlay: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::attach_using_store(root.canonicalize()?, timeline, overlay, self.store.clone())
     }
 
@@ -491,6 +499,7 @@ impl FurrowRepository {
         timeline: Option<&str>,
         overlay: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::attach_using_store(root.canonicalize()?, timeline, overlay, store)
     }
 
@@ -533,6 +542,7 @@ impl FurrowRepository {
         existing_trigger: SnapshotTrigger,
         changed: Option<&[PathBuf]>,
     ) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         let trigger = if self.store.workspace_head(&self.workspace_id)?.is_some() {
             existing_trigger
         } else {
@@ -542,6 +552,7 @@ impl FurrowRepository {
     }
 
     pub fn open(root: &Path) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::open_composed(root, None)
     }
 
@@ -550,6 +561,7 @@ impl FurrowRepository {
     /// instead of in the root. A composed workspace keeps its identity in the
     /// store, so nothing is written into the tree.
     pub fn open_composed(root: &Path, overlay: Option<PathBuf>) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::open_composed_in(&data_root()?, root, overlay)
     }
 
@@ -559,6 +571,7 @@ impl FurrowRepository {
         root: &Path,
         overlay: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::open_timeline_in(data_dir, root, overlay, None)
     }
 
@@ -569,6 +582,7 @@ impl FurrowRepository {
         overlay: Option<PathBuf>,
         timeline: Option<&str>,
     ) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         Self::open_timeline_store(
             ObjectStore::open(data_dir.join(STORE_DIR))?,
             root,
@@ -584,6 +598,7 @@ impl FurrowRepository {
         overlay: Option<PathBuf>,
         timeline: Option<&str>,
     ) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         let root = root
             .canonicalize()
             .with_context(|| format!("open {}", root.display()))?;
@@ -621,6 +636,7 @@ impl FurrowRepository {
 
     /// Defers device flushes to the daemon's group commit without deferring capture.
     pub fn defer_durability(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.store.defer_durability()
     }
 
@@ -630,12 +646,14 @@ impl FurrowRepository {
 
     /// Makes all captures in this data directory durable before returning.
     pub fn sync(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.store.sync()?;
         self.checkpoint_capture_index()
     }
 
     /// Bounds the advisory WAL without putting checkpoints on the capture path.
     pub fn checkpoint_capture_index(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.store.checkpoint_catalog()?;
         if let Some(index) = self.path_index.borrow().as_ref() {
             index.checkpoint()?;
@@ -651,6 +669,7 @@ impl FurrowRepository {
         &self,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> anyhow::Result<Vec<PathBuf>> {
+        let _operation = crate::writer_wait::Operation::start();
         let policy = self.load_policy()?;
         Ok(paths
             .into_iter()
@@ -666,6 +685,7 @@ impl FurrowRepository {
     }
 
     pub fn store_physical_bytes(&self) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self.store.stats()?.physical_bytes)
     }
 
@@ -678,6 +698,7 @@ impl FurrowRepository {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         self.snapshot_internal(label, trigger, None, Vec::new())
     }
 
@@ -687,6 +708,7 @@ impl FurrowRepository {
         trigger: SnapshotTrigger,
         changed_paths: &[PathBuf],
     ) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         self.snapshot_internal(label, trigger, Some(changed_paths), Vec::new())
     }
 
@@ -767,6 +789,7 @@ impl FurrowRepository {
     }
 
     pub fn timeline(&self, limit: usize) -> anyhow::Result<Vec<SnapshotSummary>> {
+        let _operation = crate::writer_wait::Operation::start();
         let pinned = self.store.pinned_snapshots(&self.workspace_id)?;
         self.store
             .timeline(&self.workspace_id, limit)?
@@ -791,11 +814,13 @@ impl FurrowRepository {
         &self,
         id: &ObjectId,
     ) -> anyhow::Result<Option<crate::policy::IgnoredSummary>> {
+        let _operation = crate::writer_wait::Operation::start();
         let snapshot: Snapshot = self.store.read_struct(id, ObjectKind::Snapshot)?;
         Ok(snapshot.ignored)
     }
 
     pub fn snapshot_json(&self, id: &ObjectId) -> anyhow::Result<serde_json::Value> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut value = serde_json::json!({"snapshot": id_hex(id)});
         if let Some(report) = self.snapshot_ignored(id)? {
             value["ignored"] = serde_json::to_value(report)?;
@@ -816,6 +841,7 @@ impl FurrowRepository {
     /// the way a seal records one, so the next seal takes it as its parent.
     /// The snapshot's own parent may be absent from this store.
     pub fn adopt_head(&mut self, id: &ObjectId) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let snapshot: Snapshot = self.store.read_struct(id, ObjectKind::Snapshot)?;
         self.store.publish_snapshot(
             &self.workspace_id,
@@ -827,6 +853,7 @@ impl FurrowRepository {
     }
 
     pub fn status(&self) -> anyhow::Result<RepositoryStatus> {
+        let _operation = crate::writer_wait::Operation::start();
         let stats = self.store.stats()?;
         let head = self.store.workspace_head(&self.workspace_id)?;
         Ok(RepositoryStatus {
@@ -842,6 +869,7 @@ impl FurrowRepository {
     }
 
     pub fn fidelity(&self) -> anyhow::Result<FidelityReport> {
+        let _operation = crate::writer_wait::Operation::start();
         let policy = self.load_policy()?;
         Ok(FidelityReport {
             platform: std::env::consts::OS,
@@ -918,6 +946,7 @@ impl FurrowRepository {
     }
 
     pub fn gc(&mut self, dry_run: bool) -> anyhow::Result<GcReport> {
+        let _operation = crate::writer_wait::Operation::start();
         let report = gc::collect(&mut self.store, dry_run)?;
         if !dry_run {
             let status = self.store.budget_status()?;
@@ -927,6 +956,7 @@ impl FurrowRepository {
     }
 
     pub fn pin(&mut self, snapshot: &ObjectId) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.store.acquire_maintenance_exclusive()?;
         let materialization = self.materialization(snapshot)?;
         anyhow::ensure!(
@@ -938,14 +968,17 @@ impl FurrowRepository {
     }
 
     pub fn unpin(&mut self, snapshot: &ObjectId) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         self.store.unpin_snapshot(&self.workspace_id, snapshot)
     }
 
     pub fn materialization(&self, snapshot_id: &ObjectId) -> anyhow::Result<MaterializationReport> {
+        let _operation = crate::writer_wait::Operation::start();
         derive_materialization(&self.store, snapshot_id)
     }
 
     pub fn gc_global(dry_run: bool) -> anyhow::Result<GcReport> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut store = ObjectStore::open(data_root()?.join(STORE_DIR))?;
         let report = gc::collect(&mut store, dry_run)?;
         if !dry_run {
@@ -959,6 +992,7 @@ impl FurrowRepository {
         max_store_bytes: Option<u64>,
         reserved_free_bytes: Option<u64>,
     ) -> anyhow::Result<BudgetStatus> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut store = ObjectStore::open(data_root()?.join(STORE_DIR))?;
         if max_store_bytes.is_some() || reserved_free_bytes.is_some() {
             store.configure_budget(max_store_bytes, reserved_free_bytes)
@@ -968,18 +1002,21 @@ impl FurrowRepository {
     }
 
     pub fn global_store_physical_bytes() -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(ObjectStore::open(data_root()?.join(STORE_DIR))?
             .stats()?
             .physical_bytes)
     }
 
     pub fn estimate(root: &Path) -> anyhow::Result<CaptureEstimate> {
+        let _operation = crate::writer_wait::Operation::start();
         let root = root.canonicalize()?;
         let store = ObjectStore::open(data_root()?.join(STORE_DIR))?;
         estimate::calculate(&root, &store)
     }
 
     pub fn claims(&self) -> anyhow::Result<Vec<ClaimRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         self.active_claims()
     }
 
@@ -989,6 +1026,7 @@ impl FurrowRepository {
         owner: &str,
         ttl_seconds: u64,
     ) -> anyhow::Result<ClaimOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut registry = claims::Registry::open(self.store.root(), &self.family_id)?;
         let claim = registry.claim(pattern, owner, &self.workspace_id, ttl_seconds)?;
         let snapshot = self.snapshot(
@@ -1002,6 +1040,7 @@ impl FurrowRepository {
     }
 
     pub fn release_claim(&mut self, selector: &str, owner: &str) -> anyhow::Result<ReleaseOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut registry = claims::Registry::open(self.store.root(), &self.family_id)?;
         let released = registry.release(selector, owner, &self.workspace_id)?;
         let snapshot = match self.snapshot(
@@ -1032,6 +1071,7 @@ impl FurrowRepository {
         bytes: &[u8],
         owner: &str,
     ) -> anyhow::Result<CoordOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let propagation = coord::write(&self.root, &self.store, &self.family_id, path, bytes)?;
         let snapshot = self.snapshot(
             Some(format!("{owner} wrote coord/{}", propagation.path)),
@@ -1045,6 +1085,7 @@ impl FurrowRepository {
     }
 
     pub fn coord_remove(&mut self, path: &Path, owner: &str) -> anyhow::Result<CoordOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let propagation = coord::remove(&self.root, &self.store, &self.family_id, path)?;
         let snapshot = self.snapshot(
             Some(format!("{owner} removed coord/{}", propagation.path)),
@@ -1058,11 +1099,13 @@ impl FurrowRepository {
     }
 
     pub fn coord_read(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
+        let _operation = crate::writer_wait::Operation::start();
         coord::reconcile(&self.root, &self.store, &self.family_id)?;
         coord::read(&self.root, path)
     }
 
     pub fn coord_list(&self) -> anyhow::Result<Vec<coord::CoordEntry>> {
+        let _operation = crate::writer_wait::Operation::start();
         coord::reconcile(&self.root, &self.store, &self.family_id)?;
         coord::list(&self.root)
     }
@@ -1073,6 +1116,7 @@ impl FurrowRepository {
         after: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<ForkUpdates> {
+        let _operation = crate::writer_wait::Operation::start();
         anyhow::ensure!(
             (1..=1000).contains(&limit),
             "limit must be between 1 and 1000"
@@ -1119,6 +1163,7 @@ impl FurrowRepository {
         namespace: &str,
         key: Option<&str>,
     ) -> anyhow::Result<sync::PairSummary> {
+        let _operation = crate::writer_wait::Operation::start();
         let summary = sync::pair(&self.sync_config_path(), remote, namespace, key)?;
         let key_bytes = hex::decode(&summary.key_hex)?;
         let mut key = [0_u8; 32];
@@ -1147,6 +1192,7 @@ impl FurrowRepository {
         takeover: bool,
         ref_name: Option<&str>,
     ) -> anyhow::Result<sync::PushReport> {
+        let _operation = crate::writer_wait::Operation::start();
         let config = sync::load(&self.sync_config_path())?;
         let mut remote = sync::open_session(&config, ref_name)?;
         self.sync_push_on(takeover, &config, &mut remote)
@@ -1174,6 +1220,7 @@ impl FurrowRepository {
         bootstrap: bool,
         ref_name: Option<&str>,
     ) -> anyhow::Result<SyncPullOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let config = sync::load(&self.sync_config_path())?;
         let mut remote = sync::open_session(&config, ref_name)?;
         self.sync_pull_on(bootstrap, true, &config, &mut remote)
@@ -1189,6 +1236,7 @@ impl FurrowRepository {
         snapshot: &ObjectId,
         ref_name: &str,
     ) -> anyhow::Result<sync::PushReport> {
+        let _operation = crate::writer_wait::Operation::start();
         let _: Snapshot = self.store.read_struct(snapshot, ObjectKind::Snapshot)?;
         let config = sync::load(&self.sync_config_path())?;
         let mut remote = sync::open_session(&config, Some(ref_name))?;
@@ -1207,6 +1255,7 @@ impl FurrowRepository {
         trigger: SnapshotTrigger,
         base: &ObjectId,
     ) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         self.snapshot_internal_with_parent(label, trigger, None, Vec::new(), Some(*base))
     }
 
@@ -1496,6 +1545,7 @@ impl FurrowRepository {
     }
 
     pub fn sync_follow_session(&self, ref_name: Option<&str>) -> anyhow::Result<SyncFollowSession> {
+        let _operation = crate::writer_wait::Operation::start();
         let config = sync::load(&self.sync_config_path())?;
         let remote = sync::open_session(&config, ref_name)?;
         Ok(SyncFollowSession {
@@ -1509,6 +1559,7 @@ impl FurrowRepository {
         &mut self,
         session: &mut SyncFollowSession,
     ) -> anyhow::Result<SyncFollowOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let remote_root = sync::published_root_on(&session.config, &mut session.remote)?;
         let local_head = self
             .store
@@ -1555,6 +1606,7 @@ impl FurrowRepository {
     }
 
     pub fn prepare_fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkPlan> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_fork_name(name)?;
         let destination = prepare_fork_destination(destination)?;
 
@@ -1588,6 +1640,7 @@ impl FurrowRepository {
         destination: &Path,
         at: &ObjectId,
     ) -> anyhow::Result<ForkPlan> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_fork_name(name)?;
         let destination = prepare_fork_destination(destination)?;
 
@@ -1623,6 +1676,7 @@ impl FurrowRepository {
     }
 
     pub fn materialize_fork(&mut self, plan: ForkPlan) -> anyhow::Result<ForkSummary> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_fork_name(&plan.name)?;
         validate_fork_id(&plan.fork_id)?;
         let destination = absolute_destination(&plan.destination)?;
@@ -1674,6 +1728,7 @@ impl FurrowRepository {
     }
 
     pub fn fork(&mut self, name: &str, destination: &Path) -> anyhow::Result<ForkSummary> {
+        let _operation = crate::writer_wait::Operation::start();
         let plan = self.prepare_fork(name, destination)?;
         self.materialize_fork(plan)
     }
@@ -2052,10 +2107,14 @@ impl FurrowRepository {
             ),
             EntryKind::File => {
                 let source = safe_join(&self.root, relative)?;
-                let source_metadata = fs::symlink_metadata(source)?;
+                let source_metadata = fs::symlink_metadata(&source)?;
+                #[cfg(windows)]
+                let identity = crate::platform::path_identity(&source)?;
+                #[cfg(unix)]
+                let identity = hardlink::identity(&source_metadata);
                 let cached = cached.context("fork base file cache is incomplete")?;
                 anyhow::ensure!(
-                    cached_matches(cached, &source_metadata)
+                    cached_matches(cached, &source_metadata, identity)
                         && indexed.target == Some(cached.blob_id),
                     "source changed while its atomic fork was created"
                 );
@@ -2071,6 +2130,7 @@ impl FurrowRepository {
     }
 
     pub fn forks(&self) -> anyhow::Result<Vec<ForkSummary>> {
+        let _operation = crate::writer_wait::Operation::start();
         let directory = self.forks_dir();
         let mut forks = Vec::new();
         if directory.exists() {
@@ -2160,6 +2220,7 @@ impl FurrowRepository {
     }
 
     pub fn events(&self, after: Option<&str>, limit: usize) -> anyhow::Result<EventPage> {
+        let _operation = crate::writer_wait::Operation::start();
         // Inventory refresh is also the reconciliation path for seals published
         // before a crash or while no event consumer was connected.
         let _ = self.forks()?;
@@ -2167,6 +2228,7 @@ impl FurrowRepository {
     }
 
     pub fn diff(&mut self, target: &str) -> anyhow::Result<DiffSummary> {
+        let _operation = crate::writer_wait::Operation::start();
         if let Some(mut fork) = self.forks()?.into_iter().find(|fork| fork.name == target) {
             anyhow::ensure!(
                 fork.destination.exists(),
@@ -2206,6 +2268,7 @@ impl FurrowRepository {
         bad: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<BisectOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         anyhow::ensure!(!command.is_empty(), "bisect command cannot be empty");
         anyhow::ensure!(
             (2..=10_000).contains(&limit),
@@ -2293,6 +2356,7 @@ impl FurrowRepository {
     }
 
     pub fn remove_fork(&mut self, name: &str, keep_files: bool) -> anyhow::Result<ForkRemoval> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_fork_name(name)?;
         let record_path = self.forks_dir().join(format!("{name}.json"));
         let fork: ForkSummary = serde_json::from_slice(
@@ -2338,6 +2402,7 @@ impl FurrowRepository {
         check: Option<&str>,
         dry_run: bool,
     ) -> anyhow::Result<MergeOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let mutation = if dry_run {
             None
         } else {
@@ -2425,6 +2490,7 @@ impl FurrowRepository {
         check: Option<&str>,
         dry_run: bool,
     ) -> anyhow::Result<MergeOutcome> {
+        let _operation = crate::writer_wait::Operation::start();
         let mutation = if dry_run {
             None
         } else {
@@ -2977,6 +3043,7 @@ impl FurrowRepository {
     }
 
     pub fn resolve_snapshot(&self, value: &str) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         // `head` is the workspace's own newest snapshot: a sealed one, or the
         // imported one a materialize adopted. Callers that need "what this tree
         // was last known to be" ask for it by that word instead of tracking ids.
@@ -3012,6 +3079,7 @@ impl FurrowRepository {
     }
 
     pub fn plan_rewind(&self, target: &ObjectId, paths: &[PathBuf]) -> anyhow::Result<RewindPlan> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.store.acquire_maintenance_shared()?;
         let materialization = self.materialization(target)?;
         let unavailable: Vec<_> = materialization
@@ -3157,6 +3225,7 @@ impl FurrowRepository {
         paths: &[PathBuf],
         sqlite_consistent: bool,
     ) -> anyhow::Result<(ObjectId, RewindPlan)> {
+        let _operation = crate::writer_wait::Operation::start();
         let lock = self.acquire_mutation_lock()?;
         let mut plan = self.plan_rewind(target, paths)?;
         let restore_policy = self.load_policy()?;
@@ -3332,6 +3401,7 @@ impl FurrowRepository {
     }
 
     pub fn forget(self, purge: bool) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.forget_internal(purge, true)
     }
 
@@ -3402,8 +3472,52 @@ impl FurrowRepository {
         {
             return self.capture_root_retry_with_policy(policy);
         }
+        #[cfg(windows)]
+        if self.windows_delta_needs_link_walk(paths, policy)? {
+            anyhow::ensure!(
+                self.capture_scope.borrow().is_none(),
+                "capture plan needs a full hard-link walk; re-plan"
+            );
+            return self.capture_root_retry_with_policy(policy);
+        }
         let paths = self.with_overlay_path(paths);
         self.capture_changed_paths_retry_with_policy(&paths, policy)
+    }
+
+    /// Listing IDs do not include link counts. A changed identity needs a walk to
+    /// discover new aliases; an existing group needs all of its members captured together.
+    #[cfg(windows)]
+    fn windows_delta_needs_link_walk(
+        &self,
+        paths: &[PathBuf],
+        policy: &CapturePolicy,
+    ) -> anyhow::Result<bool> {
+        let index = self.open_path_index()?;
+        for path in paths {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                self.root.join(path)
+            };
+            let Some(relative) = self.logical_path(&path) else {
+                continue;
+            };
+            if is_identity_path(&relative) || policy.excludes_bytes(&relative) {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_file() {
+                let before = index.link_identity(&relative)?;
+                if crate::platform::path_identity(&path)? != before
+                    || (before.is_some() && !index.link_has_no_known_sibling(&relative)?)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// The overlay is composed at every seal, so its contents count as changed.
@@ -3604,7 +3718,7 @@ impl FurrowRepository {
         &self,
         index: &PathIndex,
         relative: &[u8],
-        linked_before: Option<(u64, u64)>,
+        linked_before: Option<crate::platform::FileIdentity>,
     ) -> anyhow::Result<bool> {
         Ok(index.link_identity(relative)? != linked_before
             && index.link_has_no_known_sibling(relative)?)
@@ -3677,6 +3791,7 @@ impl FurrowRepository {
         let relative = self
             .logical_path(path)
             .context("directory is outside the tree")?;
+        let identities = crate::platform::directory_identities(path)?;
         // Windows supplies metadata with FindFirstFile/FindNextFile. Feed the
         // existing disk-backed index directly, then build in its byte order;
         // sorting names first would discard that metadata and reopen each file.
@@ -3694,9 +3809,16 @@ impl FurrowRepository {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                if let Some(entry) =
-                    self.capture_path_entry_with_metadata(&child_path, index, policy, &metadata)?
-                {
+                if let Some(entry) = self.capture_path_entry_with_metadata(
+                    &child_path,
+                    index,
+                    policy,
+                    &metadata,
+                    crate::platform::entry_identity(
+                        &identities,
+                        child_path.file_name().context("child has no name")?,
+                    ),
+                )? {
                     index.upsert(&child_relative, &relative, &entry)?;
                 }
             }
@@ -3738,9 +3860,16 @@ impl FurrowRepository {
             } else {
                 metadata
             };
-            if let Some(entry) =
-                self.capture_path_entry_with_metadata(&child_path, index, policy, &metadata)?
-            {
+            if let Some(entry) = self.capture_path_entry_with_metadata(
+                &child_path,
+                index,
+                policy,
+                &metadata,
+                crate::platform::entry_identity(
+                    &identities,
+                    child_path.file_name().context("child has no name")?,
+                ),
+            )? {
                 index.upsert(&child_relative, &relative, &entry)?;
             }
         }
@@ -3835,7 +3964,15 @@ impl FurrowRepository {
     ) -> anyhow::Result<Option<TreeEntry>> {
         let metadata =
             fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
-        self.capture_path_entry_with_metadata(path, index, policy, &metadata)
+        #[cfg(windows)]
+        let identity = if metadata.is_file() {
+            crate::platform::path_identity(path)?
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let identity = hardlink::identity(&metadata);
+        self.capture_path_entry_with_metadata(path, index, policy, &metadata, identity)
     }
 
     fn capture_path_entry_with_metadata(
@@ -3844,6 +3981,7 @@ impl FurrowRepository {
         index: &PathIndex,
         policy: &CapturePolicy,
         metadata: &fs::Metadata,
+        identity: Option<crate::platform::FileIdentity>,
     ) -> anyhow::Result<Option<TreeEntry>> {
         self.check_capture_path(path, metadata)?;
         let file_type = metadata.file_type();
@@ -3859,9 +3997,9 @@ impl FurrowRepository {
         let mode = self.recorded_mode(&relative, metadata.mode())?;
         let class = content_class::classify(&relative);
         if file_type.is_file() {
-            index.note_link(&relative, hardlink::identity(metadata))?;
+            index.note_link(&relative, identity)?;
             return self
-                .capture_file_entry(path, &relative, name, class, metadata)
+                .capture_file_entry(path, &relative, name, class, metadata, identity)
                 .map(Some);
         }
         let xattrs = if file_type.is_dir() {
@@ -4016,8 +4154,9 @@ impl FurrowRepository {
         name: Vec<u8>,
         class: ContentClass,
         metadata: &fs::Metadata,
+        identity: Option<crate::platform::FileIdentity>,
     ) -> anyhow::Result<TreeEntry> {
-        let row = match self.unchanged_row(relative, metadata)? {
+        let row = match self.unchanged_row(relative, metadata, identity)? {
             Some(row) => row,
             None => self
                 .read_file(path)
@@ -4054,11 +4193,12 @@ impl FurrowRepository {
         &self,
         relative: &[u8],
         metadata: &fs::Metadata,
+        identity: Option<crate::platform::FileIdentity>,
     ) -> anyhow::Result<Option<CachedFile>> {
         Ok(self
             .store
             .cached_file(&self.workspace_id, relative)?
-            .filter(|row| cached_matches(row, metadata) && !row.is_racy()))
+            .filter(|row| cached_matches(row, metadata, identity) && !row.is_racy()))
     }
 
     fn cache_read(&self, relative: &[u8], read: FileRead) -> anyhow::Result<CachedFile> {
@@ -4089,6 +4229,8 @@ impl FurrowRepository {
                 self.check_capture_path(path, &before)?;
             }
             let xattrs = self.capture_xattrs(path)?;
+            #[cfg(windows)]
+            let identity = crate::platform::handle_identity(&file)?;
             let chunked = self.store_chunks(file)?;
             let after = fs::metadata(path).with_context(|| format!("restat {}", path.display()))?;
             if stable_metadata(&before, &after) {
@@ -4102,6 +4244,8 @@ impl FurrowRepository {
                 return Ok(FileRead {
                     blob,
                     xattrs,
+                    #[cfg(windows)]
+                    identity,
                     sqlite: chunked.sqlite,
                     stat: after,
                     read_at_nanos,
@@ -5289,15 +5433,25 @@ fn restorable_xattrs(entries: Vec<XattrEntry>) -> impl Iterator<Item = XattrEntr
 }
 
 #[cfg(windows)]
-fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
-    cached.size == metadata.len()
+fn cached_matches(
+    cached: &CachedFile,
+    metadata: &fs::Metadata,
+    identity: Option<crate::platform::FileIdentity>,
+) -> bool {
+    identity == Some((cached.device, cached.inode))
+        && cached.inode != 0
+        && cached.size == metadata.len()
         && cached.mtime_secs == metadata.mtime()
         && cached.mtime_nanos == metadata.mtime_nsec()
         && cached.mode == crate::platform::cache_mode(metadata)
 }
 
 #[cfg(unix)]
-fn cached_matches(cached: &CachedFile, metadata: &fs::Metadata) -> bool {
+fn cached_matches(
+    cached: &CachedFile,
+    metadata: &fs::Metadata,
+    _identity: Option<crate::platform::FileIdentity>,
+) -> bool {
     cached.device == metadata.dev()
         && cached.inode == metadata.ino()
         && cached.size == metadata.len()
@@ -5325,6 +5479,8 @@ fn entry_matches_metadata(entry: &TreeEntry, metadata: &fs::Metadata) -> bool {
 
 /// What reading a regular file produced.
 struct FileRead {
+    #[cfg(windows)]
+    identity: crate::platform::FileIdentity,
     blob: ObjectId,
     xattrs: Option<ObjectId>,
     sqlite: bool,
@@ -5342,8 +5498,14 @@ struct Chunked {
 fn cached_from_read(read: &FileRead) -> CachedFile {
     let metadata = &read.stat;
     CachedFile {
+        #[cfg(unix)]
         device: metadata.dev(),
+        #[cfg(unix)]
         inode: metadata.ino(),
+        #[cfg(windows)]
+        device: read.identity.0,
+        #[cfg(windows)]
+        inode: read.identity.1,
         size: metadata.len(),
         mtime_secs: metadata.mtime(),
         mtime_nanos: metadata.mtime_nsec(),

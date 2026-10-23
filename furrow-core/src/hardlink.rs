@@ -78,10 +78,10 @@ fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
 }
 
 #[cfg(windows)]
-fn same_file(_: &Path, _: &Path) -> anyhow::Result<bool> {
-    // Relinking an already linked pair is safe; never claim two unknown file
-    // IDs are equal and accidentally leave separate copies unlinked.
-    Ok(false)
+fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    let left = crate::platform::path_identity(left)?;
+    let right = crate::platform::path_identity(right)?;
+    Ok(left.is_some() && left == right)
 }
 
 fn relink(anchor: &Path, member: &Path) -> anyhow::Result<()> {

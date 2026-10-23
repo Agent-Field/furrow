@@ -78,11 +78,12 @@ pub fn set_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
 /// Editors and antivirus scanners can briefly deny Windows replacement.
 /// Retry only sharing/access failures, with a total wait bounded to 1.27s.
 pub fn retry_replace<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let _operation = crate::writer_wait::Operation::start();
     #[cfg(windows)]
     for delay in REPLACE_DELAYS_MS {
         match operation() {
             Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => {
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+                crate::writer_wait::pause(std::time::Duration::from_millis(delay))?;
             }
             result => return result,
         }
@@ -111,13 +112,18 @@ pub fn persist(
 ) -> Result<File, tempfile::PersistError> {
     #[cfg(windows)]
     let mut file = file;
+    let _operation = crate::writer_wait::Operation::start();
     #[cfg(windows)]
     for delay in REPLACE_DELAYS_MS {
         match file.persist(path.as_ref()) {
             Ok(file) => return Ok(file),
             Err(error) if matches!(error.error.raw_os_error(), Some(5 | 32 | 33)) => {
                 file = error.file;
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+                if let Err(error) =
+                    crate::writer_wait::pause(std::time::Duration::from_millis(delay))
+                {
+                    return Err(tempfile::PersistError { error, file });
+                }
             }
             Err(error) => return Err(error),
         }
@@ -239,8 +245,8 @@ mod windows {
         fn blocks(&self) -> u64;
     }
     impl MetadataExt for fs::Metadata {
-        // Stable std metadata has no Windows file IDs. Cache matching ignores
-        // identity, and native hardlink grouping remains absent.
+        // Stable std metadata has no Windows file IDs. Capture uses directory
+        // enumeration and existing content handles for identity instead.
         fn dev(&self) -> u64 {
             0
         }
@@ -479,4 +485,47 @@ pub fn with_held(
         answer["held"] = serde_json::to_value(held)?;
     }
     Ok(answer)
+}
+
+/// Unix inodes keep their original representation; Windows retains every bit of a 128-bit file ID.
+#[cfg(unix)]
+pub type FileId = u64;
+#[cfg(windows)]
+pub type FileId = u128;
+pub type FileIdentity = (u64, FileId);
+
+#[cfg(unix)]
+pub(crate) fn sql_file_id(id: FileId) -> i64 {
+    id as i64
+}
+#[cfg(windows)]
+pub(crate) fn sql_file_id(id: FileId) -> Vec<u8> {
+    id.to_le_bytes().to_vec()
+}
+
+pub(crate) fn read_file_id(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<FileId> {
+    #[cfg(windows)]
+    if let rusqlite::types::ValueRef::Blob(bytes) = row.get_ref(column)? {
+        return bytes
+            .try_into()
+            .map(u128::from_le_bytes)
+            .map_err(|_| rusqlite::Error::InvalidQuery);
+    }
+    // Legacy rows and Unix stores use SQLite integers. They remain readable on Windows.
+    Ok(row.get::<_, i64>(column)? as u64 as FileId)
+}
+
+#[cfg(windows)]
+#[path = "platform/windows_identity.rs"]
+mod windows_identity;
+#[cfg(windows)]
+pub use windows_identity::{directory_identities, entry_identity, handle_identity, path_identity};
+
+#[cfg(all(test, windows))]
+pub(crate) fn reset_identity_opens() {
+    windows_identity::DIRECTORY_OPENS.with(|count| count.set(0));
+}
+#[cfg(all(test, windows))]
+pub(crate) fn identity_opens() -> usize {
+    windows_identity::DIRECTORY_OPENS.with(|count| count.get())
 }

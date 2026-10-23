@@ -316,6 +316,12 @@ absent from this report. Reporting never looks inside an ignored directory.
 Delta seals may repeat the last full seal's report. Older snapshots and captures
 without the directive omit the field and retain their existing serialization.
 
+Writer contention has one 30-second deadline per command or daemon request,
+shared by catalog access, pack locks and retries. A stalled writer returns a
+message asking you to retry; a second wait cannot restart that budget.
+Windows capture enumerates directory file IDs to preserve hard-link groups and
+distinguish replaced files in the stat cache without opening each file for its ID.
+
 ### Screened captures and group durability
 
 `hook turn-end` writes the complete capture before returning. The local daemon

@@ -2,7 +2,6 @@
 
 use crate::store::ObjectStore;
 use anyhow::Context;
-use fs2::FileExt;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -227,7 +226,7 @@ fn family_lock(store: &ObjectStore, family_id: &str) -> anyhow::Result<File> {
         .read(true)
         .write(true)
         .open(family.join("coord.lock"))?;
-    file.lock_exclusive()?;
+    crate::store::wait_lock(&file, true)?;
     Ok(file)
 }
 

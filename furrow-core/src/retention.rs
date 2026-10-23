@@ -157,6 +157,7 @@ impl RetentionState {
 
 impl RetentionLog {
     pub fn open(store_root: &Path, workspace_id: &str) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         let workspace_dir = store_root.join("workspaces").join(workspace_id);
         fs::create_dir_all(&workspace_dir)?;
         Ok(Self {
@@ -166,6 +167,7 @@ impl RetentionLog {
     }
 
     pub fn state(&self) -> anyhow::Result<RetentionState> {
+        let _operation = crate::writer_wait::Operation::start();
         let lock = self.lock()?;
         let mut file = self.open_log()?;
         let state = read_latest(&mut file)?;
@@ -174,11 +176,13 @@ impl RetentionLog {
     }
 
     pub fn plan(&self, refs: &RefLog, now: i64) -> anyhow::Result<RetentionState> {
+        let _operation = crate::writer_wait::Operation::start();
         let current = self.state()?;
         plan_state(refs, now, current.pins)
     }
 
     pub fn apply(&self, refs: &RefLog, now: i64) -> anyhow::Result<RetentionState> {
+        let _operation = crate::writer_wait::Operation::start();
         let lock = self.lock()?;
         let mut file = self.open_log()?;
         let current = read_latest(&mut file)?;
@@ -195,6 +199,7 @@ impl RetentionLog {
     }
 
     pub fn pin(&self, refs: &RefLog, snapshot_id: ObjectId) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let record = refs
             .find(&snapshot_id)?
             .context("snapshot does not belong to this workspace timeline")?;
@@ -218,6 +223,7 @@ impl RetentionLog {
     }
 
     pub fn unpin(&self, snapshot_id: &ObjectId) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let lock = self.lock()?;
         let mut file = self.open_log()?;
         let mut state = read_latest(&mut file)?;
@@ -241,7 +247,7 @@ impl RetentionLog {
             .read(true)
             .write(true)
             .open(&self.lock_path)?;
-        lock.lock_exclusive()?;
+        crate::store::wait_lock(&lock, true)?;
         Ok(lock)
     }
 

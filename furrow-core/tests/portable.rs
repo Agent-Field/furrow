@@ -48,6 +48,7 @@ fn generate_fixture(destination: &Path) {
     let data = temp.path().join("data");
     fs::create_dir_all(root.join("nested")).unwrap();
     fs::write(root.join("nested/tool"), CONTENT).unwrap();
+    fs::hard_link(root.join("nested/tool"), root.join("tool-alias")).unwrap();
     fs::set_permissions(root.join("nested/tool"), fs::Permissions::from_mode(0o755)).unwrap();
     for name in ["aux.c", "con", "a:b", "tail.", "space ", "README", "readme"] {
         fs::write(root.join(name), name.as_bytes()).unwrap();
@@ -83,8 +84,8 @@ fn generate_fixture(destination: &Path) {
 
 #[test]
 fn w3_linux_exchange_preserves_bytes_paths_and_recorded_modes() {
-    // W3: LF, CRLF, NUL and non-text bytes survive import, materialize, re-seal
-    // and a second exchange; executable mode survives a Windows re-seal.
+    // M2/W3: hard-link groups, bytes and modes survive Linux import, native Windows
+    // materialize and re-seal, and the Windows export consumed again on Linux.
     #[cfg(unix)]
     if let Some(destination) = std::env::var_os("FURROW_GENERATE_PORTABLE") {
         generate_fixture(Path::new(&destination));
@@ -108,6 +109,7 @@ fn w3_linux_exchange_preserves_bytes_paths_and_recorded_modes() {
     ingest(&data, &temp.path().join("inbox"), &bytes, head.trim());
     let answer = ops::restore_head(&data, &root, None, head.trim()).unwrap();
     assert_eq!(fs::read(root.join("nested/tool")).unwrap(), CONTENT);
+    assert_linked(&root);
     #[cfg(windows)]
     {
         // W4: each impossible entry is individually reported, while the
@@ -136,6 +138,8 @@ fn w3_linux_exchange_preserves_bytes_paths_and_recorded_modes() {
     drop(repository);
     let store = open_store(&data).unwrap();
     let snapshot: Snapshot = store.read_struct(&new_head, ObjectKind::Snapshot).unwrap();
+    assert_eq!(snapshot.hardlinks.len(), 1);
+    assert_eq!(snapshot.hardlinks[0].paths.len(), 2);
     let tool = furrow::tree::find_path(&store, &snapshot.root_tree, b"nested/tool")
         .unwrap()
         .unwrap();
@@ -172,6 +176,7 @@ fn w3_linux_exchange_preserves_bytes_paths_and_recorded_modes() {
     fs::create_dir(&second_tree).unwrap();
     ops::restore_head(&second_data, &second_tree, None, &id_hex(&new_head)).unwrap();
     assert_eq!(fs::read(second_tree.join("nested/tool")).unwrap(), CONTENT);
+    assert_linked(&second_tree);
     assert_eq!(fs::read(second_tree.join("new")).unwrap(), b"new\r\n");
     assert!(
         ops::wanted(&second_data, &keys(), &id_hex(&new_head)).unwrap()["want"]
@@ -200,4 +205,24 @@ fn w3_linux_exchange_preserves_bytes_paths_and_recorded_modes() {
     );
     assert!(paths.iter().all(|path| !path.exists()));
     assert!(parse_id(head.trim()).is_ok());
+}
+
+fn assert_linked(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = fs::metadata(root.join("nested/tool")).unwrap();
+        let b = fs::metadata(root.join("tool-alias")).unwrap();
+        assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+    }
+    #[cfg(windows)]
+    {
+        let a = furrow::platform::path_identity(&root.join("nested/tool"))
+            .unwrap()
+            .unwrap();
+        let b = furrow::platform::path_identity(&root.join("tool-alias"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a, b);
+    }
 }

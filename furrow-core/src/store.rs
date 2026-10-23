@@ -54,11 +54,12 @@ pub struct GroupCommit {
 
 impl GroupCommit {
     pub fn open(root: &Path) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         let catalog = rusqlite::Connection::open_with_flags(
             root.join("catalog.sqlite3"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        catalog.busy_timeout(crate::catalog::WRITER_WAIT)?;
+        crate::writer_wait::configure(&catalog)?;
         Ok(Self {
             root: root.to_owned(),
             catalog,
@@ -66,6 +67,7 @@ impl GroupCommit {
     }
 
     pub fn sync(&mut self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let maintenance = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -244,6 +246,7 @@ pub struct StoreStats {
 
 impl ObjectStore {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         fs::create_dir_all(root.join("packs"))?;
         fs::create_dir_all(root.join("locks"))?;
         fs::create_dir_all(root.join("workspaces"))?;
@@ -303,6 +306,7 @@ impl ObjectStore {
     }
 
     pub fn put_bytes(&self, kind: ObjectKind, bytes: &[u8]) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_shared()?;
         // Every writer takes the catalog before the pack, including restore previews.
         self.catalog.batch(|| self.put_bytes_locked(kind, bytes))
@@ -392,10 +396,12 @@ impl ObjectStore {
     }
 
     pub(crate) fn acquire_maintenance_shared(&self) -> anyhow::Result<MaintenanceGuard> {
+        let _operation = crate::writer_wait::Operation::start();
         self.acquire_maintenance(false)
     }
 
     pub(crate) fn acquire_maintenance_exclusive(&self) -> anyhow::Result<MaintenanceGuard> {
+        let _operation = crate::writer_wait::Operation::start();
         if self.maintenance.depth.get() == 0 && self.root.join("group-commit.json").exists() {
             self.sync()?;
         }
@@ -447,11 +453,13 @@ impl ObjectStore {
         kind: ObjectKind,
         value: &T,
     ) -> anyhow::Result<ObjectId> {
+        let _operation = crate::writer_wait::Operation::start();
         let bytes = serde_json::to_vec(value)?;
         self.put_bytes(kind, &bytes)
     }
 
     pub fn read_bytes(&self, id: &ObjectId, expected: ObjectKind) -> anyhow::Result<Vec<u8>> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_shared()?;
         self.read_bytes_unlocked(id, expected)
     }
@@ -461,6 +469,7 @@ impl ObjectStore {
         id: &ObjectId,
         expected: ObjectKind,
     ) -> anyhow::Result<Vec<u8>> {
+        let _operation = crate::writer_wait::Operation::start();
         let location = self
             .catalog
             .object(id)?
@@ -500,15 +509,18 @@ impl ObjectStore {
         id: &ObjectId,
         expected: ObjectKind,
     ) -> anyhow::Result<T> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(serde_json::from_slice(&self.read_bytes(id, expected)?)?)
     }
 
     pub(crate) fn contains_object(&self, id: &ObjectId) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_shared()?;
         Ok(self.catalog.object(id)?.is_some())
     }
 
     pub fn ensure_workspace(&mut self, id: &str, root: &[u8]) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let workspace_dir = self.root.join("workspaces").join(id);
         fs::create_dir_all(&workspace_dir)?;
         if !workspace_dir.join("root.path").exists() {
@@ -545,6 +557,7 @@ impl ObjectStore {
     /// workspace already at `to` describes the folder that was there before the
     /// move, so it is detached, or a path would name two workspaces.
     pub fn rebind_workspace(&mut self, from: &[u8], to: &[u8]) -> anyhow::Result<String> {
+        let _operation = crate::writer_wait::Operation::start();
         let id = self
             .find_workspace(from)?
             .context("no workspace is registered at the folder that moved")?;
@@ -563,6 +576,7 @@ impl ObjectStore {
         from: &[u8],
         to: &[u8],
     ) -> anyhow::Result<String> {
+        let _operation = crate::writer_wait::Operation::start();
         let id = crate::repository::timeline_workspace_id(timeline)?;
         let directory = self.workspace_data_dir(&id);
         anyhow::ensure!(
@@ -574,6 +588,7 @@ impl ObjectStore {
     }
 
     pub fn find_workspace(&self, root: &[u8]) -> anyhow::Result<Option<String>> {
+        let _operation = crate::writer_wait::Operation::start();
         for entry in fs::read_dir(self.root.join("workspaces"))? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with("t-")
@@ -592,12 +607,14 @@ impl ObjectStore {
     }
 
     pub fn workspace_head(&self, id: &str) -> anyhow::Result<Option<ObjectId>> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(RefLog::open(&self.root, id)?
             .head()?
             .map(|record| record.snapshot_id))
     }
 
     pub fn detach_workspace(&mut self, id: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let workspace_dir = self.workspace_data_dir(id);
         fs::create_dir_all(&workspace_dir)?;
         let marker = workspace_dir.join("detached");
@@ -613,6 +630,7 @@ impl ObjectStore {
     }
 
     pub fn purge_workspace(&mut self, id: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog.remove_workspace(id)?;
         let workspace_dir = self.workspace_data_dir(id);
         if workspace_dir.exists() {
@@ -623,6 +641,7 @@ impl ObjectStore {
     }
 
     pub fn timeline(&self, id: &str, limit: usize) -> anyhow::Result<Vec<TimelineRow>> {
+        let _operation = crate::writer_wait::Operation::start();
         let refs = RefLog::open(&self.root, id)?;
         let Some(head) = refs.head()? else {
             return Ok(Vec::new());
@@ -642,6 +661,7 @@ impl ObjectStore {
     }
 
     pub fn retained_snapshot_count(&self, id: &str) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         let refs = RefLog::open(&self.root, id)?;
         let head = refs.head()?.map_or(0, |record| record.sequence);
         Ok(RetentionLog::open(&self.root, id)?
@@ -653,6 +673,7 @@ impl ObjectStore {
         &self,
         workspace_id: &str,
     ) -> anyhow::Result<std::collections::BTreeSet<ObjectId>> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(RetentionLog::open(&self.root, workspace_id)?
             .state()?
             .pins
@@ -662,6 +683,7 @@ impl ObjectStore {
     }
 
     pub fn pin_snapshot(&self, workspace_id: &str, snapshot_id: ObjectId) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_exclusive()?;
         anyhow::ensure!(
             self.catalog.object(&snapshot_id)?.is_some(),
@@ -676,6 +698,7 @@ impl ObjectStore {
         workspace_id: &str,
         snapshot_id: &ObjectId,
     ) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_exclusive()?;
         RetentionLog::open(&self.root, workspace_id)?.unpin(snapshot_id)
     }
@@ -685,6 +708,7 @@ impl ObjectStore {
         workspace_id: &str,
         path: &[u8],
     ) -> anyhow::Result<Option<CachedFile>> {
+        let _operation = crate::writer_wait::Operation::start();
         let folder = self.cache_namespace(workspace_id, path)?;
         match self.catalog.cached_file(&folder, path)? {
             Some(row) => Ok(Some(row)),
@@ -698,6 +722,7 @@ impl ObjectStore {
         workspace_id: &str,
         paths: &[Vec<u8>],
     ) -> anyhow::Result<Vec<Option<CachedFile>>> {
+        let _operation = crate::writer_wait::Operation::start();
         paths
             .iter()
             .map(|path| self.cached_file(workspace_id, path))
@@ -710,11 +735,13 @@ impl ObjectStore {
         path: &[u8],
         file: &CachedFile,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog
             .cache_file(&self.cache_namespace(workspace_id, path)?, path, file)
     }
 
     pub fn sqlite_paths(&self, workspace_id: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut paths = self
             .catalog
             .sqlite_paths(&self.cache_namespace(workspace_id, b"")?)?;
@@ -766,6 +793,7 @@ impl ObjectStore {
     /// Recovery trusts that checkpoint only up to the independent durable
     /// frontier and rebuilds the advisory catalog from packs and references.
     pub fn batched<T>(&self, write: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog.batch(|| {
             let value = write()?;
             fault::point("seal.captured");
@@ -785,6 +813,7 @@ impl ObjectStore {
         workspace_id: &str,
         path: &[u8],
     ) -> anyhow::Result<Option<ObjectId>> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog.cached_directory(workspace_id, path)
     }
 
@@ -794,6 +823,7 @@ impl ObjectStore {
         path: &[u8],
         tree_id: &ObjectId,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog.cache_directory(workspace_id, path, tree_id)
     }
 
@@ -805,6 +835,7 @@ impl ObjectStore {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         // The append is the visibility boundary. Synchronous calls flush the pack;
         // deferred calls leave complete written records for the independent group commit.
         if !self.deferred.get() {
@@ -829,6 +860,7 @@ impl ObjectStore {
 
     /// A deferred capture is complete in the kernel before it becomes visible.
     pub fn defer_durability(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         if !self.root.join("group-commit.json").exists() {
             self.sync()?;
         }
@@ -842,11 +874,13 @@ impl ObjectStore {
     }
 
     pub(crate) fn checkpoint_catalog(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog.checkpoint()
     }
 
     /// Packs precede references; the durable frontier is published last.
     pub fn sync(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_shared()?;
         self.sync_files_locked()?;
         if let Some(run) = self.unsynced.take() {
@@ -894,6 +928,7 @@ impl ObjectStore {
     }
 
     pub fn budget_status(&self) -> anyhow::Result<BudgetStatus> {
+        let _operation = crate::writer_wait::Operation::start();
         let config = budget::load(&self.root)?;
         budget::status(&self.root, config, self.stats()?.physical_bytes)
     }
@@ -903,6 +938,7 @@ impl ObjectStore {
         max_store_bytes: Option<u64>,
         reserved_free_bytes: Option<u64>,
     ) -> anyhow::Result<BudgetStatus> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_exclusive()?;
         let mut config = budget::load(&self.root)?;
         if let Some(max_store_bytes) = max_store_bytes {
@@ -917,6 +953,7 @@ impl ObjectStore {
     }
 
     pub fn enforce_budget(&mut self, force: bool) -> anyhow::Result<Option<GcReport>> {
+        let _operation = crate::writer_wait::Operation::start();
         let before = self.budget_status()?;
         if !before.pressured() {
             budget::record_attempt(&self.root, before.physical_bytes, true)?;
@@ -940,6 +977,7 @@ impl ObjectStore {
     }
 
     pub(crate) fn workspace_roots(&self) -> anyhow::Result<Vec<(String, PathBuf)>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut roots = Vec::new();
         for entry in fs::read_dir(self.root.join("workspaces"))? {
             let entry = entry?;
@@ -959,11 +997,13 @@ impl ObjectStore {
     }
 
     pub fn stats(&self) -> anyhow::Result<StoreStats> {
+        let _operation = crate::writer_wait::Operation::start();
         let _maintenance = self.acquire_maintenance_shared()?;
         self.stats_unlocked()
     }
 
     pub(crate) fn stats_unlocked(&self) -> anyhow::Result<StoreStats> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut physical_bytes = 0_u64;
         for entry in fs::read_dir(self.root.join("packs"))? {
             let entry = entry?;
@@ -980,10 +1020,12 @@ impl ObjectStore {
     }
 
     pub(crate) fn object_payload_bytes(&self) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog.object_payload_bytes()
     }
 
     pub(crate) fn object_len(&self, id: &ObjectId) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog
             .object(id)?
             .map(|location| location.len)
@@ -991,6 +1033,7 @@ impl ObjectStore {
     }
 
     pub(crate) fn object_kind(&self, id: &ObjectId) -> anyhow::Result<ObjectKind> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog
             .object(id)?
             .map(|location| location.kind)
@@ -1003,11 +1046,13 @@ impl ObjectStore {
         pack: &str,
         checkpoint: &PackCheckpoint,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.catalog
             .replace_objects_from_gc(mark_database, pack, checkpoint)
     }
 
     pub(crate) fn activate_pack(&mut self, pack: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_pack_name(pack)?;
         let packs = self.root.join("packs");
         let temporary = packs.join("CURRENT.tmp");
@@ -1358,7 +1403,7 @@ impl ObjectStore {
 
 /// Store writers wait a bounded interval so a stalled process cannot hang a caller forever.
 pub(crate) fn wait_lock(file: &File, exclusive: bool) -> anyhow::Result<()> {
-    let started = std::time::Instant::now();
+    let _operation = crate::writer_wait::Operation::start();
     loop {
         let result = if exclusive {
             file.try_lock_exclusive()
@@ -1371,12 +1416,7 @@ pub(crate) fn wait_lock(file: &File, exclusive: bool) -> anyhow::Result<()> {
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
             {
-                anyhow::ensure!(
-                    started.elapsed() < crate::catalog::WRITER_WAIT,
-                    "store writer is still busy after waiting {} seconds; retry the operation",
-                    crate::catalog::WRITER_WAIT.as_secs()
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                crate::writer_wait::pause(std::time::Duration::from_millis(10))?;
             }
             Err(error) => return Err(error.into()),
         }

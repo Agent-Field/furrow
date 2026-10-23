@@ -12,17 +12,23 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc,
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+const QUEUED: u8 = 0;
+const RUNNING: u8 = 1;
+const CANCELED: u8 = 2;
 
 struct Job {
     verb: &'static dyn Verb,
     target: Target,
     args: Value,
     reply: Sender<anyhow::Result<Value>>,
+    deadline: Instant,
+    state: Arc<AtomicU8>,
 }
 
 struct Writer {
@@ -40,6 +46,19 @@ impl Writer {
             loop {
                 match inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(job) => {
+                        let _operation = furrow::writer_wait::Operation::until(job.deadline);
+                        if let Err(error) = furrow::writer_wait::check() {
+                            let _ = job.reply.send(Err(error.into()));
+                            continue;
+                        }
+                        if job
+                            .state
+                            .compare_exchange(QUEUED, RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            let _ = job.reply.send(Err(furrow::writer_wait::timeout().into()));
+                            continue;
+                        }
                         let error = flusher.error.lock().expect("flusher error").clone();
                         let result = match &error {
                             Some(error) => Err(anyhow!("group commit failed: {error}")),
@@ -109,16 +128,35 @@ impl Router {
         verb: &'static dyn Verb,
         args: Value,
     ) -> anyhow::Result<Value> {
+        let _operation = furrow::writer_wait::Operation::start();
+        let deadline = furrow::writer_wait::deadline();
         let (reply, answer) = channel();
+        let state = Arc::new(AtomicU8::new(QUEUED));
         self.writer_inbox(&target)?
             .send(Job {
                 verb,
                 target,
                 args,
                 reply,
+                deadline,
+                state: Arc::clone(&state),
             })
             .map_err(|_| anyhow!("store writer stopped"))?;
-        answer.recv().map_err(|_| anyhow!("store writer stopped"))?
+        match answer.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow!("store writer stopped")),
+            Err(RecvTimeoutError::Timeout) => {
+                if state
+                    .compare_exchange(QUEUED, CANCELED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Err(furrow::writer_wait::timeout().into());
+                }
+                // The original deadline still bounds every contended wait in the running job.
+                // Its unblocked computation and storage I/O must finish without a false busy reply.
+                answer.recv().map_err(|_| anyhow!("store writer stopped"))?
+            }
+        }
     }
 
     fn writer_inbox(&self, target: &Target) -> anyhow::Result<Sender<Job>> {
@@ -186,6 +224,7 @@ impl Flusher {
                 );
                 if pending.swap(false, Ordering::SeqCst) {
                     let result = (|| {
+                        let _operation = furrow::writer_wait::Operation::start();
                         if group.is_none() {
                             group = Some(furrow::store::GroupCommit::open(&root)?);
                         }

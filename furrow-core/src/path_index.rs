@@ -5,7 +5,6 @@ use anyhow::Context;
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
-use std::time::Duration;
 
 pub const CHILD_BATCH: usize = 512;
 
@@ -26,7 +25,9 @@ pub struct PathUsage {
 
 impl PathIndex {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         let connection = Connection::open(path)?;
+        crate::writer_wait::configure(&connection)?;
         // The index is rebuildable, so closing it need not pay two syncs to
         // fold its log back into the database: the log is folded in when it
         // grows, and every open reads through it.
@@ -78,12 +79,14 @@ impl PathIndex {
     }
 
     pub fn checkpoint(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
         Ok(())
     }
 
     pub fn begin(&mut self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         anyhow::ensure!(!self.transaction_active, "path-index transaction is active");
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         self.transaction_active = true;
@@ -91,13 +94,16 @@ impl PathIndex {
     }
 
     pub fn backup_to(&self, path: &Path) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut destination = Connection::open(path)?;
+        crate::writer_wait::configure(&destination)?;
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut destination)?;
-        backup.run_to_completion(256, Duration::from_millis(1), None)?;
+        crate::writer_wait::backup(&backup, 256)?;
         Ok(())
     }
 
     pub fn commit(&mut self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         anyhow::ensure!(
             self.transaction_active,
             "path-index transaction is not active"
@@ -108,6 +114,7 @@ impl PathIndex {
     }
 
     pub fn rollback(&mut self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         if self.transaction_active {
             self.connection.execute_batch("ROLLBACK")?;
             self.transaction_active = false;
@@ -116,6 +123,7 @@ impl PathIndex {
     }
 
     pub fn reset(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.connection.execute("DELETE FROM entries", [])?;
         self.connection.execute("DELETE FROM links", [])?;
         self.connection.execute("DELETE FROM state", [])?;
@@ -123,6 +131,7 @@ impl PathIndex {
     }
 
     pub fn upsert(&self, path: &[u8], parent: &[u8], entry: &TreeEntry) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.connection.execute(
             "INSERT INTO entries(path, parent, name, entry) VALUES(?1, ?2, ?3, ?4)
              ON CONFLICT(path) DO UPDATE SET
@@ -135,6 +144,7 @@ impl PathIndex {
     }
 
     pub fn entry(&self, path: &[u8]) -> anyhow::Result<Option<TreeEntry>> {
+        let _operation = crate::writer_wait::Operation::start();
         let bytes: Option<Vec<u8>> = self
             .connection
             .query_row(
@@ -149,6 +159,7 @@ impl PathIndex {
     }
 
     pub fn remove_subtree(&self, path: &[u8]) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         const DESCENDANTS: &str = "WITH RECURSIVE descendants(path) AS (
                 SELECT path FROM entries WHERE path = ?1
                 UNION ALL
@@ -170,11 +181,16 @@ impl PathIndex {
     /// Notes which file `path` is on disk when it shares that file with another
     /// directory entry (`identity` is its device and inode), and forgets the
     /// note when it does not. Two paths are one file when both notes agree.
-    pub fn note_link(&self, path: &[u8], identity: Option<(u64, u64)>) -> anyhow::Result<()> {
+    pub fn note_link(
+        &self,
+        path: &[u8],
+        identity: Option<crate::platform::FileIdentity>,
+    ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         match identity {
             Some((device, inode)) => self.connection.execute(
                 "INSERT OR REPLACE INTO links(path, device, inode) VALUES(?1, ?2, ?3)",
-                params![path, device as i64, inode as i64],
+                params![path, device as i64, crate::platform::sql_file_id(inode)],
             )?,
             None => self
                 .connection
@@ -184,13 +200,22 @@ impl PathIndex {
     }
 
     /// The device and inode noted for `path`, when it shares its file.
-    pub fn link_identity(&self, path: &[u8]) -> anyhow::Result<Option<(u64, u64)>> {
+    pub fn link_identity(
+        &self,
+        path: &[u8],
+    ) -> anyhow::Result<Option<crate::platform::FileIdentity>> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self
             .connection
             .query_row(
                 "SELECT device, inode FROM links WHERE path = ?1",
                 params![path],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        crate::platform::read_file_id(row, 1)?,
+                    ))
+                },
             )
             .optional()?)
     }
@@ -200,6 +225,7 @@ impl PathIndex {
     /// means its siblings were not looked at, because nothing told us they
     /// changed when the link was made.
     pub fn link_has_no_known_sibling(&self, path: &[u8]) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM links mine WHERE mine.path = ?1)
                 AND NOT EXISTS(
@@ -216,6 +242,7 @@ impl PathIndex {
     /// bytewise order of their first path. A file linked to something outside
     /// the tree (the store, another folder) is alone here and is not a group.
     pub fn link_groups(&self) -> anyhow::Result<Vec<Vec<Vec<u8>>>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut statement = self.connection.prepare(
             "SELECT device, inode, path FROM links
              WHERE (device, inode) IN (
@@ -224,7 +251,10 @@ impl PathIndex {
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
-                (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                (
+                    row.get::<_, i64>(0)?,
+                    crate::platform::read_file_id(row, 1)?,
+                ),
                 row.get::<_, Vec<u8>>(2)?,
             ))
         })?;
@@ -244,6 +274,7 @@ impl PathIndex {
     }
 
     pub fn remove(&self, path: &[u8]) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         self.connection
             .execute("DELETE FROM links WHERE path = ?1", params![path])?;
         Ok(self
@@ -258,6 +289,7 @@ impl PathIndex {
         after_name: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<TreeEntry>> {
+        let _operation = crate::writer_wait::Operation::start();
         let after_name = after_name.unwrap_or_default();
         let mut statement = self.connection.prepare(
             "SELECT entry FROM entries
@@ -285,6 +317,7 @@ impl PathIndex {
         after_path: Option<&[u8]>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Vec<u8>, TreeEntry)>> {
+        let _operation = crate::writer_wait::Operation::start();
         let after_path = after_path.unwrap_or_default();
         let mut statement = self.connection.prepare(
             "SELECT path, entry FROM entries
@@ -305,6 +338,7 @@ impl PathIndex {
     }
 
     pub fn set_root(&self, root: &ObjectId, generation: &str) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.connection.execute(
             "INSERT INTO state(singleton, root_tree, generation) VALUES(1, ?1, ?2)
              ON CONFLICT(singleton) DO UPDATE SET
@@ -316,6 +350,7 @@ impl PathIndex {
     }
 
     pub fn root(&self, generation: &str) -> anyhow::Result<Option<ObjectId>> {
+        let _operation = crate::writer_wait::Operation::start();
         let bytes: Option<Vec<u8>> = self
             .connection
             .query_row(
@@ -335,6 +370,7 @@ impl PathIndex {
     }
 
     pub fn count(&self) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self
             .connection
             .query_row("SELECT COUNT(*) FROM entries", [], |row| {
@@ -343,6 +379,7 @@ impl PathIndex {
     }
 
     pub fn usage(&self) -> anyhow::Result<PathUsage> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut statement = self.connection.prepare("SELECT entry FROM entries")?;
         let mut rows = statement.query([])?;
         let mut usage = PathUsage {

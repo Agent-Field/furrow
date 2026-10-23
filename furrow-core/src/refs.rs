@@ -53,6 +53,7 @@ pub struct RefLog {
 
 impl RefLog {
     pub fn open(store_root: &Path, workspace_id: &str) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         let workspace_dir = store_root.join("workspaces").join(workspace_id);
         fs::create_dir_all(&workspace_dir)?;
         Ok(Self {
@@ -65,6 +66,7 @@ impl RefLog {
     /// Reads and verifies the complete authoritative log. This is intentionally
     /// the recovery/rebuild path; normal head and timeline reads use the index.
     pub fn records(&self) -> anyhow::Result<Vec<RefRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         let lock = self.lock()?;
         let mut file = self.open_log()?;
         let (records, valid_len, incomplete_tail) = read_records(&mut file, 0, [0; 32], 1)?;
@@ -78,6 +80,7 @@ impl RefLog {
     }
 
     pub fn head(&self) -> anyhow::Result<Option<RefRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         Ok(self.recent(1)?.pop())
     }
 
@@ -88,6 +91,7 @@ impl RefLog {
         &self,
         mut visit: impl FnMut(ObjectId) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.for_each_record(|record| visit(record.snapshot_id))
     }
 
@@ -95,6 +99,7 @@ impl RefLog {
         &self,
         mut visit: impl FnMut(&RefRecord) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         if !self.path.exists() {
             return Ok(());
         }
@@ -126,6 +131,7 @@ impl RefLog {
     }
 
     pub fn find(&self, snapshot_id: &ObjectId) -> anyhow::Result<Option<RefRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut found = None;
         self.for_each_record(|record| {
             if record.snapshot_id == *snapshot_id {
@@ -137,6 +143,7 @@ impl RefLog {
     }
 
     pub fn records_at_sequences(&self, sequences: &[u64]) -> anyhow::Result<Vec<RefRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         if sequences.is_empty() || !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -172,6 +179,7 @@ impl RefLog {
     /// Returns newest-first records while reading only O(limit) log frames once
     /// the reverse index has been validated.
     pub fn recent(&self, limit: usize) -> anyhow::Result<Vec<RefRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         if limit == 0 || !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -233,6 +241,7 @@ impl RefLog {
         label: Option<String>,
         trigger: SnapshotTrigger,
     ) -> anyhow::Result<RefRecord> {
+        let _operation = crate::writer_wait::Operation::start();
         self.append_ordered(snapshot_id, sealed_at, label, trigger, true)
     }
 
@@ -244,6 +253,7 @@ impl RefLog {
         trigger: SnapshotTrigger,
         durable: bool,
     ) -> anyhow::Result<RefRecord> {
+        let _operation = crate::writer_wait::Operation::start();
         let lock = self.lock()?;
         let mut file = self.open_log()?;
         self.ensure_index(&mut file)?;
@@ -294,12 +304,14 @@ impl RefLog {
     }
 
     pub(crate) fn complete_len(&self) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         let _lock = self.lock()?;
         Ok(self.open_log()?.metadata()?.len())
     }
 
     /// The caller already sampled a complete prefix; flushing it must not hold up the next append.
     pub(crate) fn sync(&self) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         self.open_log()?.sync_data()?;
         Ok(())
     }
@@ -310,6 +322,7 @@ impl RefLog {
         durable_len: u64,
         mut present: impl FnMut(&ObjectId) -> anyhow::Result<bool>,
     ) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         let _lock = self.lock()?;
         let mut file = self.open_log()?;
         let len = file.metadata()?.len();
@@ -351,7 +364,7 @@ impl RefLog {
             .read(true)
             .write(true)
             .open(&self.lock_path)?;
-        lock.lock_exclusive()?;
+        crate::store::wait_lock(&lock, true)?;
         Ok(lock)
     }
 

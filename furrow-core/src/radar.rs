@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXACT: i64 = 0;
 const SUBTREE: i64 = 1;
@@ -73,11 +73,12 @@ pub struct EventPage {
 
 impl Radar {
     pub fn open(store_root: &Path, family_id: &str) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_id(family_id, "family")?;
         let directory = store_root.join("families").join(family_id);
         std::fs::create_dir_all(&directory)?;
         let connection = Connection::open(directory.join("radar.sqlite3"))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        crate::writer_wait::configure(&connection)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -149,6 +150,7 @@ impl Radar {
         fork_ids: &[String],
         claims: &[ClaimRecord],
     ) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let transaction = self.connection.transaction()?;
         transaction.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS radar_keep(fork_id TEXT PRIMARY KEY) WITHOUT ROWID;
@@ -181,6 +183,7 @@ impl Radar {
         store: &ObjectStore,
         registration: UniverseRegistration<'_>,
     ) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_id(registration.fork_id, "fork")?;
         let current: Option<(Vec<u8>, Vec<u8>)> = self
             .connection
@@ -264,6 +267,7 @@ impl Radar {
     }
 
     pub fn reconcile(&mut self, claims: &[ClaimRecord]) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let transaction = self.connection.transaction()?;
         reconcile_conflicts(&transaction, &self.family_id, claims)?;
         transaction.commit()?;
@@ -271,6 +275,7 @@ impl Radar {
     }
 
     pub fn summaries(&self) -> anyhow::Result<BTreeMap<String, ForkConflictSummary>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut summaries = BTreeMap::new();
         let mut statement = self.connection.prepare(
             "SELECT u.fork_id, m.path
@@ -294,6 +299,7 @@ impl Radar {
     }
 
     pub fn updated_at(&self) -> anyhow::Result<BTreeMap<String, i64>> {
+        let _operation = crate::writer_wait::Operation::start();
         let mut statement = self
             .connection
             .prepare("SELECT fork_id, updated_at FROM universes ORDER BY fork_id")?;
@@ -302,6 +308,7 @@ impl Radar {
     }
 
     pub fn events_after(&self, after: Option<&str>, limit: usize) -> anyhow::Result<EventPage> {
+        let _operation = crate::writer_wait::Operation::start();
         anyhow::ensure!((1..=1000).contains(&limit), "event limit must be 1..=1000");
         let cursor_supplied = after.is_some();
         let after_sequence = after

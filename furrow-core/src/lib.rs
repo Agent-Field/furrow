@@ -40,6 +40,7 @@ pub mod tree;
 pub mod ui;
 pub mod universe;
 pub mod watcher;
+pub mod writer_wait;
 
 pub use budget::{BudgetConfig, BudgetStatus};
 pub use estimate::CaptureEstimate;

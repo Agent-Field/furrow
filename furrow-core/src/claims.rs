@@ -4,7 +4,7 @@ use crate::model::ClaimRecord;
 use anyhow::Context;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_PATTERN_BYTES: usize = 1024;
 const MAX_OWNER_BYTES: usize = 256;
@@ -16,11 +16,12 @@ pub struct Registry {
 
 impl Registry {
     pub fn open(store_root: &Path, family_id: &str) -> anyhow::Result<Self> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_family_id(family_id)?;
         let directory = store_root.join("families").join(family_id);
         std::fs::create_dir_all(&directory)?;
         let connection = Connection::open(directory.join("claims.sqlite3"))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        crate::writer_wait::configure(&connection)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -44,6 +45,7 @@ impl Registry {
         workspace_id: &str,
         ttl_seconds: u64,
     ) -> anyhow::Result<ClaimRecord> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_pattern(pattern)?;
         validate_owner(owner)?;
         anyhow::ensure!(
@@ -105,6 +107,7 @@ impl Registry {
     }
 
     pub fn active(&mut self) -> anyhow::Result<Vec<ClaimRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         let now = now()?;
         let transaction = self
             .connection
@@ -128,6 +131,7 @@ impl Registry {
         owner: &str,
         workspace_id: &str,
     ) -> anyhow::Result<Vec<ClaimRecord>> {
+        let _operation = crate::writer_wait::Operation::start();
         validate_owner(owner)?;
         let transaction = self
             .connection
@@ -155,6 +159,7 @@ impl Registry {
     }
 
     pub fn restore(&mut self, claims: &[ClaimRecord]) -> anyhow::Result<()> {
+        let _operation = crate::writer_wait::Operation::start();
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -178,6 +183,7 @@ impl Registry {
     }
 
     pub fn release_workspace(&mut self, workspace_id: &str) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

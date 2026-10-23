@@ -578,6 +578,7 @@ fn read_changed_stdin() -> anyhow::Result<Vec<PathBuf>> {
 }
 
 fn main() -> anyhow::Result<()> {
+    let mut operation = Some(furrow::writer_wait::Operation::start());
     let cli = Cli::parse();
     if let Some(timeline) = &cli.timeline {
         furrow::repository::timeline_workspace_id(timeline)?;
@@ -638,6 +639,7 @@ fn main() -> anyhow::Result<()> {
                 println!("Store {}", repository.store_root().display());
             }
             if foreground {
+                drop(operation.take());
                 furrow::watcher::run(
                     repository,
                     std::time::Duration::from_millis(debounce_ms.max(10)),
@@ -647,6 +649,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Daemon { debounce_ms } => {
+            drop(operation.take());
             let repository = open_selected(&cli.repo, None)?;
             furrow::watcher::run(
                 repository,
@@ -656,11 +659,15 @@ fn main() -> anyhow::Result<()> {
         Command::Serve {
             socket,
             idle_minutes,
-        } => serve(socket, idle_minutes)?,
+        } => {
+            drop(operation.take());
+            serve(socket, idle_minutes)?;
+        }
         Command::Exchange { command: verb } | Command::ExchangeLegacy(verb) => {
             exchange::run(verb, &cli.repo, cli.json)?
         }
         Command::RemoteHelper { namespace } => {
+            drop(operation.take());
             furrow::remote::serve(&namespace)?;
         }
         Command::NamespaceProbe => {
@@ -948,6 +955,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let repository = open_selected(&cli.repo, None)?;
             let mut cursor = after;
+            drop(operation.take());
             loop {
                 let page = repository.events(cursor.as_deref(), limit)?;
                 anyhow::ensure!(
@@ -977,6 +985,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let repository = open_selected(&cli.repo, None)?;
             let mut cursor = after;
+            drop(operation.take());
             loop {
                 let updates = repository.fork_updates(&name, cursor.as_deref(), 1000)?;
                 if !updates.cursor_found {
@@ -1591,6 +1600,7 @@ fn main() -> anyhow::Result<()> {
             if follow {
                 anyhow::ensure!(poll_seconds > 0, "--poll-seconds must be greater than zero");
                 let mut session = repository.sync_follow_session(ref_name)?;
+                drop(operation.take());
                 loop {
                     let result = repository.sync_follow_once(&mut session);
                     let session_failed = result.is_err();
