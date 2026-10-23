@@ -559,7 +559,10 @@ impl CachedFile {
     /// True when a write in the timestamp granularity after the read could
     /// still have left the stat unchanged; such a file is read again.
     pub fn is_racy(&self) -> bool {
+        #[cfg(unix)]
         let newest = self.mtime_nanos_total().max(self.ctime_nanos_total());
+        #[cfg(windows)]
+        let newest = self.mtime_nanos_total();
         newest.saturating_add(RACY_WINDOW_NANOS) >= self.cached_at_nanos
     }
 
@@ -569,6 +572,7 @@ impl CachedFile {
             .saturating_add(self.mtime_nanos)
     }
 
+    #[cfg(unix)]
     fn ctime_nanos_total(&self) -> i64 {
         self.ctime_secs
             .saturating_mul(1_000_000_000)
