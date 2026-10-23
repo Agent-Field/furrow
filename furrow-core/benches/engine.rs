@@ -694,6 +694,21 @@ impl Workspace {
         fs::write(repo.join(".gitignore"), b"node_modules/\n")?;
         git(&repo, &["add", ".gitignore"])?;
         git(&repo, &["commit", "-q", "-m", "benchmark baseline"])?;
+        // G2/G3 compare identical seal scenarios with optional ignored output and policy.
+        if std::env::var_os("FURROW_BENCH_GITIGNORE").is_some() {
+            fs::write(repo.join(".furrowpolicy"), b"gitignore\n")?;
+        }
+        let ignored = environment_usize("FURROW_BENCH_IGNORED_FILES", 0)?;
+        if std::env::var_os("FURROW_BENCH_IGNORED_FILES").is_some() {
+            fs::write(repo.join(".gitignore"), b"node_modules/\ndist/\n")?;
+        }
+        if ignored > 0 {
+            let dist = repo.join("dist");
+            fs::create_dir(&dist)?;
+            for i in 0..ignored {
+                fs::write(dist.join(format!("output-{i}")), b"generated output")?;
+            }
+        }
         write_files(&repo, profile.files)?;
         if warm {
             let cache = repo.join("node_modules/runtime/cache.bin");

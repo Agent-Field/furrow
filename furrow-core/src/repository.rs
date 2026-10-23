@@ -650,7 +650,18 @@ impl FurrowRepository {
                 claims,
                 excluded_paths: policy.rule_strings(),
                 hardlinks,
-                ignored: policy.omitted.clone(),
+                ignored: if policy.did_full_capture() {
+                    policy.ignored_summary()
+                } else if policy.ignored_summary().is_some() {
+                    match parent {
+                        Some(id) => self
+                            .snapshot_ignored(&id)?
+                            .or_else(|| policy.ignored_summary()),
+                        None => policy.ignored_summary(),
+                    }
+                } else {
+                    None
+                },
             };
             let id = self.store.put_struct(ObjectKind::Snapshot, &snapshot)?;
             Ok((id, secs))
@@ -3077,7 +3088,12 @@ impl FurrowRepository {
             Some(overlay) => own.union(&CapturePolicy::load(overlay.source())?),
             None => own,
         };
-        policy.resolve_gitignore(&self.root)
+        let policy = policy.resolve_gitignore(&self.root)?;
+        Ok(if self.overlay.is_some() {
+            policy.with_virtual_subtree(overlay::NAME)
+        } else {
+            policy
+        })
     }
 
     fn in_overlay(&self, raw_path: &[u8]) -> bool {
@@ -3205,10 +3221,6 @@ impl FurrowRepository {
         changed_paths: Option<&[PathBuf]>,
         policy: &CapturePolicy,
     ) -> anyhow::Result<ObjectId> {
-        // Ignore rules and the tracked index may change outside a caller's delta list.
-        if policy.uses_gitignore() {
-            return self.capture_root_retry_with_policy(policy);
-        }
         let Some(paths) = changed_paths else {
             return self.capture_root_retry_with_policy(policy);
         };
@@ -3239,6 +3251,7 @@ impl FurrowRepository {
     }
 
     fn capture_root_retry_with_policy(&self, policy: &CapturePolicy) -> anyhow::Result<ObjectId> {
+        policy.begin_full_capture();
         let mut index = self.open_path_index()?;
         let mut last_error = None;
         for _ in 0..3 {
@@ -3427,7 +3440,13 @@ impl FurrowRepository {
             .context("directory is outside the tree")?;
         let mut tree = tree::Builder::new(&self.store);
 
-        for child_name in self.children(path)? {
+        let tracked = policy.tracked_children(&relative);
+        let tracked_only = tracked.is_some();
+        let children: Box<dyn Iterator<Item = std::io::Result<OsString>>> = match tracked {
+            Some(names) => Box::new(names.into_iter().map(Ok)),
+            None => self.children(path)?,
+        };
+        for child_name in children {
             let child_path = self.child_path(path, &child_name?);
             if child_path.starts_with(self.store.root()) {
                 continue;
@@ -3445,6 +3464,13 @@ impl FurrowRepository {
                 .logical_path(&child_path)
                 .context("child is outside the tree")?;
             if policy.excludes_bytes(&child_relative) {
+                continue;
+            }
+            // An index entry may outlive a working-tree deletion; directed traversal skips that missing name.
+            if tracked_only
+                && fs::symlink_metadata(&child_path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
                 continue;
             }
             let Some(entry) = self.capture_path_entry(&child_path, index, policy)? else {

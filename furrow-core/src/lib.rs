@@ -11,6 +11,7 @@ pub mod exchange;
 pub mod fault;
 pub mod fork;
 pub mod gc;
+mod gitignore;
 pub mod hardlink;
 pub mod mcp;
 pub mod merge;

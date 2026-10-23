@@ -193,7 +193,7 @@ fn captured_files(repo: &FurrowRepository, id: &str) -> BTreeSet<String> {
 fn s6_s7_s8_git_matrix_and_ignored_restore_protection() {
     // S6 compares capture against real Git, including nested rules and tracked exceptions.
     // S7 protects ignored content from old snapshots, safety seals and directory replacement.
-    // S8 counts ignored files/bytes and collapses directory paths without reading their contents.
+    // G4 reports collapsed omitted groups without counting files or bytes inside them.
     let rig = Rig::new();
     git(&rig.tree, &["init", "-q"]);
     let global = rig._temp.path().join("global-ignore");
@@ -258,12 +258,9 @@ fn s6_s7_s8_git_matrix_and_ignored_restore_protection() {
             "{p}"
         );
     }
-    let expected_bytes: u64 = ignored
-        .iter()
-        .map(|p| fs::symlink_metadata(rig.tree.join(p)).unwrap().len())
-        .sum();
-    assert_eq!(report["ignored"]["files"], ignored.len());
-    assert_eq!(report["ignored"]["bytes"], expected_bytes);
+    assert!(report["ignored"].get("files").is_none());
+    assert!(report["ignored"].get("bytes").is_none());
+    assert_eq!(report["ignored"]["more"], 0);
     assert!(report["ignored"]["paths"]
         .as_array()
         .unwrap()
@@ -623,22 +620,8 @@ fn s3_stalled_writer_times_out_with_a_bounded_retry_message() {
 }
 
 #[test]
-fn s8_ignored_nested_repository_counts_every_omitted_file() {
-    // S6 and S8 omit empty ignored directories and count files when Git collapses a nested repository.
-    fn totals(path: &Path) -> (u64, u64) {
-        fs::read_dir(path)
-            .unwrap()
-            .fold((0, 0), |(files, bytes), entry| {
-                let path = entry.unwrap().path();
-                let metadata = fs::symlink_metadata(&path).unwrap();
-                let (more_files, more_bytes) = if metadata.is_dir() {
-                    totals(&path)
-                } else {
-                    (1, metadata.len())
-                };
-                (files + more_files, bytes + more_bytes)
-            })
-    }
+fn g4_ignored_nested_repository_and_empty_directory_are_collapsed() {
+    // G4 reports ignored nested repositories and empty directories without traversing them.
     let rig = Rig::new();
     git(&rig.tree, &["init", "-q"]);
     fs::write(rig.tree.join(".gitignore"), "dist/\nempty/\n").unwrap();
@@ -647,10 +630,10 @@ fn s8_ignored_nested_repository_counts_every_omitted_file() {
     fs::create_dir(rig.tree.join("empty")).unwrap();
     git(&rig.tree.join("dist"), &["init", "-q"]);
     fs::write(rig.tree.join("dist/output"), "omitted").unwrap();
-    let expected = totals(&rig.tree.join("dist"));
     let report = rig.cli("a", &["hook", "turn-end"]);
-    assert_eq!(report["ignored"]["files"], expected.0);
-    assert_eq!(report["ignored"]["bytes"], expected.1);
+    assert_eq!(report["ignored"]["more"], 0);
+    assert!(report["ignored"].get("files").is_none());
+    assert!(report["ignored"].get("bytes").is_none());
     assert_eq!(report["ignored"]["paths"], json!(["dist/", "empty/"]));
     let files = captured_files(&rig.repo("a"), report["snapshot"].as_str().unwrap());
     assert!(!files.iter().any(|p| p.starts_with("dist/")));
@@ -711,4 +694,417 @@ fn s1_fork_commands_keep_the_forks_own_identity() {
             Some(sibling.as_str())
         );
     }
+}
+
+#[test]
+fn g1_g3_delta_only_captures_named_paths_and_reloads_rules() {
+    // G1 reloads replaced index/rule identities; G3 leaves unrelated changed content for a full seal.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::write(rig.tree.join(".furrowpolicy"), "gitignore\n").unwrap();
+    fs::write(rig.tree.join(".gitignore"), "*.log\ndist/\n").unwrap();
+    fs::write(rig.tree.join("force.log"), "tracked").unwrap();
+    fs::write(rig.tree.join("other.log"), "ignored").unwrap();
+    fs::create_dir_all(rig.tree.join("dist/inner")).unwrap();
+    fs::write(rig.tree.join("dist/inner/tracked"), "tracked").unwrap();
+    fs::write(rig.tree.join("dist/inner/ignored"), "ignored").unwrap();
+    fs::write(rig.tree.join("source"), "original").unwrap();
+    fs::write(rig.tree.join("unrelated"), "original").unwrap();
+    git(&rig.tree, &["add", "-f", "force.log", "dist/inner/tracked"]);
+    git(&rig.tree, &["update-index", "--index-version=4"]);
+    rig.seal("a");
+    let mut repo = rig.repo("a");
+    let first = repo.snapshot(None, SnapshotTrigger::Watcher).unwrap();
+    let first_files = captured_files(&repo, &id_hex(&first));
+    assert!(first_files.contains("dist/inner/tracked"));
+    assert!(!first_files.contains("dist/inner/ignored"));
+    assert!(first_files.contains("force.log"));
+    assert!(!first_files.contains("other.log"));
+    fs::write(rig.tree.join("source"), "named change").unwrap();
+    fs::write(rig.tree.join("unrelated"), "unlisted change").unwrap();
+    let delta = repo
+        .snapshot_changed_paths(None, SnapshotTrigger::Watcher, &[PathBuf::from("source")])
+        .unwrap();
+    let store = furrow::store::ObjectStore::open(repo.store_root().to_owned()).unwrap();
+    let previous: Snapshot = store.read_struct(&first, ObjectKind::Snapshot).unwrap();
+    let current: Snapshot = store.read_struct(&delta, ObjectKind::Snapshot).unwrap();
+    let entries = |snapshot: &Snapshot| {
+        let mut result = std::collections::BTreeMap::new();
+        furrow::tree::for_each_entry(&store, &snapshot.root_tree, |entry| {
+            result.insert(entry.name.clone(), entry.target);
+            Ok(())
+        })
+        .unwrap();
+        result
+    };
+    assert_eq!(
+        entries(&previous)[b"unrelated".as_slice()],
+        entries(&current)[b"unrelated".as_slice()]
+    );
+    assert_ne!(
+        entries(&previous)[b"source".as_slice()],
+        entries(&current)[b"source".as_slice()]
+    );
+    assert_eq!(previous.ignored, current.ignored);
+    // G2 follows only existing indexed paths inside pruned directories, including staged-but-deleted files.
+    fs::remove_file(rig.tree.join("dist/inner/tracked")).unwrap();
+    let deleted = repo.snapshot(None, SnapshotTrigger::Watcher).unwrap();
+    assert!(!captured_files(&repo, &id_hex(&deleted)).contains("dist/inner/tracked"));
+    git(&rig.tree, &["rm", "--cached", "force.log"]);
+    git(&rig.tree, &["add", "-f", "other.log"]);
+    let swapped = repo.snapshot(None, SnapshotTrigger::Watcher).unwrap();
+    let files = captured_files(&repo, &id_hex(&swapped));
+    assert!(!files.contains("force.log"));
+    assert!(files.contains("other.log"));
+    let previous_time = filetime::FileTime::from_last_modification_time(
+        &fs::metadata(rig.tree.join(".gitignore")).unwrap(),
+    );
+    fs::write(rig.tree.join("replacement"), "source\n*.log").unwrap();
+    filetime::set_file_mtime(rig.tree.join("replacement"), previous_time).unwrap();
+    fs::rename(rig.tree.join("replacement"), rig.tree.join(".gitignore")).unwrap();
+    let after = repo
+        .snapshot_changed_paths(None, SnapshotTrigger::Watcher, &[PathBuf::from("source")])
+        .unwrap();
+    assert!(!captured_files(&repo, &id_hex(&after)).contains("source"));
+    fs::write(rig.tree.join(".git/index"), "bad").unwrap();
+    let missing = repo.snapshot(None, SnapshotTrigger::Watcher).unwrap();
+    assert!(!captured_files(&repo, &id_hex(&missing)).contains("other.log"));
+    fs::remove_file(rig.tree.join(".git/index")).unwrap();
+    repo.snapshot(None, SnapshotTrigger::Watcher).unwrap();
+}
+
+#[test]
+fn g1_user_config_xdg_linked_worktree_nested_repo_and_no_git_binary() {
+    // G1 evaluates user includes, XDG defaults, linked worktrees and nested scopes with no Git binary.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::write(rig.tree.join(".furrowpolicy"), "gitignore\n").unwrap();
+    fs::write(rig.tree.join(".gitignore"), "*.outer\nnested/\n").unwrap();
+    fs::write(rig.tree.join("kept.outer"), "tracked").unwrap();
+    git(&rig.tree, &["add", "-f", "kept.outer"]);
+    let nested = rig.tree.join("nested");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    fs::write(nested.join(".gitignore"), "*.inner\n").unwrap();
+    fs::write(nested.join("keep.outer"), "nested scope").unwrap();
+    fs::write(nested.join("omit.inner"), "nested ignore").unwrap();
+    git(
+        &rig.tree,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,nested",
+        ],
+    );
+    let home = rig._temp.path().join("home");
+    fs::create_dir_all(home.join(".config/git")).unwrap();
+    fs::write(home.join(".config/git/ignore"), "*.global\n").unwrap();
+    fs::write(rig.tree.join("omit.global"), "xdg ignored").unwrap();
+    fs::write(rig.tree.join("omit.local"), "info ignored").unwrap();
+    fs::write(rig.tree.join(".git/info/exclude"), "*.local\n").unwrap();
+    let common = rig._temp.path().join("common");
+    fs::rename(rig.tree.join(".git"), &common).unwrap();
+    let linked = common.join("worktrees/linked");
+    fs::create_dir_all(&linked).unwrap();
+    fs::copy(common.join("index"), linked.join("index")).unwrap();
+    fs::write(linked.join("commondir"), "../..\n").unwrap();
+    fs::write(linked.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        rig.tree.join(".git"),
+        format!("gitdir: {}\n", linked.display()),
+    )
+    .unwrap();
+    let capture = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_furrow"))
+            .env("FURROW_DATA_DIR", &rig.data)
+            .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env("PATH", rig._temp.path().join("no-executables"))
+            .env("FURROW_NO_DAEMON", "1")
+            .args(["--json", "--repo"])
+            .arg(&rig.tree)
+            .args(["--timeline", "a", "hook", "turn-end"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        captured_files(&rig.repo("a"), value["snapshot"].as_str().unwrap())
+    };
+    let files = capture();
+    assert!(files.contains("kept.outer"));
+    assert!(files.contains("nested/keep.outer"));
+    assert!(!files.contains("nested/omit.inner"));
+    assert!(!files.contains("omit.global"));
+    assert!(!files.contains("omit.local"));
+    fs::write(
+        home.join(".gitconfig"),
+        "[include]\npath = included-config\n",
+    )
+    .unwrap();
+    fs::write(
+        home.join("included-config"),
+        "[core]\nexcludesFile = ~/.user-ignore\n",
+    )
+    .unwrap();
+    fs::write(home.join(".user-ignore"), "kept.user\n").unwrap();
+    fs::write(rig.tree.join("kept.user"), "user ignored").unwrap();
+    assert!(!capture().contains("kept.user"));
+}
+
+#[test]
+fn g4_omitted_groups_are_bounded_and_explicit_exclusions_are_absent() {
+    // G4 reports at most twenty collapsed groups and the remaining group count without file totals.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::write(
+        rig.tree.join(".furrowpolicy"),
+        "gitignore\nexclude private\n",
+    )
+    .unwrap();
+    fs::write(rig.tree.join(".gitignore"), "out*/\nprivate/\n").unwrap();
+    fs::create_dir(rig.tree.join("private")).unwrap();
+    for i in 0..25 {
+        let path = rig.tree.join(format!("out{i:02}"));
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("content"), "irrelevant").unwrap();
+    }
+    let report = rig.cli("a", &["hook", "turn-end"]);
+    let paths = report["ignored"]["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 20);
+    assert_eq!(paths[0], "out00/");
+    assert_eq!(paths[19], "out19/");
+    assert_eq!(report["ignored"]["more"], 5);
+    assert_eq!(report["ignored"].as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn g1_git_control_paths_and_case_folded_tracked_files_are_kept() {
+    // G1 matches Git's untracked namespace and honors tracked exceptions with core.ignoreCase.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::write(rig.tree.join("tracked.log"), "tracked").unwrap();
+    git(&rig.tree, &["add", "tracked.log"]);
+    let config = rig.tree.join(".git/config");
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str("\n[core]\nignoreCase = true\n");
+    fs::write(config, contents).unwrap();
+    fs::rename(rig.tree.join("tracked.log"), rig.tree.join("TRACKED.log")).unwrap();
+    fs::write(rig.tree.join(".gitignore"), ".git\n*.log\n").unwrap();
+    fs::write(rig.tree.join(".furrowpolicy"), "gitignore\n").unwrap();
+    let ignored = split_paths(&git(
+        &rig.tree,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ],
+    ));
+    assert!(!ignored.contains("TRACKED.log"));
+    assert!(!ignored
+        .iter()
+        .any(|p| p == ".git" || p.starts_with(".git/")));
+    let head = rig.seal("a");
+    let files = captured_files(&rig.repo("a"), &head);
+    assert!(files.contains(".git/HEAD"));
+    assert!(files.contains("TRACKED.log"));
+}
+
+#[test]
+fn g1_s10_composed_state_is_outside_the_projects_git_ignore_scope() {
+    // G1 applies Git rules to the physical project; S10 preserves composed-state capture and explicit exclusions.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::write(rig.tree.join(".gitignore"), ".cell/\n").unwrap();
+    let overlay = rig._temp.path().join("overlay");
+    fs::create_dir(&overlay).unwrap();
+    fs::write(
+        overlay.join(".furrowpolicy"),
+        "gitignore\nexclude .cell/private\n",
+    )
+    .unwrap();
+    fs::write(overlay.join("state"), "agent continuation").unwrap();
+    fs::write(overlay.join("private"), "withheld").unwrap();
+    let (repo, head) = FurrowRepository::attach_and_seal_timeline_in(
+        &rig.data,
+        &rig.tree,
+        Some("a"),
+        None,
+        SnapshotTrigger::Watcher,
+        SealOptions {
+            overlay: Some(overlay),
+            changed: None,
+        },
+    )
+    .unwrap();
+    let files = captured_files(&repo, &id_hex(&head));
+    assert!(files.contains(".cell/state"));
+    assert!(!files.contains(".cell/private"));
+}
+
+#[test]
+fn g1_g2_malformed_index_names_cannot_escape_or_list_an_ignored_directory() {
+    // G1 grants no tracked exception to malformed names; G2 follows only safe, existing indexed paths.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::create_dir_all(rig.tree.join("dist/xx/yy")).unwrap();
+    fs::create_dir_all(rig.tree.join("dist/01234567890")).unwrap();
+    fs::write(rig.tree.join("dist/xx/yy/secret"), "tracked fixture").unwrap();
+    fs::write(rig._temp.path().join("secret"), "outside the project").unwrap();
+    git(&rig.tree, &["add", "dist/xx/yy/secret"]);
+    fs::write(rig.tree.join(".gitignore"), "dist/\n").unwrap();
+    fs::write(rig.tree.join(".furrowpolicy"), "gitignore\n").unwrap();
+    let index_path = rig.tree.join(".git/index");
+    let original = fs::read(&index_path).unwrap();
+    let needle = b"dist/xx/yy/secret";
+    let position = original
+        .windows(needle.len())
+        .position(|p| p == needle)
+        .unwrap();
+    for invalid in [
+        b"dist/../../secret".as_slice(),
+        b"dist/01234567890/".as_slice(),
+    ] {
+        assert_eq!(needle.len(), invalid.len());
+        let mut bytes = original.clone();
+        bytes[position..position + needle.len()].copy_from_slice(invalid);
+        // Git's null-checksum representation lets the reader reach the deliberately malformed name.
+        let checksum = bytes.len() - 20;
+        bytes[checksum..].fill(0);
+        fs::write(&index_path, bytes).unwrap();
+        let head = rig.seal("a");
+        let files = captured_files(&rig.repo("a"), &head);
+        assert!(!files.iter().any(|p| p.starts_with("dist/")), "{files:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(rig._temp.path().join("secret")).unwrap(),
+        "outside the project"
+    );
+}
+
+#[test]
+fn g1_g2_s7_sparse_indexes_keep_tracked_working_bytes_without_ignored_siblings() {
+    // G1 reads sparse index trees in process; G2 follows their tracked names; S7 keeps ignored siblings.
+    for packed in [false, true] {
+        let rig = Rig::new();
+        git(&rig.tree, &["init", "-q"]);
+        fs::create_dir_all(rig.tree.join("dist/deep")).unwrap();
+        fs::create_dir(rig.tree.join("keep")).unwrap();
+        fs::write(rig.tree.join("keep/source"), "source").unwrap();
+        fs::write(rig.tree.join("dist/a.log"), "indexed a").unwrap();
+        fs::write(rig.tree.join("dist/deep/b.log"), "indexed b").unwrap();
+        fs::write(rig.tree.join(".gitignore"), "dist/\n*.log\n").unwrap();
+        git(&rig.tree, &["add", "-f", ".gitignore", "keep", "dist"]);
+        git(
+            &rig.tree,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "sparse fixture",
+            ],
+        );
+        if packed {
+            git(&rig.tree, &["repack", "-adq"]);
+        }
+        git(
+            &rig.tree,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        git(&rig.tree, &["sparse-checkout", "set", "keep"]);
+        let sparse = git(&rig.tree, &["ls-files", "--sparse", "-s"]);
+        let sparse = String::from_utf8(sparse).unwrap();
+        assert!(
+            sparse
+                .lines()
+                .any(|line| line.starts_with("040000 ") && line.ends_with("\tdist/")),
+            "{sparse}"
+        );
+        fs::create_dir_all(rig.tree.join("dist/deep")).unwrap();
+        fs::write(rig.tree.join("dist/a.log"), "working a").unwrap();
+        fs::write(rig.tree.join("dist/deep/b.log"), "working b").unwrap();
+        fs::write(rig.tree.join("dist/untracked"), "ignored local output").unwrap();
+        fs::write(rig.tree.join("dist/deep/untracked"), "deep ignored output").unwrap();
+        fs::write(rig.tree.join(".furrowpolicy"), "gitignore\n").unwrap();
+        let head = rig.seal("a");
+        let files = captured_files(&rig.repo("a"), &head);
+        assert!(files.contains("dist/a.log"));
+        assert!(files.contains("dist/deep/b.log"));
+        assert!(!files.contains("dist/untracked"));
+        assert!(!files.contains("dist/deep/untracked"));
+        fs::write(rig.tree.join("dist/a.log"), "later working change").unwrap();
+        rig.cli("a", &["rewind", &head, "--yes"]);
+        assert_eq!(
+            fs::read_to_string(rig.tree.join("dist/a.log")).unwrap(),
+            "working a"
+        );
+        assert_eq!(
+            fs::read_to_string(rig.tree.join("dist/untracked")).unwrap(),
+            "ignored local output"
+        );
+    }
+}
+
+#[test]
+fn g1_s6_tracked_descendants_do_not_reinclude_an_ignored_replacement_file() {
+    // G1/S6 use tracked exceptions for directories only when the indexed descendant can exist beneath them.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::create_dir(rig.tree.join("generated")).unwrap();
+    fs::write(rig.tree.join("generated/tracked"), "tracked").unwrap();
+    git(&rig.tree, &["add", "generated/tracked"]);
+    fs::remove_dir_all(rig.tree.join("generated")).unwrap();
+    fs::write(rig.tree.join("generated"), "ignored replacement").unwrap();
+    fs::write(rig.tree.join(".gitignore"), "generated\n").unwrap();
+    fs::write(rig.tree.join(".furrowpolicy"), "gitignore\n").unwrap();
+    let ignored = split_paths(&git(
+        &rig.tree,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ],
+    ));
+    assert!(ignored.contains("generated"));
+    let head = rig.seal("a");
+    assert!(!captured_files(&rig.repo("a"), &head).contains("generated"));
+}
+
+#[test]
+fn g1_s1_s7_rewind_removes_a_tracked_only_directory_matching_an_ignore_rule() {
+    // S1/S7 preserve rewind behavior when a matching directory contains only tracked files, with no ignored data.
+    let rig = Rig::new();
+    git(&rig.tree, &["init", "-q"]);
+    fs::write(rig.tree.join(".gitignore"), "dist/\n").unwrap();
+    fs::write(rig.tree.join(".furrowpolicy"), "gitignore\n").unwrap();
+    let old = rig.seal("a");
+    fs::create_dir(rig.tree.join("dist")).unwrap();
+    fs::write(rig.tree.join("dist/tracked"), "tracked").unwrap();
+    git(&rig.tree, &["add", "-f", "dist/tracked"]);
+    assert!(split_paths(&git(
+        &rig.tree,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard"
+        ]
+    ))
+    .is_empty());
+    rig.seal("a");
+    rig.cli("a", &["rewind", &old, "--yes"]);
+    assert!(!rig.tree.join("dist").exists());
 }

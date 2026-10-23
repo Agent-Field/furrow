@@ -18,6 +18,11 @@ name = "furrow"
 fault-injection = []
 
 [dependencies]
+ignore = "=0.4.24"
+gix-index = "=0.35.0"
+gix-odb = "=0.63.0"
+gix-object = "=0.44.0"
+gix-config = "=0.40.0"
 anyhow.workspace = true
 blake3.workspace = true
 chacha20poly1305.workspace = true
@@ -46,3 +51,6 @@ zeroize.workspace = true
 [[bench]]
 name = "engine"
 harness = false
+
+[target.'cfg(windows)'.dependencies]
+same-file = "=1.0.6"

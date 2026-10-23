@@ -243,13 +243,25 @@ exclude private/secrets
 ```
 
 `exclude` keeps its existing literal subtree meaning. `gitignore` additionally
-omits untracked files ignored by Git, using Git's own matcher: nested
-`.gitignore` files, `.git/info/exclude`, `core.excludesFile`, negation, anchored
-patterns, directory patterns and `**` all behave as Git does. Tracked files are
-captured even when an ignore pattern matches. The directive needs Git installed;
-outside a Git working tree it does nothing. It triggers a full metadata walk,
-even with `--changed`, because ignore rules and the tracked index can change
-independently of a caller's changed-path list.
+omits untracked files ignored by Git: nested `.gitignore` files,
+`.git/info/exclude`, `core.excludesFile`, user config includes, the XDG default
+ignore file, negation, anchored patterns, directory patterns and `**` follow
+Git's rules. Git control paths stay captured, and a composed `.cell/` directory
+keeps its own explicit exclusions outside the project's Git ignore scope.
+Evaluation runs in process and needs no Git executable. Tracked
+files are captured even when a pattern matches. Linked worktrees and nested
+repositories use their own index and rules. A missing or unreadable index gives
+no tracked exceptions, and invalid index names are never followed. Outside a
+Git working tree the directive does nothing.
+
+A full seal prunes ignored directories without listing them. When an ignored
+directory contains tracked files, capture follows only their indexed paths.
+`--changed` remains incremental: it checks the named paths and their ancestor
+rules. Rule files and indexes are cached by file identity, and atomically
+replaced files are reloaded. Sparse-index directory entries resolve only the
+needed Git tree names in process, including packed objects. Include `.furrowpolicy` in the changed list, or
+request a full seal, to apply a changed policy across the whole tree; request a
+full seal to reconcile ignore/index changes affecting paths outside that list.
 
 Ignored contents are never opened for capture, including safety snapshots.
 Rewind and materialize protect existing ignored files and directories from
@@ -259,9 +271,9 @@ directive in the composed policy when that preference must survive restoring an
 older tree that has a different `.furrowpolicy`.
 
 Snapshot, hook, and timeline JSON add `ignored` when the directive is active in a
-Git repository: `{"files": 2, "bytes": 209715200, "paths": ["dist/"]}`. This is
-per-snapshot accounting of omitted untracked files, with up to 20 collapsed
-paths. Counts and sizes come from directory listings and metadata, never file
-contents; symlinks count their link length. Explicit `exclude` subtrees are not
-included in these counts. Older snapshots and captures without the directive
-omit this field and retain their existing serialization.
+Git repository: `{"paths": ["dist/", "node_modules/"], "more": 0}`. The report
+contains up to 20 sorted, collapsed top-level omitted names discovered during the
+walk; `more` is the number of remaining groups. Explicit `exclude` subtrees are
+absent from this report. Reporting never looks inside an ignored directory.
+Delta seals may repeat the last full seal's report. Older snapshots and captures
+without the directive omit the field and retain their existing serialization.

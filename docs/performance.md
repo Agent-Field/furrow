@@ -87,34 +87,118 @@ and one-shot CLI processes against the same store. It compares the capture
 policy against real Git's tracked and ignored file lists, and exercises shared
 export/import, purge and GC. Each test names its S1–S10 contract items.
 
-The `gitignore` directive reads Git's ignore control files and enumerates ignored
-paths to report file counts and sizes. It stats ignored files without opening
-their contents. This metadata accounting is proportional to the number of
-ignored paths, not the number of ignored bytes. A large generated file therefore
-adds no content I/O to seals. Unchanged captures without the directive retain
-the existing stat-cache path. Measurements for the default-on wave are recorded
-in lane F1's NOTES.md and accompanying command logs.
+The `gitignore` directive uses in-process matchers and an identity-cached Git
+index. Sparse directory entries resolve Git tree names on demand without
+expanding unrelated sparse trees or listing ignored directories. Full capture
+prunes ignored directories and follows indexed tracked
+exceptions directly, without listing unrelated children. Delta capture checks
+only named paths and their ancestor rule chains. Omission reports contain
+collapsed names and a remaining-group count, with no recursive accounting.
 
-### Default-on wave measurements: 2026-10-22
+### Default-on wave round 1: 2026-10-22
 
-On the shared Linux/ext4 machine with Rust 1.97.1, four caller-named timelines
-capturing 31 distinct MiB of files occupied 33,521,664 allocated bytes versus
-32,899,072 for one timeline (1.0189×, measured with `du -s -B1`). Replacing one
-1 MiB file added 1,150,976 allocated bytes.
+Four caller-named timelines capturing 31 distinct MiB of files occupied
+33,521,664 allocated bytes versus 32,899,072 for one timeline (1.0189×).
+Replacing one 1 MiB file added 1,150,976 allocated bytes. Round 1's broad
+benchmark comparison ran separately under disk contention and showed large
+regressions. Round 2 replaces that comparison with interleaved base/head runs.
+The old exact-count report required ignored-directory enumeration; G4 replaces
+that report so pruning can avoid enumeration entirely.
 
-A full unchanged 10,000-file seal, outside the existing two-second racy-stat
-window, measured a median **897.739 ms before / 865.107 ms after** across seven
-alternating samples per binary. This passes the 10% regression ceiling. Fixture
-aging and first capture were outside the timed operation.
+### Default-on wave round 2: interleaved comparison
 
-Tracing first and unchanged seals with a 200 MiB ignored output file found
-**zero ignored regular-file opens and zero content reads**. Exact omission counts
-still required metadata operations and one ignored-directory open per seal.
-Directory enumeration is required for first-seal exact accounting; this does not
-establish literal zero access below ignored directories.
+Linux/ext4 shared host, Rust 1.97.1 release builds. Historical engine 7660d4f
+versus this change, 10,000 source files, 100 changed files, 32 MiB warm cache,
+128 MiB chunk stream, 721 historical snapshots, 1,000 lookups and five universes.
+Each scenario starts with five samples per binary in strict base/head
+alternation, with fixture setup excluded. Cold seal, delta seal and fork then
+receive ten additional alternating pairs, a fixed extension selected because
+the earlier run showed wide disk-latency variation. All samples are retained;
+the main table pools all 15 for these three scenarios and keeps five for the
+others. The initial five-pair results appear separately below. The unchanged-tree scenario adds the identical
+2.1-second fixture-aging harness to the historical bench only. Engine sources
+in the historical archive are unchanged. Spread below is minimum–maximum.
 
-The broader nine-scenario benchmark completed before and after, but shared disk
-pressure produced large wall-time differences (including journal `fsync` stalls
-over nine seconds). Several broader wall-time medians regressed; their raw logs
-and comparison table are retained in lane F1's handoff. These measurements do
-not establish that every documented performance ceiling passes on this machine.
+| Scenario | Samples/version | Base median ms (range) | Head median ms (range) | Head/base | G5 |
+|---|---:|---:|---:|---:|---|
+| chunk | 5 | 225.678 (222.240–256.404) | 222.865 (220.754–224.323) | 0.9875× | — |
+| tree-diff | 5 | 20986.334 (20759.286–21100.655) | 20781.684 (20523.972–21073.710) | 0.9902× | — |
+| refs | 5 | 112.420 (110.867–114.219) | 115.193 (111.188–120.101) | 1.0247× | — |
+| cold-seal | 15 | 2327.899 (1620.307–4364.582) | 2250.488 (1319.080–4169.045) | 0.9667× | PASS |
+| delta-seal | 15 | 94.510 (66.407–208.081) | 96.715 (62.345–195.779) | 1.0233× | PASS |
+| fork | 15 | 3166.522 (2929.513–16077.012) | 3006.921 (2903.549–15909.477) | 0.9496× | PASS |
+| universes | 5 | 19814.143 (15207.448–46526.283) | 17072.004 (13465.753–47566.766) | 0.8616× | — |
+| radar | 5 | 2348.073 (1199.761–2907.287) | 1566.393 (1173.590–2033.463) | 0.6671× | — |
+| gc | 5 | 454.601 (273.663–720.462) | 399.121 (319.865–897.781) | 0.8780× | — |
+| unchanged-seal | 5 | 548.297 (532.282–568.242) | 596.056 (521.663–1854.538) | 1.0871× | — |
+
+Initial five-pair critical results (same final source):
+
+| Scenario | Base median ms | Head median ms | Head/base |
+|---|---:|---:|---:|
+| cold-seal | 2811.488 | 3242.160 | 1.1532× |
+| delta-seal | 197.134 | 139.719 | 0.7088× |
+| fork | 5539.454 | 5537.018 | 0.9996× |
+
+CPU medians for the pooled critical samples, for diagnosis only:
+
+| Scenario | Base CPU ms | Head CPU ms |
+|---|---:|---:|
+| cold-seal | 717.351 | 718.231 |
+| delta-seal | 11.096 | 11.413 |
+| fork | 2212.883 | 2181.149 |
+
+Policy-specific measurements use nine alternating samples per variant on the
+same 10,000-source-file fixture. G2 compares 20,000 ignored files with that
+directory deleted; G3 compares 100-path delta seals with the directive off/on.
+
+- G2 deleted: median 4232.569 ms, range 2657.193–9672.180 ms; CPU median 788.993 ms.
+- G2 ignored: median 4814.895 ms, range 2594.448–34785.349 ms; CPU median 783.799 ms.
+- G2 ratio: 1.1376×; limit 1.2×: PASS.
+- G3 off: median 380.455 ms, range 227.420–646.782 ms; CPU median 11.546 ms.
+- G3 on: median 571.018 ms, range 259.388–2306.962 ms; CPU median 12.407 ms.
+- G3 ratio: 1.5009×; limit 1.1×: FAIL.
+
+G3 fixed follow-up: the initial nine pairs had a wide spread and exceeded the
+limit, so 32 additional alternating pairs were selected before collecting them,
+after the other benchmarks and tests. All 41 pairs are pooled below; none of
+the initial samples are discarded. This is the final G3 latency result.
+
+- off: 41 samples, median 232.694 ms, range 90.100–646.782 ms; CPU median 10.944 ms.
+- on: 41 samples, median 259.388 ms, range 111.020–2306.962 ms; CPU median 11.668 ms.
+- Final G3 ratio: 1.1147×; limit 1.1×: FAIL.
+
+Strace of cold capture, a source-file delta and an ignored-file delta with
+20,000 ignored dist/ files found zero openat/getdents64 operations under dist/
+and no Git subprocesses. Full traces, sample JSON, commands and gate results
+are retained in the default-on handoff lane f1r2.
+
+A separate instrumented base/head comparison counted operations only between
+the benchmark's timed endpoints. Sync counts are identical: cold seal has
+26 fsync and two fdatasync calls, delta seal two and two, and fork 34 and four.
+fcntl counts match; cold seal and fork add one uncontended startup flock.
+No lock retries occurred. In the instrumented delta pair, base/head CPU was
+45.935/47.371 ms while sync calls blocked 303.581/827.567 ms; one head fsync
+blocked 423.792 ms. These diagnostic timings are excluded from the tables.
+Host I/O pressure during the diagnostic run was 41.92% some / 38.31% full,
+and reached 52.68% / 50.38% during the policy timing run. This establishes
+large variation in required durability waits, without extra sync operations.
+It does not turn a failed latency gate into a pass. Final gate decisions use
+the pooled critical medians and the 41-pair G3 result, with the initial results
+retained above. A controlled-host run would distinguish a small engine cost
+from storage contention more precisely without weakening durability.
+
+Four timelines use 33,521,664 allocated bytes versus 32,899,072 for one,
+or 1.018924× (G6 limit 1.15×). Changing one MiB added 1,142,784 bytes.
+The full six-case syscall checks also cover ordinary and packed sparse-index
+tracked exceptions: only the tracked child is opened and the ignored directory
+is never enumerated. Full cold/delta pruning therefore passes independently
+of the wall-time ratios.
+
+Final unresolved latency bounds: G3 directive delta.
+
+A separate directive off/on delta trace measured the same fixture after the
+benchmark run. These instrumented timings are diagnostic, outside the medians:
+
+- off: 2 fsync, 2 fdatasync; 187.414 ms in sync calls, 46.982 ms CPU, 288.162 ms wall.
+- on: 2 fsync, 2 fdatasync; 221.961 ms in sync calls, 47.634 ms CPU, 325.970 ms wall.

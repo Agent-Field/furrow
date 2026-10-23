@@ -2,31 +2,34 @@
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Command;
 
 pub const POLICY_FILE: &str = ".furrowpolicy";
 pub const POLICY_FILE_BYTES: &[u8] = b".furrowpolicy";
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_RULES: usize = 1_024;
+const MAX_OMISSION_GROUPS: usize = 20;
 
-/// Metadata-only accounting of untracked files omitted by Git's ignore rules.
+/// Collapsed omitted names discovered without enumerating ignored directories.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IgnoredSummary {
-    pub files: u64,
-    pub bytes: u64,
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub more: usize,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CapturePolicy {
     excluded: Vec<Vec<u8>>,
     gitignore: bool,
-    ignored: BTreeSet<Vec<u8>>,
-    pub omitted: Option<IgnoredSummary>,
+    matcher: Option<RefCell<crate::gitignore::Rules>>,
+    omitted: RefCell<BTreeMap<Vec<u8>, bool>>,
+    full_capture: Cell<bool>,
+    virtual_subtree: Option<Vec<u8>>,
 }
 
 impl CapturePolicy {
@@ -107,160 +110,117 @@ impl CapturePolicy {
         excluded.extend(other.excluded.iter().cloned());
         excluded.sort();
         excluded.dedup();
-        let mut ignored = self.ignored.clone();
-        ignored.extend(other.ignored.iter().cloned());
         Self {
             excluded,
             gitignore: self.gitignore || other.gitignore,
-            ignored,
+            matcher: self.matcher.clone().or_else(|| other.matcher.clone()),
             omitted: self.omitted.clone(),
+            full_capture: self.full_capture.clone(),
+            virtual_subtree: self
+                .virtual_subtree
+                .clone()
+                .or_else(|| other.virtual_subtree.clone()),
         }
     }
 
     pub fn excludes_bytes(&self, relative: &[u8]) -> bool {
-        self.ignored.contains(relative)
-            || relative
-                .iter()
-                .enumerate()
-                .any(|(index, byte)| *byte == b'/' && self.ignored.contains(&relative[..index]))
-            || self.excluded.iter().any(|rule| {
-                relative == rule.as_slice()
-                    || (relative.starts_with(rule) && relative.get(rule.len()) == Some(&b'/'))
-            })
+        if self.excluded.iter().any(|rule| {
+            relative == rule.as_slice()
+                || (relative.starts_with(rule) && relative.get(rule.len()) == Some(&b'/'))
+        }) {
+            return true;
+        }
+        if self.is_virtual(relative) {
+            return false;
+        }
+        let Some(matcher) = &self.matcher else {
+            return false;
+        };
+        let mut matcher = matcher.borrow_mut();
+        let ignored = matcher.excludes(relative);
+        if ignored || matcher.ignored_directory(relative) {
+            self.note_omission(matcher.root(), relative);
+        }
+        ignored
     }
 
-    /// Git itself supplies its ignore semantics, including tracked exceptions and global rules.
-    /// Only directory listings and file metadata are read; ignored contents are never opened.
+    /// Resolving policy reads control files only; capture discovers omitted names as it walks.
     pub fn resolve_gitignore(mut self, root: &Path) -> anyhow::Result<Self> {
-        if !self.gitignore {
-            return Ok(self);
+        if self.gitignore {
+            self.matcher = crate::gitignore::Rules::discover(root)?.map(RefCell::new);
         }
-        let probe = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .output()
-            .context("run Git for gitignore policy")?;
-        if !probe.status.success() || probe.stdout != b"true\n" {
-            return Ok(self);
-        }
-        let list = |directories: bool| -> anyhow::Result<Vec<Vec<u8>>> {
-            let mut command = Command::new("git");
-            command.arg("-C").arg(root).args([
-                "ls-files",
-                "-z",
-                "--others",
-                "--ignored",
-                "--exclude-standard",
-            ]);
-            if directories {
-                command.arg("--directory");
-            }
-            let output = command.output()?;
-            anyhow::ensure!(
-                output.status.success(),
-                "Git could not evaluate gitignore policy"
-            );
-            Ok(output
-                .stdout
-                .split(|b| *b == 0)
-                .filter(|p| !p.is_empty())
-                .map(|p| p.strip_suffix(b"/").unwrap_or(p).to_vec())
-                .collect())
-        };
-        let mut summary = IgnoredSummary::default();
-        for path in list(false)? {
-            if self.excludes_bytes(&path) {
-                continue;
-            }
-            let absolute = crate::repository::safe_join(root, &path)?;
-            let metadata = match fs::symlink_metadata(&absolute) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if metadata.is_dir() {
-                self.count_ignored_directory(root, &absolute, &mut summary)?;
-            } else {
-                summary.files += 1;
-                summary.bytes += metadata.len();
-            }
-            self.ignored.insert(path);
-        }
-        for path in list(true)? {
-            // Git collapses only wholly ignored directories, preserving force-added children.
-            let absolute = crate::repository::safe_join(root, &path)?;
-            if fs::symlink_metadata(absolute).is_ok_and(|m| m.is_dir()) {
-                self.ignored.insert(path);
-            }
-        }
-        // Reporting collapses top-level paths independently of capture pruning, so a
-        // directory with tracked exceptions still has one concise omission label.
-        let collapsed: BTreeSet<Vec<u8>> = self
-            .ignored
-            .iter()
-            .map(|p| p.split(|byte| *byte == b'/').next().unwrap_or(p).to_vec())
-            .collect();
-        summary.paths = collapsed
-            .into_iter()
-            .take(20)
-            .map(|p| {
-                let directory = crate::repository::safe_join(root, &p)
-                    .is_ok_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()));
-                let mut display = String::from_utf8_lossy(&p).into_owned();
-                if directory {
-                    display.push('/');
-                }
-                display
-            })
-            .collect();
-        self.omitted = Some(summary);
         Ok(self)
     }
 
-    /// Git reports ignored nested repositories as directories rather than listing their files.
-    /// Their omission totals still count file metadata without opening any contents.
-    fn count_ignored_directory(
-        &self,
-        root: &Path,
-        directory: &Path,
-        summary: &mut IgnoredSummary,
-    ) -> anyhow::Result<()> {
-        let mut pending = vec![directory.to_owned()];
-        while let Some(directory) = pending.pop() {
-            for entry in fs::read_dir(directory)? {
-                let path = entry?.path();
-                if self.excludes_bytes(path.strip_prefix(root)?.as_os_str().as_encoded_bytes()) {
-                    continue;
-                }
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                if metadata.is_dir() {
-                    pending.push(path);
-                } else {
-                    summary.files += 1;
-                    summary.bytes += metadata.len();
-                }
-            }
+    fn note_omission(&self, root: &Path, relative: &[u8]) {
+        let first = relative.split(|b| *b == b'/').next().unwrap_or(relative);
+        let path = crate::gitignore::bytes_path(first);
+        let directory = fs::symlink_metadata(root.join(path)).is_ok_and(|m| m.is_dir());
+        self.omitted.borrow_mut().insert(first.to_vec(), directory);
+    }
+
+    /// A composed subtree is outside the project's physical Git namespace; explicit exclusions still apply.
+    pub fn with_virtual_subtree(mut self, prefix: &[u8]) -> Self {
+        self.virtual_subtree = Some(prefix.to_vec());
+        self
+    }
+
+    fn is_virtual(&self, relative: &[u8]) -> bool {
+        self.virtual_subtree.as_ref().is_some_and(|prefix| {
+            relative == prefix
+                || (relative.starts_with(prefix) && relative.get(prefix.len()) == Some(&b'/'))
+        })
+    }
+
+    pub fn ignored_summary(&self) -> Option<IgnoredSummary> {
+        self.matcher.as_ref()?;
+        let omitted = self.omitted.borrow();
+        Some(IgnoredSummary {
+            paths: omitted
+                .iter()
+                .take(MAX_OMISSION_GROUPS)
+                .map(|(name, directory)| {
+                    let name = String::from_utf8_lossy(name);
+                    if *directory {
+                        format!("{name}/")
+                    } else {
+                        name.into_owned()
+                    }
+                })
+                .collect(),
+            more: omitted.len().saturating_sub(MAX_OMISSION_GROUPS),
+        })
+    }
+
+    pub fn begin_full_capture(&self) {
+        self.full_capture.set(true);
+        self.omitted.borrow_mut().clear();
+    }
+
+    pub fn did_full_capture(&self) -> bool {
+        self.full_capture.get()
+    }
+
+    /// Ignored directories with tracked exceptions expose only the next indexed path components.
+    pub fn tracked_children(&self, relative: &[u8]) -> Option<Vec<std::ffi::OsString>> {
+        if self.is_virtual(relative) {
+            return None;
         }
-        Ok(())
+        self.matcher
+            .as_ref()?
+            .borrow_mut()
+            .tracked_children(relative)
     }
 
-    pub fn uses_gitignore(&self) -> bool {
-        self.gitignore
-    }
-
-    /// Removing or replacing an ancestor would also destroy protected ignored children.
+    /// An ancestor cannot be replaced if doing so would destroy an ignored descendant.
     pub fn contains_ignored(&self, relative: &[u8]) -> bool {
-        let mut prefix = relative.to_vec();
-        prefix.push(b'/');
-        self.ignored
-            .range(prefix.clone()..)
-            .next()
-            .is_some_and(|p| p.starts_with(&prefix))
+        if self.is_virtual(relative) {
+            return false;
+        }
+        let Some(matcher) = &self.matcher else {
+            return false;
+        };
+        matcher.borrow_mut().contains_ignored(relative)
     }
 
     pub fn excludes_path(&self, root: &Path, path: &Path) -> bool {
@@ -319,5 +279,39 @@ mod tests {
         assert!(CapturePolicy::load(temporary.path()).is_err());
         fs::write(temporary.path().join(POLICY_FILE), b"exclude .git\n").unwrap();
         assert!(CapturePolicy::load(temporary.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn g4_distinct_omitted_names_remain_distinct_when_display_is_lossy() {
+        // G4 counts omitted groups by filesystem name, even when several names have the same display text.
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join(POLICY_FILE), "gitignore\n").unwrap();
+        fs::write(root.join(".gitignore"), "bad*\n").unwrap();
+        let policy = CapturePolicy::load(root)
+            .unwrap()
+            .resolve_gitignore(root)
+            .unwrap();
+        for suffix in 128..154 {
+            let mut name = b"bad".to_vec();
+            name.push(suffix);
+            fs::write(
+                crate::repository::safe_join(root, &name).unwrap(),
+                "ignored",
+            )
+            .unwrap();
+            assert!(policy.excludes_bytes(&name));
+        }
+        let report = policy.ignored_summary().unwrap();
+        assert_eq!(report.paths.len(), 20);
+        assert_eq!(report.more, 6);
     }
 }
