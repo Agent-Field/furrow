@@ -11,7 +11,7 @@ measurements, and regression gates.
 ## Repository Notes
 
 - UI dependency notices remain at
-  [ui/THIRD_PARTY_NOTICES.md](../ui/THIRD_PARTY_NOTICES.md) beside the embedded
+  [furrow-core/ui/THIRD_PARTY_NOTICES.md](../furrow-core/ui/THIRD_PARTY_NOTICES.md) beside the embedded
   assets they describe.
 - Runnable workflows live in [`demo/`](../demo/); benchmark code lives in
-  [`benches/`](../benches/).
+  [`furrow-core/benches/`](../furrow-core/benches/).

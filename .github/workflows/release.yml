@@ -1,10 +1,6 @@
 name: release
 
-# Publishes per-platform `furrow` binaries so callers can install it without a
-# Rust toolchain. Windows is absent on purpose: 13 source files use
-# `std::os::unix` with no `cfg(windows)` guards, so a native Windows build needs
-# a source port, not a build target. Windows users reach furrow through WSL,
-# which uses the linux asset.
+# Publishes native binaries for Linux, macOS and Windows.
 
 on:
   push:
@@ -13,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish (e.g. v0.1.0)"
+        description: "Existing tag to build and publish (e.g. v0.2.0)"
         required: true
         type: string
 
@@ -22,11 +18,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  ZIG_VERSION: "0.13.0"
+  CARGO_ZIGBUILD_VERSION: "0.24.0"
 
 jobs:
   build:
     name: ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
+    env:
+      BINARY_SUFFIX: ${{ startsWith(matrix.os, 'windows-') && '.exe' || '' }}
+      BUILD_ROOT: ${{ startsWith(matrix.os, 'ubuntu-') && 'target/zig' || 'target' }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +55,14 @@ jobs:
             target: x86_64-apple-darwin
             os: macos-14
             native: false
+          - asset: furrow-windows-amd64.exe
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            native: true
+          - asset: furrow-windows-arm64.exe
+            target: aarch64-pc-windows-msvc
+            os: windows-latest
+            native: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,20 +70,80 @@ jobs:
 
       - name: Install toolchain
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
+          rustup show active-toolchain
           rustup target add ${{ matrix.target }}
 
+      - name: Cache Linux release tools
+        if: runner.os == 'Linux'
+        id: linux-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/furrow-release-tools/zig-${{ env.ZIG_VERSION }}
+            ~/.local/share/furrow-release-tools/cargo-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}
+          key: linux-release-tools-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-${{ env.CARGO_ZIGBUILD_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+
+      - name: Install pinned Linux release tools
+        if: runner.os == 'Linux' && steps.linux-tools.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # Use Zig's bundled glibc headers/libraries, never the runner's libc.
+          case "${{ runner.arch }}" in
+            X64)
+              zig_arch=x86_64
+              zig_sha256=d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+              ;;
+            ARM64)
+              zig_arch=aarch64
+              zig_sha256=041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556
+              ;;
+            *) exit 1 ;;
+          esac
+          tools_dir="$HOME/.local/share/furrow-release-tools"
+          archive="$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${zig_arch}-${ZIG_VERSION}.tar.xz" \
+            --output "$archive"
+          printf '%s  %s\n' "$zig_sha256" "$archive" | sha256sum --check
+          mkdir -p "$tools_dir/zig-${ZIG_VERSION}"
+          tar -xJf "$archive" --strip-components=1 -C "$tools_dir/zig-${ZIG_VERSION}"
+          cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild \
+            --root "$tools_dir/cargo-zigbuild-${CARGO_ZIGBUILD_VERSION}" -j 2
+
+      - name: Configure Linux release tools
+        if: runner.os == 'Linux'
+        run: |
+          echo "$HOME/.local/share/furrow-release-tools/zig-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/furrow-release-tools/cargo-zigbuild-${CARGO_ZIGBUILD_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Build Linux (glibc 2.17)
+        if: runner.os == 'Linux'
+        # The suffix selects glibc; Cargo's output directory uses the bare triple.
+        run: cargo zigbuild --release --locked -p furrow-cli --bin furrow --target ${{ matrix.target }}.2.17 --target-dir target/zig -j 2
+
       - name: Build
-        run: cargo +stable build --release --locked --target ${{ matrix.target }}
+        if: runner.os != 'Linux'
+        # Include the Windows C runtime so a fresh machine needs no runtime installer.
+        run: cargo build --release --locked -p furrow-cli --bin furrow --target ${{ matrix.target }} -j 4
+
+      - name: Check Linux glibc floor
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          max_glibc=$(objdump -T "$BUILD_ROOT/${{ matrix.target }}/release/furrow$BINARY_SUFFIX" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+          echo "${{ matrix.asset }}: $max_glibc (maximum allowed: GLIBC_2.17)"
+          test "$(printf '%s\n' GLIBC_2.17 "$max_glibc" | sort -V | tail -1)" = GLIBC_2.17
 
       - name: Smoke test
+        shell: bash
         if: matrix.native
-        run: ./target/${{ matrix.target }}/release/furrow --version
+        run: ./$BUILD_ROOT/${{ matrix.target }}/release/furrow$BINARY_SUFFIX --version
 
       - name: Stage asset
+        shell: bash
         run: |
           mkdir -p dist
-          install -m 755 "target/${{ matrix.target }}/release/furrow" "dist/${{ matrix.asset }}"
+          install -m 755 "$BUILD_ROOT/${{ matrix.target }}/release/furrow$BINARY_SUFFIX" "dist/${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v4
         with:

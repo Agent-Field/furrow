@@ -1,0 +1,4 @@
+# Windows starts each executable on a smaller stack than Unix. Reserve enough
+# for debug clap parsing and recursive capture in binaries and test helpers.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:33554432", "-C", "target-feature=+crt-static"]

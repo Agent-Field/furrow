@@ -1,0 +1,61 @@
+[package]
+name = "furrow-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Local-first working-state snapshots for agentic development"
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["snapshot", "backup", "agents", "filesystem", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "furrow"
+
+[features]
+# Crash points armed by FURROW_FAULT, for the crash-safety tests only.
+fault-injection = []
+
+[dependencies]
+ignore = "=0.4.24"
+gix-index = "=0.35.0"
+gix-odb = "=0.63.0"
+gix-object = "=0.44.0"
+gix-config = "=0.40.0"
+anyhow.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+directories.workspace = true
+fs2.workspace = true
+filetime.workspace = true
+hex.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+notify.workspace = true
+rusqlite.workspace = true
+rusty-s3.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tiny_http.workspace = true
+unicode-normalization.workspace = true
+ureq.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false
+
+[target.'cfg(unix)'.dependencies]
+xattr.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+same-file = "=1.0.6"
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem"] }
+# MSVC intrinsics avoid a dependency on ml64 when cross-building from Unix.
+blake3 = { workspace = true, features = ["prefer_intrinsics"] }
