@@ -131,7 +131,19 @@ fn w3_linux_exchange_preserves_bytes_paths_and_recorded_modes() {
         );
     }
     #[cfg(unix)]
-    assert!(answer.get("held").is_none());
+    {
+        // A file system that folds case (a Mac's) cannot hold README and readme
+        // together: the first sibling lands and the other is reported, as on
+        // Windows. Everything else in the fixture is representable there.
+        if keeps_case_apart(temp.path()) {
+            assert!(answer.get("held").is_none(), "{answer}");
+        } else {
+            let held = answer["held"].as_array().unwrap();
+            assert_eq!(held.len(), 1, "{answer}");
+            assert_eq!(held[0]["path"], "readme", "{answer}");
+            assert_eq!(fs::read(root.join("README")).unwrap(), b"README");
+        }
+    }
     fs::write(root.join("new"), b"new\r\n").unwrap();
     let mut repository = FurrowRepository::open_composed_in(&data, &root, None).unwrap();
     let new_head = repository.snapshot(None, SnapshotTrigger::Manual).unwrap();
@@ -225,4 +237,16 @@ fn assert_linked(root: &Path) {
             .unwrap();
         assert_eq!(a, b);
     }
+}
+
+/// Whether the file system under `dir` keeps names that differ only in case apart.
+#[cfg(unix)]
+fn keeps_case_apart(dir: &Path) -> bool {
+    let probe = dir.join("case-probe");
+    fs::create_dir(&probe).unwrap();
+    fs::write(probe.join("A"), b"").unwrap();
+    fs::write(probe.join("a"), b"").unwrap();
+    let apart = fs::read_dir(&probe).unwrap().count() == 2;
+    fs::remove_dir_all(&probe).unwrap();
+    apart
 }
