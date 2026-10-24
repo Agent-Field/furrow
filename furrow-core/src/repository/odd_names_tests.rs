@@ -87,6 +87,21 @@ fn folding(spec: &str, body: impl FnOnce()) {
     }
 }
 
+/// Whether this machine's file system keeps both names apart. The folding tests
+/// write both spellings to make the snapshot a case-sensitive machine seals; on
+/// a file system that folds them (a Mac's) the second write lands on the first
+/// file, so that snapshot cannot be made here and the test is skipped.
+fn keeps_apart(first: &str, second: &str) -> bool {
+    let probe = tempfile::tempdir().unwrap();
+    fs::write(probe.path().join(first), "").unwrap();
+    fs::write(probe.path().join(second), "").unwrap();
+    let kept = fs::read_dir(probe.path()).unwrap().count() == 2;
+    if !kept {
+        eprintln!("skipped: this file system folds {first:?} and {second:?} into one name");
+    }
+    kept
+}
+
 #[test]
 fn a_read_only_directory_with_files_is_restored_and_left_read_only() {
     let folder = Folder::new();
@@ -114,6 +129,9 @@ fn a_read_only_directory_with_files_is_restored_and_left_read_only() {
 
 #[test]
 fn names_that_differ_only_in_case_restore_as_one_copy_and_name_the_other() {
+    if !keeps_apart("Readme.md", "README.md") {
+        return;
+    }
     let folder = Folder::new();
     folder.write("Readme.md", "lower\n");
     folder.write("README.md", "upper\n");
@@ -135,6 +153,9 @@ fn names_that_differ_only_in_case_restore_as_one_copy_and_name_the_other() {
 
 #[test]
 fn composed_and_decomposed_spellings_restore_as_one_copy() {
+    if !keeps_apart("caf\u{e9}.txt", "cafe\u{301}.txt") {
+        return;
+    }
     let folder = Folder::new();
     folder.write("caf\u{e9}.txt", "composed\n");
     folder.write("cafe\u{301}.txt", "decomposed\n");
@@ -159,6 +180,9 @@ fn composed_and_decomposed_spellings_restore_as_one_copy() {
 
 #[test]
 fn a_held_directory_takes_its_contents_with_it() {
+    if !keeps_apart("Docs", "DOCS") {
+        return;
+    }
     let folder = Folder::new();
     folder.write("Docs/a.md", "lower dir\n");
     folder.write("DOCS/b.md", "upper dir\n");
@@ -184,6 +208,9 @@ fn a_held_directory_takes_its_contents_with_it() {
 
 #[test]
 fn a_twin_already_on_disk_is_not_overwritten_by_a_newly_arrived_name() {
+    if !keeps_apart("Readme.md", "README.md") {
+        return;
+    }
     let folder = Folder::new();
     folder.write("README.md", "upper\n");
     let (repository, first) = folder.seal();
@@ -210,6 +237,9 @@ fn a_twin_already_on_disk_is_not_overwritten_by_a_newly_arrived_name() {
 
 #[test]
 fn a_file_system_that_keeps_every_name_restores_both_copies_and_holds_none() {
+    if !keeps_apart("Readme.md", "README.md") {
+        return;
+    }
     let folder = Folder::new();
     folder.write("Readme.md", "lower\n");
     folder.write("README.md", "upper\n");

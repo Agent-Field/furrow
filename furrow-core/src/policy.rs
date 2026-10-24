@@ -288,6 +288,18 @@ mod tests {
     #[test]
     fn g4_distinct_omitted_names_remain_distinct_when_display_is_lossy() {
         // G4 counts omitted groups by filesystem name, even when several names have the same display text.
+        // A file system that refuses names that are not UTF-8 (a Mac's) cannot hold them at all.
+        let probe = tempfile::tempdir().unwrap();
+        let name = b"bad\x80".to_vec();
+        if fs::write(
+            crate::repository::safe_join(probe.path(), &name).unwrap(),
+            "",
+        )
+        .is_err()
+        {
+            eprintln!("skipped: this file system refuses names that are not UTF-8");
+            return;
+        }
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         assert!(std::process::Command::new("git")
