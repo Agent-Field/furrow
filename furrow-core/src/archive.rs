@@ -735,8 +735,11 @@ pub fn restore(store: &Path, id: &str, destination: &Path) -> Result<Receipt> {
     let from = std::ffi::CString::new(root.as_os_str().as_bytes())?;
     let to = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
     #[cfg(target_os = "linux")]
+    // The kernel operation predates its glibc 2.28 wrapper. Use the syscall
+    // directly so release binaries retain their glibc 2.17 compatibility floor.
     let renamed = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             from.as_ptr(),
             libc::AT_FDCWD,
