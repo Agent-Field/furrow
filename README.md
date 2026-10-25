@@ -393,3 +393,42 @@ watch limit can therefore affect large or numerous simultaneously served trees.
 A live shared writable memory mapping can change bytes without a notification
 or a new timestamp; completed mappings are detected on writable close. The
 unrestricted no-missed-change guarantee for still-live mappings remains open.
+
+
+### Verified local workspace archives
+
+On Linux and macOS, `furrow archive` stores a complete supported directory tree
+in a separate local SQLite database with deduplicated compressed chunks. This
+is local cold storage, not an encrypted relay format. Protect the archive store
+as sensitive local data, and keep the store outside the captured workspace.
+Windows builds do not expose the archive command.
+
+Stop all writers before capture and keep them stopped through verification and
+any later retirement. Capture checks for changes but does not lock applications
+or provide an atomic filesystem snapshot. The caller owns safe retirement;
+`archive` does not delete the original workspace.
+
+```sh
+furrow archive capture --store ./archives --workspace ./workspace
+# Copy the returned JSON snapshot field into snapshot:
+snapshot=SNAPSHOT_ID
+furrow archive verify --store ./archives --snapshot "$snapshot" --workspace ./workspace
+furrow archive restore --store ./archives --snapshot "$snapshot" --destination ./restored
+furrow archive verify-remainder --store ./archives --snapshot "$snapshot" --workspace ./workspace
+```
+
+Every successful command prints a versioned JSON receipt with `snapshot`,
+`files`, `logical_bytes`, and `generated_markers`. Restore requires a destination
+that does not exist, verifies the staged tree, and publishes it without replacing
+an existing destination. `verify` requires the complete captured tree;
+`verify-remainder` checks that a partially retired tree contains only unchanged
+captured entries, allowing directory changes caused by retirement.
+
+Supported state includes file bytes, directory entries, symlinks, internal hard
+links, permission bits, ownership, modification times and supported extended
+attributes. Access and creation times are not preserved. Unsupported ownership,
+ACLs, resource metadata, filesystem flags, sparse files, nested mounts, special
+files and hard links outside the workspace refuse capture. Budget limits also
+refuse oversized manifests. macOS may add a reported provenance attribute during
+restore; attributes present in the capture remain required. Keep the resident
+copy whenever capture or independent verification fails.
