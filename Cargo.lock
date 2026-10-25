@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "furrow-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "furrow-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "furrow-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
