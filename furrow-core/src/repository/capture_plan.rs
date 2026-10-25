@@ -8,6 +8,9 @@ pub struct CapturePlan {
     pub full: bool,
     /// Physical paths include the composed directory instead of its logical alias.
     pub paths: Vec<PathBuf>,
+    /// Physical paths omitted because directory enumeration or metadata access was denied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +49,8 @@ pub(super) struct PreparedPlan {
     #[serde(default)]
     watched: bool,
     candidates: BTreeMap<PathBuf, Option<Stamp>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    skipped: BTreeSet<PathBuf>,
 }
 
 impl FurrowRepository {
@@ -78,6 +83,7 @@ impl FurrowRepository {
             full,
             watched,
             candidates: BTreeMap::new(),
+            skipped: BTreeSet::new(),
         };
         if full {
             self.plan_directory(&self.root, &policy, &mut prepared)?;
@@ -120,6 +126,7 @@ impl FurrowRepository {
             token,
             full,
             paths: prepared.candidates.into_keys().collect(),
+            skipped: prepared.skipped.into_iter().collect(),
         })
     }
 
@@ -215,6 +222,10 @@ impl FurrowRepository {
         let metadata = match fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                plan.skipped.insert(path.to_owned());
+                return Ok(());
+            }
             Err(e) => return Err(e.into()),
         };
         let directory = metadata.is_dir() && !metadata.file_type().is_symlink();
@@ -227,6 +238,29 @@ impl FurrowRepository {
     }
 
     fn plan_directory(
+        &self,
+        path: &Path,
+        policy: &CapturePolicy,
+        plan: &mut PreparedPlan,
+    ) -> anyhow::Result<()> {
+        let result = self.plan_directory_children(path, policy, plan);
+        match result {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+            {
+                // An enumeration error can occur after some children were visited.
+                plan.candidates
+                    .retain(|candidate, _| !candidate.starts_with(path));
+                plan.skipped.insert(path.to_owned());
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn plan_directory_children(
         &self,
         path: &Path,
         policy: &CapturePolicy,
@@ -298,5 +332,12 @@ impl FurrowRepository {
             Some(Some(stamp)) if *stamp == Stamp::of(metadata) => Ok(()),
             _ => bail!("capture plan no longer covers {}; re-plan", path.display()),
         }
+    }
+
+    pub(super) fn skipped_capture_path(&self, path: &Path) -> bool {
+        self.capture_scope
+            .borrow()
+            .as_ref()
+            .is_some_and(|plan| plan.skipped.iter().any(|skipped| path.starts_with(skipped)))
     }
 }

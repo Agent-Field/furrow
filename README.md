@@ -353,7 +353,10 @@ furrow --repo ./project --timeline chat-1 --json sync
 
 The plan returns `token`, `full`, and `paths` (absolute physical candidate paths,
 including the external composed directory). Screen all candidates before passing
-the token to capture. An uninitialized or invalidated delta index, or a policy
+the token to capture. Permission-denied directory listings or entry metadata are
+omitted and reported as physical paths in `skipped` (absent when empty); capture
+with that token keeps those paths omitted. Other I/O errors still fail the plan.
+An uninitialized or invalidated delta index, or a policy
 change, produces a full plan. Changes to file identity, timeline head, policy,
 or index generation invalidate the token; additional paths or a new hard-link
 walk are refused before their contents are read. Re-plan after a refusal.
