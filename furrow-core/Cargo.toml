@@ -18,6 +18,7 @@ name = "furrow"
 fault-injection = []
 
 [dependencies]
+zstd = "=0.13.2"
 ignore = "=0.4.24"
 gix-index = "=0.35.0"
 gix-odb = "=0.63.0"

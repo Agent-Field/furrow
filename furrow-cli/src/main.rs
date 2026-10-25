@@ -7,6 +7,8 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+mod archive;
 mod exchange;
 
 #[derive(Parser)]
@@ -29,6 +31,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[cfg(unix)]
+    Archive {
+        #[command(subcommand)]
+        command: archive::Archive,
+    },
     /// List every capture candidate before screening it, with a token for turn-end.
     CapturePlan {
         #[command(flatten)]
@@ -585,6 +592,8 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("FURROW_TIMELINE", timeline);
     }
     match cli.command {
+        #[cfg(unix)]
+        Command::Archive { command } => archive::run(command)?,
         Command::CapturePlan { seal } => {
             let options = seal.options()?;
             let repository = FurrowRepository::attach_timeline_in(
