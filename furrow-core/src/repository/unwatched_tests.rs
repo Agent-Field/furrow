@@ -53,3 +53,37 @@ fn an_unwatched_folder_is_not_watched_in_a_populated_store_either() {
     // The watched folder still opens.
     FurrowRepository::open_timeline_in(&data, &watched, None, None).unwrap();
 }
+
+#[test]
+fn a_watched_folder_opens_while_another_process_holds_the_catalog_write_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let watched = temp.path().join("watched");
+    fs::create_dir_all(&watched).unwrap();
+    fs::write(watched.join("a.txt"), "a").unwrap();
+    FurrowRepository::attach_and_seal_timeline_in(
+        &data,
+        &watched,
+        None,
+        None,
+        SnapshotTrigger::AgentRun,
+        SealOptions::default(),
+    )
+    .unwrap();
+    let writer = rusqlite::Connection::open(data.join(STORE_DIR).join("catalog.sqlite3")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let (done, opened) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn({
+        let watched = watched.clone();
+        move || {
+            let repository = FurrowRepository::open_timeline_in(&data, &watched, None, None)
+                .and_then(|repository| repository.status().map(|_| ()));
+            done.send(repository.is_ok()).unwrap();
+        }
+    });
+    let finished = opened.recv_timeout(std::time::Duration::from_secs(3));
+    writer.execute_batch("ROLLBACK").unwrap();
+    reader.join().unwrap();
+    assert_eq!(finished, Ok(true), "status queued behind the catalog write lock");
+}

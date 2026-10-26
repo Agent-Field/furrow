@@ -1917,4 +1917,23 @@ mod tests {
         drop(connection);
         assert_all_readable(directory.path(), &ids);
     }
+    #[test]
+    fn a_settled_store_opens_while_another_process_holds_the_catalog_write_lock() {
+        let directory = store_of(10);
+        let writer = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let path = directory.path().to_owned();
+        let (done, opened) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            drop(ObjectStore::open(path).unwrap());
+            done.send(()).unwrap();
+        });
+        let finished = opened
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .is_ok();
+        writer.execute_batch("ROLLBACK").unwrap();
+        reader.join().unwrap();
+        assert!(finished, "a read-only open queued behind the catalog write lock");
+    }
 }
