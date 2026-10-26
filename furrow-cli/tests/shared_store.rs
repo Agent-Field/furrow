@@ -1118,3 +1118,156 @@ fn g1_s1_s7_rewind_removes_a_tracked_only_directory_matching_an_ignore_rule() {
     rig.cli("a", &["rewind", &old, "--yes"]);
     assert!(!rig.tree.join("dist").exists());
 }
+
+fn sqlite_source_bytes(database: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| {
+            let mut path = database.as_os_str().to_owned();
+            path.push(suffix);
+            (suffix.to_owned(), fs::read(PathBuf::from(path)).ok())
+        })
+        .collect()
+}
+
+#[test]
+fn ordinary_sqlite_capture_preserves_closed_wal_source_bytes() {
+    let rig = Rig::new();
+    let path = rig.tree.join("project.db");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE item(value); INSERT INTO item VALUES(17);",
+        )
+        .unwrap();
+    connection.close().map_err(|(_, error)| error).unwrap();
+    let before = sqlite_source_bytes(&path);
+    rig.seal("sqlite");
+    assert_eq!(
+        sqlite_source_bytes(&path),
+        before,
+        "capture changed original SQLite bytes or sidecars"
+    );
+    let destination = rig._temp.path().join("private-fork");
+    rig.cli(
+        "sqlite",
+        &[
+            "fork",
+            "sqlite-copy",
+            "--destination",
+            destination.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        sqlite_source_bytes(&path),
+        before,
+        "fork changed original SQLite bytes or sidecars"
+    );
+    let restored = rusqlite::Connection::open(destination.join("project.db")).unwrap();
+    assert_eq!(
+        restored
+            .query_row("SELECT value FROM item", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        17
+    );
+}
+
+#[test]
+fn ordinary_sqlite_capture_retains_committed_wal_without_touching_source() {
+    let rig = Rig::new();
+    let path = rig.tree.join("project.db");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE item(value); INSERT INTO item VALUES(29);").unwrap();
+    let before = sqlite_source_bytes(&path);
+    assert!(before[1].1.as_ref().is_some_and(|wal| !wal.is_empty()));
+    let snapshot = rig.seal("sqlite");
+    assert_eq!(
+        sqlite_source_bytes(&path),
+        before,
+        "capture changed original committed WAL family"
+    );
+    let repo = rig.repo("sqlite");
+    let id = furrow::model::parse_id(&snapshot).unwrap();
+    let store = furrow::store::ObjectStore::open(repo.store_root().to_owned()).unwrap();
+    let saved: Snapshot = store.read_struct(&id, ObjectKind::Snapshot).unwrap();
+    assert_eq!(saved.sqlite_backups.len(), 1);
+    assert!(saved.sqlite_backups[0].integrity_ok);
+    let destination = rig._temp.path().join("private-fork");
+    rig.cli(
+        "sqlite",
+        &[
+            "fork",
+            "sqlite-copy",
+            "--destination",
+            destination.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        sqlite_source_bytes(&path),
+        before,
+        "fork changed original committed WAL family"
+    );
+    let restore = Command::new(furrow_exe())
+        .env("FURROW_DATA_DIR", &rig.data)
+        .env("HOME", rig._temp.path().join("home"))
+        .env("FURROW_NO_DAEMON", "1")
+        .args(["--json", "--repo"])
+        .arg(&destination)
+        .args(["rewind", &snapshot, "--yes", "--sqlite-consistent"])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored = rusqlite::Connection::open(destination.join("project.db")).unwrap();
+    assert_eq!(
+        restored
+            .query_row("SELECT value FROM item", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        29
+    );
+    drop(connection);
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_sqlite_capture_refuses_symlink_sidecars_without_touching_targets() {
+    for (suffix, dangling) in ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .flat_map(|suffix| [(suffix, false), (suffix, true)])
+    {
+        let rig = Rig::new();
+        let path = rig.tree.join("project.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE item(value); INSERT INTO item VALUES(31);")
+            .unwrap();
+        connection.close().map_err(|(_, error)| error).unwrap();
+        let outside = rig._temp.path().join("outside");
+        if !dangling {
+            fs::write(&outside, b"private outside bytes").unwrap();
+        }
+        let outside_before = fs::read(&outside).ok();
+        let sidecar = rig.tree.join(format!("project.db{suffix}"));
+        std::os::unix::fs::symlink(&outside, &sidecar).unwrap();
+        let before = fs::read(&path).unwrap();
+        let output = Command::new(furrow_exe())
+            .env("FURROW_DATA_DIR", &rig.data)
+            .env("HOME", rig._temp.path().join("home"))
+            .env("FURROW_NO_DAEMON", "1")
+            .args(["--json", "--repo"])
+            .arg(&rig.tree)
+            .args(["hook", "turn-end"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "symlink sidecar was accepted: {suffix}"
+        );
+        assert_eq!(fs::read(&outside).ok(), outside_before);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read_link(&sidecar).unwrap(), outside);
+    }
+}

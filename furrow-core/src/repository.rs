@@ -4379,6 +4379,10 @@ impl FurrowRepository {
 
     /// Reads a file into the store, retrying while it changes underneath.
     fn read_file(&self, path: &Path) -> anyhow::Result<FileRead> {
+        self.read_file_guarded(path, false)
+    }
+
+    fn read_file_guarded(&self, path: &Path, no_follow: bool) -> anyhow::Result<FileRead> {
         #[cfg(all(test, windows))]
         windows_tests::CONTENT_READS.with(|count| count.set(count.get() + 1));
         for _ in 0..3 {
@@ -4387,7 +4391,11 @@ impl FurrowRepository {
             if self.capture_scope.borrow().is_some() && self.logical_path(path).is_some() {
                 self.check_capture_path(path, &fs::symlink_metadata(path)?)?;
             }
-            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let file = if no_follow {
+                open_sqlite_capture_file(path)?
+            } else {
+                File::open(path).with_context(|| format!("open {}", path.display()))?
+            };
             let before = file
                 .metadata()
                 .with_context(|| format!("stat open file {}", path.display()))?;
@@ -4398,7 +4406,12 @@ impl FurrowRepository {
             #[cfg(windows)]
             let identity = crate::platform::handle_identity(&file)?;
             let chunked = self.store_chunks(file)?;
-            let after = fs::metadata(path).with_context(|| format!("restat {}", path.display()))?;
+            let after = if no_follow {
+                fs::symlink_metadata(path)
+            } else {
+                fs::metadata(path)
+            }
+            .with_context(|| format!("restat {}", path.display()))?;
             if stable_metadata(&before, &after) {
                 let blob = self.store.put_struct(
                     ObjectKind::Blob,
@@ -4498,15 +4511,10 @@ impl FurrowRepository {
                     self.check_capture_path(&sidecar, &metadata)?;
                 }
             }
-            let staged = if self.capture_scope.borrow().is_some() {
-                Some(self.stage_scoped_database(&path, &temp_dir)?)
-            } else {
-                None
-            };
-            let source = staged
-                .as_ref()
-                .map(|d| d.path().join("db"))
-                .unwrap_or_else(|| path.clone());
+            // SQLite read-only opens can still create or modify source WAL sidecars.
+            // Open only verified private captured bytes, for ordinary and scoped capture alike.
+            let staged = self.stage_captured_database(&path, &temp_dir)?;
+            let source = staged.path().join("db");
             match sqlite_adapter::consistent_backup(&source, &temp_dir) {
                 Ok(backup) => {
                     let blob = self.capture_file(backup.file.path())?;
@@ -5475,6 +5483,37 @@ fn now() -> (i64, u32) {
 
 fn metadata_time(metadata: &fs::Metadata) -> (i64, u32) {
     (metadata.mtime(), metadata.mtime_nsec().max(0) as u32)
+}
+
+fn open_sqlite_capture_file(path: &Path) -> anyhow::Result<File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        bail!(
+            "SQLite capture requires a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || !stable_metadata(&before, &opened) {
+        bail!(
+            "SQLite capture source changed while opening: {}",
+            path.display()
+        );
+    }
+    Ok(file)
 }
 
 fn stable_metadata(before: &fs::Metadata, after: &fs::Metadata) -> bool {

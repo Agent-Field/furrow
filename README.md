@@ -99,6 +99,11 @@ furrow rewind <snapshot>                 # or the whole workspace, byte-exact
 
 Restoration covers symlinks, permissions, supported user extended attributes, hard links, SQLite (with a logically consistent image available), and Git's own mutable state. macOS system-managed attributes are omitted. On filesystems that fold case or Unicode names, rewind holds colliding names out of its plan and reports them in `held`; the snapshot retains both entries. `--dry-run` previews a rewind's impact first.
 
+SQLite backup capture opens only private copies of verified captured database and
+journal bytes; it does not open the original database through SQLite. Keep writers
+quiescent during capture. This is not an atomic snapshot across independently
+changing database and journal files; changing sources can be refused.
+
 > `.env` and the dev SQLite database, both back, both intact, after an agent ran `git clean -fdx`.
 
 ## The rest of the daily kit
