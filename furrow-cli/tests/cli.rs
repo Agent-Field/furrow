@@ -4107,8 +4107,7 @@ fn verify_reports_a_sound_store_and_rebuilds_a_damaged_index() {
     assert_eq!(sound["repaired"], false, "{sound}");
     assert!(sound["objects"].as_u64().unwrap() > 0);
 
-    let connection =
-        rusqlite::Connection::open(data.join("store-v1/catalog.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(data.join("store-v1/catalog.sqlite3")).unwrap();
     connection
         .execute(
             "DELETE FROM objects WHERE id = (SELECT id FROM objects LIMIT 1)",

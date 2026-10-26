@@ -608,7 +608,10 @@ mod tests {
             )
             .unwrap();
         // The next open records the checkpoint the check compares against.
-        drop(furrow::store::ObjectStore::open(furrow::repository::store_path(&target.data_dir)).unwrap());
+        drop(
+            furrow::store::ObjectStore::open(furrow::repository::store_path(&target.data_dir))
+                .unwrap(),
+        );
         let catalog = rusqlite::Connection::open(
             furrow::repository::store_path(&target.data_dir).join("catalog.sqlite3"),
         )
