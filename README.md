@@ -366,6 +366,8 @@ Plans enumerate metadata; policy and Git control files are read to determine
 eligibility. Known SQLite databases and their existing sidecars are included
 because consistent backups may read them even on a delta. Tokens are scoped to
 one timeline, folder, composed directory, and head, and are consumed by capture.
+A plan not sealed within ten minutes is treated as abandoned: the next plan on its
+timeline, or an idle daemon, removes it, and sealing it asks for a re-plan.
 
 The daemon verbs are `capture-plan` (`args.changed`, absent/null for unknown changes),
 `seal` (`args.changed`, optional `args.plan`, optional `args.durable`), and `sync`

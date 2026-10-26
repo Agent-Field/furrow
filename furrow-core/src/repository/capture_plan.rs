@@ -1,6 +1,13 @@
 //! A persisted read scope binds a guard's screening to one capture.
 
 use super::*;
+use std::time::Duration;
+
+/// Callers seal within about thirty seconds of planning. A plan this old has
+/// been abandoned by a caller that re-planned, crashed, timed out or exited.
+const PLAN_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+const PLANS_DIR: &str = "capture-plans";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapturePlan {
@@ -48,10 +55,56 @@ pub(super) struct PreparedPlan {
     candidates: BTreeMap<PathBuf, Option<Stamp>>,
 }
 
+/// Removes plans in one directory that are older than [`PLAN_LIFETIME`], and
+/// temporary files a writer left before renaming them into place. A seal that
+/// read its plan keeps the bytes; one that had not reads nothing and is asked
+/// to re-plan. Removal is best effort: a plan that remains is only disk space.
+fn prune_plans(directory: &Path, now: SystemTime) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = name.starts_with(".tmp")
+            || name.strip_suffix(".json").is_some_and(|token| {
+                token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+        // A modification time in the future reads as fresh.
+        let expired = || {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified)
+                        .is_ok_and(|age| age > PLAN_LIFETIME)
+                })
+        };
+        if ours && expired() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Removes abandoned plans from every timeline in a store, including ones
+/// that never plan again. Visits only the workspace directories and their
+/// plans, never the objects.
+pub fn prune_abandoned_plans(store_root: &Path) {
+    let Ok(workspaces) = fs::read_dir(store_root.join("workspaces")) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for workspace in workspaces.flatten() {
+        prune_plans(&workspace.path().join(PLANS_DIR), now);
+    }
+}
+
 impl FurrowRepository {
     /// Plans enumerate names and metadata, never file contents to be captured.
     pub fn capture_plan(&self, changed: Option<&[PathBuf]>) -> anyhow::Result<CapturePlan> {
         let _operation = crate::writer_wait::Operation::start();
+        let directory = self.workspace_data_dir().join(PLANS_DIR);
+        prune_plans(&directory, SystemTime::now());
         let policy = self.load_policy()?;
         let (tracked, _) = self.tracked_changes()?;
         let watched = changed.is_none() && tracked.is_some();
@@ -110,7 +163,6 @@ impl FurrowRepository {
         }
         let bytes = serde_json::to_vec(&prepared)?;
         let token = blake3::hash(&bytes).to_hex().to_string();
-        let directory = self.workspace_data_dir().join("capture-plans");
         fs::create_dir_all(&directory)?;
         // Replacing a complete file is sufficient: plans are disposable and never authoritative state.
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
@@ -136,7 +188,7 @@ impl FurrowRepository {
         );
         let path = self
             .workspace_data_dir()
-            .join("capture-plans")
+            .join(PLANS_DIR)
             .join(format!("{token}.json"));
         let bytes = fs::read(&path).context("capture plan is absent; re-plan")?;
         anyhow::ensure!(

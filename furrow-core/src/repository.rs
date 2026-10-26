@@ -6322,11 +6322,13 @@ mod unwatched_tests;
 mod windows_tests;
 
 mod capture_plan;
-pub use capture_plan::CapturePlan;
+pub use capture_plan::{prune_abandoned_plans, CapturePlan};
 mod change_tracking;
 
 #[cfg(test)]
 mod perf_tests;
+#[cfg(test)]
+mod plan_prune_tests;
 
 fn capture_rules_changed(root: &Path, path: &Path) -> bool {
     changed_path_matches(root, path, POLICY_FILE_BYTES)
