@@ -3663,6 +3663,9 @@ impl FurrowRepository {
                 continue;
             }
             validate_relative_path(&relative)?;
+            if self.skipped_capture_path(&self.physical_path(&relative)?) {
+                continue;
+            }
             paths.insert(relative);
         }
 
@@ -4012,6 +4015,9 @@ impl FurrowRepository {
         index: &PathIndex,
         policy: &CapturePolicy,
     ) -> anyhow::Result<Option<TreeEntry>> {
+        if self.skipped_capture_path(path) {
+            return Ok(None);
+        }
         let metadata =
             fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
         #[cfg(windows)]
@@ -4033,6 +4039,9 @@ impl FurrowRepository {
         metadata: &fs::Metadata,
         identity: Option<crate::platform::FileIdentity>,
     ) -> anyhow::Result<Option<TreeEntry>> {
+        if self.skipped_capture_path(path) {
+            return Ok(None);
+        }
         self.check_capture_path(path, metadata)?;
         let file_type = metadata.file_type();
         let (secs, nanos) = metadata_time(metadata);
@@ -4476,6 +4485,9 @@ impl FurrowRepository {
         let mut candidates = Vec::new();
         for relative in self.store.sqlite_paths(&self.workspace_id)? {
             let path = self.physical_path(&relative)?;
+            if self.skipped_capture_path(&path) {
+                continue;
+            }
             let present = fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file());
             if present && !policy.excludes_bytes(&relative) {
                 candidates.push(path);
