@@ -123,8 +123,7 @@ fn sealing_while_another_handle_plans_and_prunes_keeps_every_fresh_plan() {
     fs::create_dir_all(&directory).unwrap();
     let (root, data) = (f.root.clone(), f.data.clone());
     let planner = std::thread::spawn(move || {
-        let other =
-            FurrowRepository::attach_timeline_in(&data, &root, Some("chat"), None).unwrap();
+        let other = FurrowRepository::attach_timeline_in(&data, &root, Some("chat"), None).unwrap();
         for round in 0..30 {
             let junk: Vec<PathBuf> = (0..20)
                 .map(|n| {

@@ -103,6 +103,9 @@ impl Writer {
                         {
                             last_check = Instant::now();
                             check_index(&data_dir);
+                            furrow::repository::prune_abandoned_plans(
+                                &furrow::repository::store_path(&data_dir),
+                            );
                         }
                     }
                     Err(RecvTimeoutError::Disconnected) => {
@@ -174,7 +177,8 @@ impl Drop for SyncGuard<'_> {
     }
 }
 
-/// When a quiet writer checks its store's index against the pack.
+/// When a quiet writer checks its store's index against the pack and removes
+/// capture plans no caller will seal.
 #[derive(Debug, Clone, Copy)]
 pub struct Maintenance {
     /// How long the writer must have had no request.

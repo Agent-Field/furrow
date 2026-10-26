@@ -6322,7 +6322,7 @@ mod unwatched_tests;
 mod windows_tests;
 
 mod capture_plan;
-pub use capture_plan::CapturePlan;
+pub use capture_plan::{prune_abandoned_plans, CapturePlan};
 mod change_tracking;
 
 #[cfg(test)]
