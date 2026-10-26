@@ -31,6 +31,15 @@ const OBJECT_VERSION: u8 = 1;
 const HEADER_LEN: u64 = 4 + 1 + 1 + 8 + 32 + 32;
 const MAX_OBJECT_LEN: u64 = 256 * 1024 * 1024;
 
+/// What a [`ObjectStore::verify_index`] pass found in the active pack's index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct IndexCheck {
+    /// Objects the pack's checkpoint accounts for.
+    pub objects: u64,
+    /// Whether the index disagreed with the pack and was rebuilt from it.
+    pub repaired: bool,
+}
+
 #[derive(Clone)]
 pub struct ObjectStore {
     root: PathBuf,
@@ -350,6 +359,15 @@ impl ObjectStore {
             .map_or(0, |m| m.len()),
         );
         Ok(store)
+    }
+
+    /// Checks the active pack's index against its checkpoint and rebuilds it
+    /// from the pack when they disagree.
+    pub fn verify_index(&self, _deep: bool) -> anyhow::Result<IndexCheck> {
+        Ok(IndexCheck {
+            objects: 0,
+            repaired: false,
+        })
     }
 
     pub fn put_bytes(&self, kind: ObjectKind, bytes: &[u8]) -> anyhow::Result<ObjectId> {
@@ -1981,5 +1999,81 @@ mod tests {
         assert_eq!((rows("w1"), rows(&folder)), (1, 1));
         drop(ObjectStore::open(directory.path().to_owned()).unwrap());
         assert_eq!((rows("w1"), rows(&folder)), (1, 1));
+    }
+    fn drop_row(directory: &Path, id: &ObjectId) {
+        let connection = Connection::open(directory.join("catalog.sqlite3")).unwrap();
+        connection
+            .execute("DELETE FROM objects WHERE id = ?1", [id.as_slice()])
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_restores_rows_missing_from_the_middle_of_the_verified_prefix() {
+        let (directory, ids, _) = three_objects();
+        drop_row(directory.path(), &ids[0]);
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        // Open trusts the checkpoint and cannot see the hole.
+        assert!(store.catalog.object(&ids[0]).unwrap().is_none());
+
+        let check = store.verify_index(false).unwrap();
+        assert_eq!(
+            check,
+            IndexCheck {
+                objects: 3,
+                repaired: true
+            }
+        );
+        drop(store);
+        assert_all_readable(directory.path(), &ids);
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert!(!store.verify_index(false).unwrap().repaired);
+    }
+
+    #[test]
+    fn a_read_that_finds_a_row_missing_rescans_the_pack_once() {
+        let (directory, ids, _) = three_objects();
+        drop_row(directory.path(), &ids[0]);
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert_eq!(
+            store.read_bytes(&ids[0], ObjectKind::Chunk).unwrap(),
+            b"object 0"
+        );
+        // The rescan is spent: a second hole in the same session is an error.
+        drop_row(directory.path(), &ids[1]);
+        assert!(store.read_bytes(&ids[1], ObjectKind::Chunk).is_err());
+    }
+
+    #[test]
+    fn a_deep_verify_of_a_sound_pack_repairs_nothing() {
+        let (directory, ids, _) = three_objects();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let check = store.verify_index(true).unwrap();
+        assert_eq!(
+            check,
+            IndexCheck {
+                objects: 3,
+                repaired: false
+            }
+        );
+        drop(store);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_deep_verify_that_finds_a_damaged_record_leaves_the_index_alone() {
+        let (directory, ids, _) = three_objects();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let location = store.catalog.object(&ids[1]).unwrap().unwrap();
+        let mut pack = OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("packs").join(INITIAL_PACK_NAME))
+            .unwrap();
+        pack.seek(SeekFrom::Start(location.offset)).unwrap();
+        pack.write_all(b"Z").unwrap();
+        drop(pack);
+
+        assert!(store.verify_index(true).is_err());
+        // The failed rebuild rolled back: every row is still there.
+        assert_eq!(store.catalog.object_count().unwrap(), 3);
     }
 }

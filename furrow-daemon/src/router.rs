@@ -37,7 +37,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn spawn(data_dir: PathBuf) -> Self {
+    fn spawn(data_dir: PathBuf, _maintenance: Maintenance) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let thread = std::thread::spawn(move || {
             let mut handles: HashMap<Target, Handle> = HashMap::new();
@@ -149,10 +149,29 @@ impl Drop for SyncGuard<'_> {
     }
 }
 
+/// When a quiet writer checks its store's index against the pack.
+#[derive(Debug, Clone, Copy)]
+pub struct Maintenance {
+    /// How long the writer must have had no request.
+    pub idle: Duration,
+    /// The least time between two checks.
+    pub every: Duration,
+}
+
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(30),
+            every: Duration::from_secs(60 * 60),
+        }
+    }
+}
+
 /// `None` once closed: no new writer starts and every request is refused.
 pub struct Router {
     writers: Mutex<Option<HashMap<PathBuf, Writer>>>,
     syncs: ActiveSyncs,
+    maintenance: Maintenance,
 }
 
 impl Router {
@@ -160,9 +179,14 @@ impl Router {
     /// `new()`; the attribute keeps that fact one lint away from the gate.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::with_maintenance(Maintenance::default())
+    }
+
+    pub fn with_maintenance(maintenance: Maintenance) -> Self {
         Self {
             writers: Mutex::new(Some(HashMap::new())),
             syncs: ActiveSyncs::default(),
+            maintenance,
         }
     }
 
@@ -234,7 +258,7 @@ impl Router {
             .ok_or_else(|| anyhow!("daemon is stopping"))?;
         let writer = writers
             .entry(target.data_dir.clone())
-            .or_insert_with(|| Writer::spawn(target.data_dir.clone()));
+            .or_insert_with(|| Writer::spawn(target.data_dir.clone(), self.maintenance));
         Ok(writer.jobs.clone())
     }
 
@@ -534,5 +558,55 @@ mod tests {
         }
         drop(release);
         flusher.finish().unwrap();
+    }
+    #[test]
+    fn a_quiet_writer_rebuilds_an_index_that_lost_a_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("a"), b"completed capture").unwrap();
+        let target = Target {
+            data_dir: temp.path().join("data"),
+            tree,
+            cell_dir: None,
+            timeline: Some("heal".into()),
+        };
+        let router = Router::with_maintenance(Maintenance {
+            idle: Duration::from_millis(100),
+            every: Duration::from_millis(200),
+        });
+        router
+            .submit(
+                target.clone(),
+                crate::verbs::lookup("seal").unwrap(),
+                json!({}),
+            )
+            .unwrap();
+        // The next open records the checkpoint the check compares against.
+        drop(furrow::store::ObjectStore::open(furrow::repository::store_path(&target.data_dir)).unwrap());
+        let catalog = rusqlite::Connection::open(
+            furrow::repository::store_path(&target.data_dir).join("catalog.sqlite3"),
+        )
+        .unwrap();
+        let rows = || -> i64 {
+            catalog
+                .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+                .unwrap()
+        };
+        let whole = rows();
+        catalog
+            .execute(
+                "DELETE FROM objects WHERE rowid = (SELECT rowid FROM objects LIMIT 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(rows(), whole - 1);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rows() != whole && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(rows(), whole, "the quiet writer never rebuilt the index");
+        router.close();
     }
 }
