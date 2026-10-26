@@ -145,6 +145,12 @@ fn w3_linux_exchange_preserves_bytes_paths_and_recorded_modes() {
         }
     }
     fs::write(root.join("new"), b"new\r\n").unwrap();
+    #[cfg(unix)]
+    {
+        // The mode asserted below must not depend on the runner's umask.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("new"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
     let mut repository = FurrowRepository::open_composed_in(&data, &root, None).unwrap();
     let new_head = repository.snapshot(None, SnapshotTrigger::Manual).unwrap();
     drop(repository);
