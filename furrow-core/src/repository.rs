@@ -6283,6 +6283,8 @@ mod hardlink_tests;
 mod odd_names_tests;
 #[cfg(all(test, unix))]
 mod seal_tests;
+#[cfg(test)]
+mod unwatched_tests;
 #[cfg(all(test, windows))]
 mod windows_tests;
 

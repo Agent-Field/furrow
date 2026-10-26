@@ -48,6 +48,10 @@ ureq.workspace = true
 url.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+# Tests count the catalog work an open performs through SQLite's progress hook.
+rusqlite = { workspace = true, features = ["hooks"] }
+
 [[bench]]
 name = "engine"
 harness = false

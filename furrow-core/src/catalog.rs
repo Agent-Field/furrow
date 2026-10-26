@@ -45,6 +45,18 @@ fn writer_error(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static WORK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// SQLite virtual-machine steps this thread's catalogs have run, so a test can
+/// pin how much work an operation does without timing it.
+#[cfg(test)]
+pub(crate) fn work_steps() -> u64 {
+    WORK.with(Cell::get)
+}
+
 pub struct Catalog {
     conn: Connection,
     files: RefCell<HashMap<String, HashMap<Vec<u8>, CachedFile>>>,
@@ -84,6 +96,14 @@ impl Catalog {
         // hot pages spares each lookup a read from the file.
         conn.pragma_update(None, "cache_size", -CACHE_KIB)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        #[cfg(test)]
+        conn.progress_handler(
+            1,
+            Some(|| {
+                WORK.with(|work| work.set(work.get() + 1));
+                false
+            }),
+        );
         crate::sqlite_adapter::fold_oversized_wal(&conn, path)?;
         conn.execute_batch(
             "

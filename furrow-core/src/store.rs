@@ -1677,4 +1677,196 @@ mod tests {
             verified_len
         );
     }
+    fn store_of(count: usize) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        for n in 0..count {
+            store
+                .put_bytes(ObjectKind::Chunk, format!("object {n}").as_bytes())
+                .unwrap();
+        }
+        drop(store);
+        // The reopen records the checkpoint every later open starts from.
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        directory
+    }
+
+    fn open_work(directory: &Path) -> u64 {
+        let before = crate::catalog::work_steps();
+        drop(ObjectStore::open(directory.to_owned()).unwrap());
+        crate::catalog::work_steps() - before
+    }
+
+    #[test]
+    fn opening_a_checkpointed_store_does_catalog_work_independent_of_its_size() {
+        let small = open_work(store_of(50).path());
+        let large = open_work(store_of(5000).path());
+        // A row-proportional scan adds several steps per extra row (~5000 rows
+        // here); a fixed handful of seeks stays within the same few hundred.
+        assert!(
+            large <= small + 500,
+            "open work grew with the store: {small} steps for 50 objects, {large} for 5000"
+        );
+    }
+
+    #[test]
+    fn a_settled_pack_opens_without_waiting_for_the_pack_lock() {
+        let directory = store_of(10);
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("locks/pack.lock"))
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+
+        let path = directory.path().to_owned();
+        let (done, opened) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            drop(ObjectStore::open(path).unwrap());
+            done.send(()).unwrap();
+        });
+        let finished = opened.recv_timeout(std::time::Duration::from_secs(3)).is_ok();
+        FileExt::unlock(&lock).unwrap();
+        reader.join().unwrap();
+        assert!(finished, "a read-only open queued behind the pack lock");
+    }
+
+    fn three_objects() -> (tempfile::TempDir, [ObjectId; 3], u64) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let mut ids = [ObjectId::default(); 3];
+        for (n, id) in ids.iter_mut().enumerate() {
+            *id = store
+                .put_bytes(ObjectKind::Chunk, format!("object {n}").as_bytes())
+                .unwrap();
+        }
+        drop(store);
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        let verified = fs::metadata(directory.path().join("packs").join(INITIAL_PACK_NAME))
+            .unwrap()
+            .len();
+        (directory, ids, verified)
+    }
+
+    fn assert_all_readable(directory: &Path, ids: &[ObjectId; 3]) {
+        let store = ObjectStore::open(directory.to_owned()).unwrap();
+        for (n, id) in ids.iter().enumerate() {
+            assert_eq!(
+                store.read_bytes(id, ObjectKind::Chunk).unwrap(),
+                format!("object {n}").as_bytes()
+            );
+        }
+        assert_eq!(store.catalog.object_count().unwrap(), 3);
+        let checkpoint = store
+            .catalog
+            .pack_checkpoint(INITIAL_PACK_NAME)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.object_count, 3);
+        assert_eq!(
+            checkpoint.verified_len,
+            fs::metadata(directory.join("packs").join(INITIAL_PACK_NAME))
+                .unwrap()
+                .len()
+        );
+    }
+
+    /// Winds the checkpoint back to just before the third object's record.
+    fn checkpoint_before_third(connection: &Connection, ids: &[ObjectId; 3]) {
+        let verified: i64 = connection
+            .query_row(
+                "SELECT offset - ?2 FROM objects WHERE id = ?1",
+                rusqlite::params![ids[2].as_slice(), HEADER_LEN as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE pack_checkpoints SET verified_len = ?1, object_count = 2,
+                 last_object = ?2,
+                 last_record_start = (SELECT offset - ?3 FROM objects WHERE id = ?2)",
+                rusqlite::params![verified, ids[1].as_slice(), HEADER_LEN as i64],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn rows_ahead_of_a_stale_checkpoint_recover_every_object() {
+        // A crash after the catalog rows committed but before the checkpoint did.
+        let (directory, ids, _) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        checkpoint_before_third(&connection, &ids);
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_pack_ahead_of_a_lost_catalog_commit_is_reindexed() {
+        let (directory, ids, _) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        checkpoint_before_third(&connection, &ids);
+        connection
+            .execute("DELETE FROM objects WHERE id = ?1", [ids[2].as_slice()])
+            .unwrap();
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_torn_final_record_is_dropped_with_its_catalog_row() {
+        // The catalog remembers an object whose record the pack lost part of.
+        let (directory, ids, verified) = three_objects();
+        let pack = OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("packs").join(INITIAL_PACK_NAME))
+            .unwrap();
+        pack.set_len(verified - 2).unwrap();
+        drop(pack);
+
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert!(store.catalog.object(&ids[2]).unwrap().is_none());
+        for (n, id) in ids[..2].iter().enumerate() {
+            assert_eq!(
+                store.read_bytes(id, ObjectKind::Chunk).unwrap(),
+                format!("object {n}").as_bytes()
+            );
+        }
+        let checkpoint = store
+            .catalog
+            .pack_checkpoint(INITIAL_PACK_NAME)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.object_count, 2);
+        assert_eq!(
+            checkpoint.verified_len,
+            fs::metadata(directory.path().join("packs").join(INITIAL_PACK_NAME))
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_inside_a_record_forces_a_rebuild() {
+        let (directory, ids, verified) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE pack_checkpoints SET verified_len = ?1",
+                [verified as i64 - 3],
+            )
+            .unwrap();
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_dropped_index_is_rebuilt_from_the_pack() {
+        let (directory, ids, _) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        connection.execute("DELETE FROM objects", []).unwrap();
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
 }
