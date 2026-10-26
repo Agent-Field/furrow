@@ -4111,7 +4111,7 @@ fn verify_reports_a_sound_store_and_rebuilds_a_damaged_index() {
         rusqlite::Connection::open(data.join("store-v1/catalog.sqlite3")).unwrap();
     connection
         .execute(
-            "DELETE FROM objects WHERE rowid = (SELECT rowid FROM objects LIMIT 1)",
+            "DELETE FROM objects WHERE id = (SELECT id FROM objects LIMIT 1)",
             [],
         )
         .unwrap();

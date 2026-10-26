@@ -596,7 +596,7 @@ mod tests {
         let whole = rows();
         catalog
             .execute(
-                "DELETE FROM objects WHERE rowid = (SELECT rowid FROM objects LIMIT 1)",
+                "DELETE FROM objects WHERE id = (SELECT id FROM objects LIMIT 1)",
                 [],
             )
             .unwrap();
