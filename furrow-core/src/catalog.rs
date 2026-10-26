@@ -204,6 +204,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// Whether `workspace` still owns file rows that belong to its folder.
+    pub(crate) fn has_legacy_file_rows(&self, workspace: &str) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stat_cache
+             WHERE workspace_id = ?1 AND path != ?2 AND substr(path, 1, 6) != ?3)",
+            params![workspace, b".cell".as_slice(), b".cell/".as_slice()],
+            |row| row.get(0),
+        )?)
+    }
     pub(crate) fn share_legacy_file_rows(
         &self,
         workspace: &str,
@@ -669,6 +679,16 @@ impl Catalog {
 
     pub fn ensure_workspace(&self, id: &str, root: &[u8]) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
+        // Looked up first so a workspace that is already registered, the
+        // ordinary case, opens without asking for the write lock.
+        let registered: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?1 OR root = ?2)",
+            params![id, root],
+            |row| row.get(0),
+        )?;
+        if registered {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT OR IGNORE INTO workspaces(id, root) VALUES(?1, ?2)",
             params![id, root],

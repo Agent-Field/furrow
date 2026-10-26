@@ -85,5 +85,9 @@ fn a_watched_folder_opens_while_another_process_holds_the_catalog_write_lock() {
     let finished = opened.recv_timeout(std::time::Duration::from_secs(3));
     writer.execute_batch("ROLLBACK").unwrap();
     reader.join().unwrap();
-    assert_eq!(finished, Ok(true), "status queued behind the catalog write lock");
+    assert_eq!(
+        finished,
+        Ok(true),
+        "status queued behind the catalog write lock"
+    );
 }

@@ -820,17 +820,27 @@ impl ObjectStore {
 
     /// Old timeline-scoped rows are advisory and can move to their folder without reading content again.
     fn share_legacy_file_rows(&self) -> anyhow::Result<()> {
+        // Only a workspace that still owns such rows needs the write lock; once
+        // they are shared, every later open finds none and takes no lock.
+        let mut pending = Vec::new();
+        for entry in fs::read_dir(self.root.join("workspaces"))? {
+            let entry = entry?;
+            if !entry.path().join("root.path").is_file() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if self.catalog.has_legacy_file_rows(&id)? {
+                pending.push(id);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
         self.catalog.batch(|| {
-            for entry in fs::read_dir(self.root.join("workspaces"))? {
-                let entry = entry?;
-                let path = entry.path().join("root.path");
-                if !path.is_file() {
-                    continue;
-                }
-                let id = entry.file_name().to_string_lossy().into_owned();
-                let root = fs::read(path)?;
+            for id in &pending {
+                let root = fs::read(self.workspace_data_dir(id).join("root.path"))?;
                 self.catalog.share_legacy_file_rows(
-                    &id,
+                    id,
                     &format!("folder:{}", blake3::hash(&root).to_hex()),
                 )?;
             }
@@ -981,22 +991,23 @@ impl ObjectStore {
         let Some(frontier) = self.frontier()? else {
             return Ok(());
         };
-        self.catalog.batch(|| {
-            for entry in fs::read_dir(self.root.join("workspaces"))? {
-                let entry = entry?;
-                if !entry.path().join("refs.log").exists() {
-                    continue;
-                }
-                let id = entry.file_name().to_string_lossy().into_owned();
-                let log = RefLog::open(&self.root, &id)?;
-                if log.repair_suffix(*frontier.refs.get(&id).unwrap_or(&0), |id| {
-                    self.contains_object(id)
-                })? {
-                    self.catalog.forget_workspace_refs(&id)?;
-                }
+        // The catalog is written only for a log that needed repair, so an open
+        // that finds every log intact does not take its write lock.
+        for entry in fs::read_dir(self.root.join("workspaces"))? {
+            let entry = entry?;
+            if !entry.path().join("refs.log").exists() {
+                continue;
             }
-            Ok(())
-        })
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let log = RefLog::open(&self.root, &id)?;
+            if log.repair_suffix(*frontier.refs.get(&id).unwrap_or(&0), |id| {
+                self.contains_object(id)
+            })? {
+                self.catalog
+                    .batch(|| self.catalog.forget_workspace_refs(&id))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn budget_status(&self) -> anyhow::Result<BudgetStatus> {
@@ -1934,6 +1945,41 @@ mod tests {
             .is_ok();
         writer.execute_batch("ROLLBACK").unwrap();
         reader.join().unwrap();
-        assert!(finished, "a read-only open queued behind the catalog write lock");
+        assert!(
+            finished,
+            "a read-only open queued behind the catalog write lock"
+        );
+    }
+    #[test]
+    fn legacy_file_rows_move_to_their_folder_once_and_later_opens_leave_them() {
+        let directory = store_of(1);
+        let workspace = directory.path().join("workspaces/w1");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("root.path"), b"/work/tree").unwrap();
+        let folder = format!("folder:{}", blake3::hash(b"/work/tree").to_hex());
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        for path in [b"a.txt".as_slice(), b".cell/x".as_slice()] {
+            connection
+                .execute(
+                    "INSERT INTO stat_cache VALUES('w1', ?1, 1, 1, 1, 1, 1, 1, 1, 420, ?2, NULL, 0, 1)",
+                    rusqlite::params![path, [7_u8; 32].as_slice()],
+                )
+                .unwrap();
+        }
+        let rows = |owner: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM stat_cache WHERE workspace_id = ?1",
+                    [owner],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        // The folder takes the file row; the composed `.cell` row stays put.
+        assert_eq!((rows("w1"), rows(&folder)), (1, 1));
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        assert_eq!((rows("w1"), rows(&folder)), (1, 1));
     }
 }
