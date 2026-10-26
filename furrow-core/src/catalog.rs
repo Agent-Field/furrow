@@ -45,6 +45,18 @@ fn writer_error(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static WORK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// SQLite virtual-machine steps this thread's catalogs have run, so a test can
+/// pin how much work an operation does without timing it.
+#[cfg(test)]
+pub(crate) fn work_steps() -> u64 {
+    WORK.with(Cell::get)
+}
+
 pub struct Catalog {
     conn: Connection,
     files: RefCell<HashMap<String, HashMap<Vec<u8>, CachedFile>>>,
@@ -84,6 +96,14 @@ impl Catalog {
         // hot pages spares each lookup a read from the file.
         conn.pragma_update(None, "cache_size", -CACHE_KIB)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        #[cfg(test)]
+        conn.progress_handler(
+            1,
+            Some(|| {
+                WORK.with(|work| work.set(work.get() + 1));
+                false
+            }),
+        );
         crate::sqlite_adapter::fold_oversized_wal(&conn, path)?;
         conn.execute_batch(
             "
@@ -184,6 +204,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// Whether `workspace` still owns file rows that belong to its folder.
+    pub(crate) fn has_legacy_file_rows(&self, workspace: &str) -> anyhow::Result<bool> {
+        let _operation = crate::writer_wait::Operation::start();
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stat_cache
+             WHERE workspace_id = ?1 AND path != ?2 AND substr(path, 1, 6) != ?3)",
+            params![workspace, b".cell".as_slice(), b".cell/".as_slice()],
+            |row| row.get(0),
+        )?)
+    }
     pub(crate) fn share_legacy_file_rows(
         &self,
         workspace: &str,
@@ -332,6 +362,19 @@ impl Catalog {
         )?;
         let rows = statement.query_map(params![workspace_id], |row| row.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Runs `read` against one snapshot of the catalog without taking its
+    /// write lock, so several queries agree with each other while a writer
+    /// commits between them.
+    pub fn snapshot<T>(&self, read: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        if !self.conn.is_autocommit() {
+            return read();
+        }
+        self.conn.execute_batch("BEGIN")?;
+        let value = read();
+        let _ = self.conn.execute_batch("ROLLBACK");
+        value
     }
 
     /// Runs `write` as one transaction, so its many small catalog writes cost
@@ -585,6 +628,7 @@ impl Catalog {
         Ok(())
     }
 
+    /// Rows of `pack` that end at or before `verified_len`.
     pub fn pack_prefix_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
         let _operation = crate::writer_wait::Operation::start();
         Ok(self.conn.query_row(
@@ -595,6 +639,7 @@ impl Catalog {
         )? as u64)
     }
 
+    /// Rows of `pack` that start before `verified_len` and end after it.
     pub fn pack_crossing_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
         let _operation = crate::writer_wait::Operation::start();
         Ok(self.conn.query_row(
@@ -605,6 +650,13 @@ impl Catalog {
         )? as u64)
     }
 
+    /// Whether no transaction is open on this connection.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.conn.is_autocommit()
+    }
+
+    /// The end of the furthest object row in `pack`: one seek down the
+    /// `objects_pack_end` index, however many rows the pack holds.
     pub(crate) fn pack_high_water(&self, pack: &str) -> anyhow::Result<u64> {
         let _operation = crate::writer_wait::Operation::start();
         Ok(self.conn.query_row(
@@ -654,10 +706,24 @@ impl Catalog {
 
     pub fn ensure_workspace(&self, id: &str, root: &[u8]) -> anyhow::Result<()> {
         let _operation = crate::writer_wait::Operation::start();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO workspaces(id, root) VALUES(?1, ?2)",
+        // Looked up first so a workspace that is already registered, the
+        // ordinary case, opens without asking for the write lock.
+        let registered: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?1 OR root = ?2)",
             params![id, root],
+            |row| row.get(0),
         )?;
+        if registered {
+            return Ok(());
+        }
+        // This can now be the first write of an open, so a busy catalog is
+        // reported as the writer wait it is, as `batch` does.
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO workspaces(id, root) VALUES(?1, ?2)",
+                params![id, root],
+            )
+            .map_err(|error| writer_error(error.into()))?;
         Ok(())
     }
 

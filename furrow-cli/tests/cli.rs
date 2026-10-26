@@ -4073,3 +4073,49 @@ fn concurrent_work_runs_on_one_input_ref_publish_independent_results() {
         b"tracked original\n"
     );
 }
+
+#[test]
+fn verify_reports_a_sound_store_and_rebuilds_a_damaged_index() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let tree = temp.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("a.txt"), "a").unwrap();
+    let run = |args: &[&str]| -> Value {
+        let output = Command::new(furrow_bin())
+            .env("FURROW_DATA_DIR", &data)
+            .env("FURROW_NO_DAEMON", "1")
+            .env("HOME", temp.path().join("home"))
+            .arg("--json")
+            .arg("--repo")
+            .arg(&tree)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    run(&["watch"]);
+    // Reopening records the checkpoint verify compares against.
+    run(&["status"]);
+
+    let sound = run(&["verify"]);
+    assert_eq!(sound["repaired"], false, "{sound}");
+    assert!(sound["objects"].as_u64().unwrap() > 0);
+
+    let connection = rusqlite::Connection::open(data.join("store-v1/catalog.sqlite3")).unwrap();
+    connection
+        .execute(
+            "DELETE FROM objects WHERE id = (SELECT id FROM objects LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let repaired = run(&["verify"]);
+    assert_eq!(repaired["repaired"], true, "{repaired}");
+    assert_eq!(run(&["verify"])["repaired"], false);
+}

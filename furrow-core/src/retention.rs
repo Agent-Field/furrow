@@ -168,6 +168,11 @@ impl RetentionLog {
 
     pub fn state(&self) -> anyhow::Result<RetentionState> {
         let _operation = crate::writer_wait::Operation::start();
+        // A workspace that has never pinned or thinned has no log; asking
+        // about it must not create one.
+        if !self.path.exists() {
+            return Ok(RetentionState::initial());
+        }
         let lock = self.lock()?;
         let mut file = self.open_log()?;
         let state = read_latest(&mut file)?;

@@ -31,6 +31,15 @@ const OBJECT_VERSION: u8 = 1;
 const HEADER_LEN: u64 = 4 + 1 + 1 + 8 + 32 + 32;
 const MAX_OBJECT_LEN: u64 = 256 * 1024 * 1024;
 
+/// What a [`ObjectStore::verify_index`] pass found in the active pack's index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct IndexCheck {
+    /// Objects the pack's checkpoint accounts for.
+    pub objects: u64,
+    /// Whether the index disagreed with the pack and was rebuilt from it.
+    pub repaired: bool,
+}
+
 #[derive(Clone)]
 pub struct ObjectStore {
     root: PathBuf,
@@ -43,6 +52,8 @@ pub struct ObjectStore {
     deferred: Cell<bool>,
     append_pack: Rc<RefCell<Option<(String, File)>>>,
     known_end: Rc<Cell<u64>>,
+    /// Whether a failed read has already had its index rescanned this session.
+    healed: Rc<Cell<bool>>,
     group: Rc<RefCell<Option<GroupCommit>>>,
 }
 
@@ -330,6 +341,7 @@ impl ObjectStore {
             deferred: Cell::new(false),
             append_pack: Default::default(),
             known_end: Rc::new(Cell::new(0)),
+            healed: Default::default(),
             group: Default::default(),
         };
         let startup_guard = MaintenanceGuard {
@@ -350,6 +362,52 @@ impl ObjectStore {
             .map_or(0, |m| m.len()),
         );
         Ok(store)
+    }
+
+    /// Checks the active pack's index against its checkpoint with the full
+    /// row counts that opening no longer pays for, and rebuilds the index from
+    /// the pack when they disagree. `deep` rebuilds regardless, which also
+    /// re-hashes every record; a damaged record fails the pass and leaves the
+    /// index as it was. Meant for `furrow verify` and idle maintenance, never
+    /// for open.
+    pub fn verify_index(&self, deep: bool) -> anyhow::Result<IndexCheck> {
+        let _operation = crate::writer_wait::Operation::start();
+        let _maintenance = self.acquire_maintenance_shared()?;
+        let pack_name = self.active_pack.borrow().clone();
+        self.catalog.batch(|| {
+            let agrees = match self.catalog.pack_checkpoint(&pack_name)? {
+                Some(checkpoint) => {
+                    self.catalog
+                        .pack_prefix_object_count(&pack_name, checkpoint.verified_len)?
+                        == checkpoint.object_count
+                        && self
+                            .catalog
+                            .pack_crossing_object_count(&pack_name, checkpoint.verified_len)?
+                            == 0
+                }
+                None => self.catalog.pack_high_water(&pack_name)? == 0,
+            };
+            if !agrees || deep {
+                self.catalog.reset_pack_index(&pack_name)?;
+                self.recover_pack_under_catalog_lock()?;
+            }
+            Ok(IndexCheck {
+                objects: self
+                    .catalog
+                    .pack_checkpoint(&pack_name)?
+                    .map_or(0, |checkpoint| checkpoint.object_count),
+                repaired: !agrees,
+            })
+        })
+    }
+
+    /// One rescan per session for a read that fails: a row the index lost, or
+    /// one that points outside the pack, is rebuilt from the pack and the read
+    /// tried again. A read that still fails after that is genuinely damaged.
+    fn heal_index(&self) -> bool {
+        !self.healed.replace(true)
+            && self.catalog.is_idle()
+            && self.verify_index(false).is_ok_and(|check| check.repaired)
     }
 
     pub fn put_bytes(&self, kind: ObjectKind, bytes: &[u8]) -> anyhow::Result<ObjectId> {
@@ -517,6 +575,13 @@ impl ObjectStore {
         expected: ObjectKind,
     ) -> anyhow::Result<Vec<u8>> {
         let _operation = crate::writer_wait::Operation::start();
+        match self.read_located(id, expected) {
+            Err(_) if self.heal_index() => self.read_located(id, expected),
+            result => result,
+        }
+    }
+
+    fn read_located(&self, id: &ObjectId, expected: ObjectKind) -> anyhow::Result<Vec<u8>> {
         let location = self
             .catalog
             .object(id)?
@@ -635,8 +700,23 @@ impl ObjectStore {
     }
 
     pub fn find_workspace(&self, root: &[u8]) -> anyhow::Result<Option<String>> {
+        Self::find_workspace_in(&self.root, root)
+    }
+
+    /// As [`Self::find_workspace`], from the store directory alone: the
+    /// answer lives in the per-workspace folders, so it needs neither the
+    /// catalog nor the pack, and a store that does not exist has none.
+    pub(crate) fn find_workspace_in(
+        store_root: &Path,
+        root: &[u8],
+    ) -> anyhow::Result<Option<String>> {
         let _operation = crate::writer_wait::Operation::start();
-        for entry in fs::read_dir(self.root.join("workspaces"))? {
+        let entries = match fs::read_dir(store_root.join("workspaces")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with("t-")
             {
@@ -805,17 +885,27 @@ impl ObjectStore {
 
     /// Old timeline-scoped rows are advisory and can move to their folder without reading content again.
     fn share_legacy_file_rows(&self) -> anyhow::Result<()> {
+        // Only a workspace that still owns such rows needs the write lock; once
+        // they are shared, every later open finds none and takes no lock.
+        let mut pending = Vec::new();
+        for entry in fs::read_dir(self.root.join("workspaces"))? {
+            let entry = entry?;
+            if !entry.path().join("root.path").is_file() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if self.catalog.has_legacy_file_rows(&id)? {
+                pending.push(id);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
         self.catalog.batch(|| {
-            for entry in fs::read_dir(self.root.join("workspaces"))? {
-                let entry = entry?;
-                let path = entry.path().join("root.path");
-                if !path.is_file() {
-                    continue;
-                }
-                let id = entry.file_name().to_string_lossy().into_owned();
-                let root = fs::read(path)?;
+            for id in &pending {
+                let root = fs::read(self.workspace_data_dir(id).join("root.path"))?;
                 self.catalog.share_legacy_file_rows(
-                    &id,
+                    id,
                     &format!("folder:{}", blake3::hash(&root).to_hex()),
                 )?;
             }
@@ -966,22 +1056,23 @@ impl ObjectStore {
         let Some(frontier) = self.frontier()? else {
             return Ok(());
         };
-        self.catalog.batch(|| {
-            for entry in fs::read_dir(self.root.join("workspaces"))? {
-                let entry = entry?;
-                if !entry.path().join("refs.log").exists() {
-                    continue;
-                }
-                let id = entry.file_name().to_string_lossy().into_owned();
-                let log = RefLog::open(&self.root, &id)?;
-                if log.repair_suffix(*frontier.refs.get(&id).unwrap_or(&0), |id| {
-                    self.contains_object(id)
-                })? {
-                    self.catalog.forget_workspace_refs(&id)?;
-                }
+        // The catalog is written only for a log that needed repair, so an open
+        // that finds every log intact does not take its write lock.
+        for entry in fs::read_dir(self.root.join("workspaces"))? {
+            let entry = entry?;
+            if !entry.path().join("refs.log").exists() {
+                continue;
             }
-            Ok(())
-        })
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let log = RefLog::open(&self.root, &id)?;
+            if log.repair_suffix(*frontier.refs.get(&id).unwrap_or(&0), |id| {
+                self.contains_object(id)
+            })? {
+                self.catalog
+                    .batch(|| self.catalog.forget_workspace_refs(&id))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn budget_status(&self) -> anyhow::Result<BudgetStatus> {
@@ -1206,8 +1297,39 @@ impl ObjectStore {
             }
             return Ok(());
         }
+        // A pack that ends exactly at its verified checkpoint has nothing to
+        // recover, so a reader neither queues behind a writer for the catalog
+        // and pack locks nor writes anything. Anything else, including a
+        // writer that is mid-append, falls through to the locked recovery.
+        if self.pack_is_settled(&name)? {
+            return Ok(());
+        }
         self.catalog
             .batch(|| self.recover_pack_under_catalog_lock())
+    }
+    /// Whether the active pack is exactly its checkpointed, validated prefix,
+    /// judged from one catalog snapshot without taking any lock. A `false`
+    /// only means recovery must look under the locks.
+    fn pack_is_settled(&self, pack_name: &str) -> anyhow::Result<bool> {
+        let Ok(mut pack) = File::open(self.root.join("packs").join(pack_name)) else {
+            return Ok(false);
+        };
+        let file_len = pack.metadata()?.len();
+        self.catalog.snapshot(|| {
+            let Some(checkpoint) = self.catalog.pack_checkpoint(pack_name)? else {
+                return Ok(false);
+            };
+            if checkpoint.verified_len != file_len {
+                return Ok(false);
+            }
+            let durable_len = self
+                .frontier()?
+                .map(|f| f.packs.get(pack_name).copied().unwrap_or(0));
+            if durable_len.is_some_and(|len| len != file_len) {
+                return Ok(false);
+            }
+            self.validate_checkpoint(&mut pack, file_len, &checkpoint)
+        })
     }
 
     fn recover_pack_under_catalog_lock(&self) -> anyhow::Result<()> {
@@ -1385,15 +1507,15 @@ impl ObjectStore {
         file_len: u64,
         checkpoint: &PackCheckpoint,
     ) -> anyhow::Result<bool> {
+        // Every object row ends at or before the checkpoint. A row past it
+        // means a crash between an append and the checkpoint write; a row that
+        // straddles it is a torn record. Both are a high water above
+        // `verified_len`, which is one index seek, not a scan of the pack's rows.
         if checkpoint.verified_len > file_len
-            || self.catalog.pack_prefix_object_count(
-                self.active_pack.borrow().as_str(),
-                checkpoint.verified_len,
-            )? != checkpoint.object_count
-            || self.catalog.pack_crossing_object_count(
-                self.active_pack.borrow().as_str(),
-                checkpoint.verified_len,
-            )? != 0
+            || self
+                .catalog
+                .pack_high_water(self.active_pack.borrow().as_str())?
+                > checkpoint.verified_len
         {
             return Ok(false);
         }
@@ -1676,5 +1798,329 @@ mod tests {
                 .verified_len,
             verified_len
         );
+    }
+    fn store_of(count: usize) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        for n in 0..count {
+            store
+                .put_bytes(ObjectKind::Chunk, format!("object {n}").as_bytes())
+                .unwrap();
+        }
+        drop(store);
+        // The reopen records the checkpoint every later open starts from.
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        directory
+    }
+
+    fn open_work(directory: &Path) -> u64 {
+        let before = crate::catalog::work_steps();
+        drop(ObjectStore::open(directory.to_owned()).unwrap());
+        crate::catalog::work_steps() - before
+    }
+
+    #[test]
+    fn opening_a_checkpointed_store_does_catalog_work_independent_of_its_size() {
+        let small = open_work(store_of(50).path());
+        let large = open_work(store_of(5000).path());
+        // A row-proportional scan adds several steps per extra row (~5000 rows
+        // here); a fixed handful of seeks stays within the same few hundred.
+        assert!(
+            large <= small + 500,
+            "open work grew with the store: {small} steps for 50 objects, {large} for 5000"
+        );
+    }
+
+    #[test]
+    fn a_settled_pack_opens_without_waiting_for_the_pack_lock() {
+        let directory = store_of(10);
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("locks/pack.lock"))
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+
+        let path = directory.path().to_owned();
+        let (done, opened) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            drop(ObjectStore::open(path).unwrap());
+            done.send(()).unwrap();
+        });
+        let finished = opened
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .is_ok();
+        FileExt::unlock(&lock).unwrap();
+        reader.join().unwrap();
+        assert!(finished, "a read-only open queued behind the pack lock");
+    }
+
+    fn three_objects() -> (tempfile::TempDir, [ObjectId; 3], u64) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let mut ids = [ObjectId::default(); 3];
+        for (n, id) in ids.iter_mut().enumerate() {
+            *id = store
+                .put_bytes(ObjectKind::Chunk, format!("object {n}").as_bytes())
+                .unwrap();
+        }
+        drop(store);
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        let verified = fs::metadata(directory.path().join("packs").join(INITIAL_PACK_NAME))
+            .unwrap()
+            .len();
+        (directory, ids, verified)
+    }
+
+    fn assert_all_readable(directory: &Path, ids: &[ObjectId; 3]) {
+        let store = ObjectStore::open(directory.to_owned()).unwrap();
+        for (n, id) in ids.iter().enumerate() {
+            assert_eq!(
+                store.read_bytes(id, ObjectKind::Chunk).unwrap(),
+                format!("object {n}").as_bytes()
+            );
+        }
+        assert_eq!(store.catalog.object_count().unwrap(), 3);
+        let checkpoint = store
+            .catalog
+            .pack_checkpoint(INITIAL_PACK_NAME)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.object_count, 3);
+        assert_eq!(
+            checkpoint.verified_len,
+            fs::metadata(directory.join("packs").join(INITIAL_PACK_NAME))
+                .unwrap()
+                .len()
+        );
+    }
+
+    /// Winds the checkpoint back to just before the third object's record.
+    fn checkpoint_before_third(connection: &Connection, ids: &[ObjectId; 3]) {
+        let verified: i64 = connection
+            .query_row(
+                "SELECT offset - ?2 FROM objects WHERE id = ?1",
+                rusqlite::params![ids[2].as_slice(), HEADER_LEN as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE pack_checkpoints SET verified_len = ?1, object_count = 2,
+                 last_object = ?2,
+                 last_record_start = (SELECT offset - ?3 FROM objects WHERE id = ?2)",
+                rusqlite::params![verified, ids[1].as_slice(), HEADER_LEN as i64],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn rows_ahead_of_a_stale_checkpoint_recover_every_object() {
+        // A crash after the catalog rows committed but before the checkpoint did.
+        let (directory, ids, _) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        checkpoint_before_third(&connection, &ids);
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_pack_ahead_of_a_lost_catalog_commit_is_reindexed() {
+        let (directory, ids, _) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        checkpoint_before_third(&connection, &ids);
+        connection
+            .execute("DELETE FROM objects WHERE id = ?1", [ids[2].as_slice()])
+            .unwrap();
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_torn_final_record_is_dropped_with_its_catalog_row() {
+        // The catalog remembers an object whose record the pack lost part of.
+        let (directory, ids, verified) = three_objects();
+        let pack = OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("packs").join(INITIAL_PACK_NAME))
+            .unwrap();
+        pack.set_len(verified - 2).unwrap();
+        drop(pack);
+
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert!(store.catalog.object(&ids[2]).unwrap().is_none());
+        for (n, id) in ids[..2].iter().enumerate() {
+            assert_eq!(
+                store.read_bytes(id, ObjectKind::Chunk).unwrap(),
+                format!("object {n}").as_bytes()
+            );
+        }
+        let checkpoint = store
+            .catalog
+            .pack_checkpoint(INITIAL_PACK_NAME)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.object_count, 2);
+        assert_eq!(
+            checkpoint.verified_len,
+            fs::metadata(directory.path().join("packs").join(INITIAL_PACK_NAME))
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_inside_a_record_forces_a_rebuild() {
+        let (directory, ids, verified) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE pack_checkpoints SET verified_len = ?1",
+                [verified as i64 - 3],
+            )
+            .unwrap();
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_dropped_index_is_rebuilt_from_the_pack() {
+        let (directory, ids, _) = three_objects();
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        connection.execute("DELETE FROM objects", []).unwrap();
+        drop(connection);
+        assert_all_readable(directory.path(), &ids);
+    }
+    #[test]
+    fn a_settled_store_opens_while_another_process_holds_the_catalog_write_lock() {
+        let directory = store_of(10);
+        let writer = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let path = directory.path().to_owned();
+        let (done, opened) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            drop(ObjectStore::open(path).unwrap());
+            done.send(()).unwrap();
+        });
+        let finished = opened
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .is_ok();
+        writer.execute_batch("ROLLBACK").unwrap();
+        reader.join().unwrap();
+        assert!(
+            finished,
+            "a read-only open queued behind the catalog write lock"
+        );
+    }
+    #[test]
+    fn legacy_file_rows_move_to_their_folder_once_and_later_opens_leave_them() {
+        let directory = store_of(1);
+        let workspace = directory.path().join("workspaces/w1");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("root.path"), b"/work/tree").unwrap();
+        let folder = format!("folder:{}", blake3::hash(b"/work/tree").to_hex());
+        let connection = Connection::open(directory.path().join("catalog.sqlite3")).unwrap();
+        for path in [b"a.txt".as_slice(), b".cell/x".as_slice()] {
+            connection
+                .execute(
+                    "INSERT INTO stat_cache VALUES('w1', ?1, 1, 1, 1, 1, 1, 1, 1, 420, ?2, NULL, 0, 1)",
+                    rusqlite::params![path, [7_u8; 32].as_slice()],
+                )
+                .unwrap();
+        }
+        let rows = |owner: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM stat_cache WHERE workspace_id = ?1",
+                    [owner],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        // The folder takes the file row; the composed `.cell` row stays put.
+        assert_eq!((rows("w1"), rows(&folder)), (1, 1));
+        drop(ObjectStore::open(directory.path().to_owned()).unwrap());
+        assert_eq!((rows("w1"), rows(&folder)), (1, 1));
+    }
+    fn drop_row(directory: &Path, id: &ObjectId) {
+        let connection = Connection::open(directory.join("catalog.sqlite3")).unwrap();
+        connection
+            .execute("DELETE FROM objects WHERE id = ?1", [id.as_slice()])
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_restores_rows_missing_from_the_middle_of_the_verified_prefix() {
+        let (directory, ids, _) = three_objects();
+        drop_row(directory.path(), &ids[0]);
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        // Open trusts the checkpoint and cannot see the hole.
+        assert!(store.catalog.object(&ids[0]).unwrap().is_none());
+
+        let check = store.verify_index(false).unwrap();
+        assert_eq!(
+            check,
+            IndexCheck {
+                objects: 3,
+                repaired: true
+            }
+        );
+        drop(store);
+        assert_all_readable(directory.path(), &ids);
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert!(!store.verify_index(false).unwrap().repaired);
+    }
+
+    #[test]
+    fn a_read_that_finds_a_row_missing_rescans_the_pack_once() {
+        let (directory, ids, _) = three_objects();
+        drop_row(directory.path(), &ids[0]);
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        assert_eq!(
+            store.read_bytes(&ids[0], ObjectKind::Chunk).unwrap(),
+            b"object 0"
+        );
+        // The rescan is spent: a second hole in the same session is an error.
+        drop_row(directory.path(), &ids[1]);
+        assert!(store.read_bytes(&ids[1], ObjectKind::Chunk).is_err());
+    }
+
+    #[test]
+    fn a_deep_verify_of_a_sound_pack_repairs_nothing() {
+        let (directory, ids, _) = three_objects();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let check = store.verify_index(true).unwrap();
+        assert_eq!(
+            check,
+            IndexCheck {
+                objects: 3,
+                repaired: false
+            }
+        );
+        drop(store);
+        assert_all_readable(directory.path(), &ids);
+    }
+
+    #[test]
+    fn a_deep_verify_that_finds_a_damaged_record_leaves_the_index_alone() {
+        let (directory, ids, _) = three_objects();
+        let store = ObjectStore::open(directory.path().to_owned()).unwrap();
+        let location = store.catalog.object(&ids[1]).unwrap().unwrap();
+        let mut pack = OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("packs").join(INITIAL_PACK_NAME))
+            .unwrap();
+        pack.seek(SeekFrom::Start(location.offset)).unwrap();
+        pack.write_all(b"Z").unwrap();
+        drop(pack);
+
+        assert!(store.verify_index(true).is_err());
+        // The failed rebuild rolled back: every row is still there.
+        assert_eq!(store.catalog.object_count().unwrap(), 3);
     }
 }
