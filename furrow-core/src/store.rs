@@ -1773,7 +1773,9 @@ mod tests {
             drop(ObjectStore::open(path).unwrap());
             done.send(()).unwrap();
         });
-        let finished = opened.recv_timeout(std::time::Duration::from_secs(3)).is_ok();
+        let finished = opened
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .is_ok();
         FileExt::unlock(&lock).unwrap();
         reader.join().unwrap();
         assert!(finished, "a read-only open queued behind the pack lock");

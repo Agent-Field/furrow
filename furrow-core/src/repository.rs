@@ -5354,7 +5354,8 @@ fn ensure_watched(data_dir: &Path, root: &Path, composed: bool) -> anyhow::Resul
     let Ok(root) = root.canonicalize() else {
         return Ok(());
     };
-    if IdentityHome::of(composed) == IdentityHome::Workspace && read_workspace_file(&root)?.is_some()
+    if IdentityHome::of(composed) == IdentityHome::Workspace
+        && read_workspace_file(&root)?.is_some()
     {
         return Ok(());
     }

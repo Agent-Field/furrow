@@ -19,7 +19,10 @@ fn an_unwatched_folder_is_answered_without_opening_the_catalog() {
         "unexpected error: {error:#}"
     );
     assert_eq!(crate::catalog::work_steps(), before);
-    assert!(!data.join(STORE_DIR).exists(), "the question created a store");
+    assert!(
+        !data.join(STORE_DIR).exists(),
+        "the question created a store"
+    );
 }
 
 #[test]
