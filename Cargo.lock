@@ -590,6 +590,7 @@ dependencies = [
  "furrow-core",
  "hex",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
