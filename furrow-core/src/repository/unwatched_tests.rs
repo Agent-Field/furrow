@@ -91,3 +91,45 @@ fn a_watched_folder_opens_while_another_process_holds_the_catalog_write_lock() {
         "status queued behind the catalog write lock"
     );
 }
+
+fn entries(directory: &Path) -> std::collections::BTreeSet<PathBuf> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut pending = vec![directory.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            found.insert(path);
+        }
+    }
+    found
+}
+
+#[test]
+fn status_of_a_watched_folder_creates_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let watched = temp.path().join("watched");
+    fs::create_dir_all(&watched).unwrap();
+    fs::write(watched.join("a.txt"), "a").unwrap();
+    FurrowRepository::attach_and_seal_timeline_in(
+        &data,
+        &watched,
+        None,
+        None,
+        SnapshotTrigger::AgentRun,
+        SealOptions::default(),
+    )
+    .unwrap();
+    // A first open settles anything the seal left for the next one.
+    FurrowRepository::open_timeline_in(&data, &watched, None, None).unwrap();
+    let before = entries(temp.path());
+
+    let repository = FurrowRepository::open_timeline_in(&data, &watched, None, None).unwrap();
+    repository.status().unwrap();
+    drop(repository);
+
+    assert_eq!(entries(temp.path()), before);
+}

@@ -52,6 +52,8 @@ pub struct ObjectStore {
     deferred: Cell<bool>,
     append_pack: Rc<RefCell<Option<(String, File)>>>,
     known_end: Rc<Cell<u64>>,
+    /// Whether a failed read has already had its index rescanned this session.
+    healed: Rc<Cell<bool>>,
     group: Rc<RefCell<Option<GroupCommit>>>,
 }
 
@@ -339,6 +341,7 @@ impl ObjectStore {
             deferred: Cell::new(false),
             append_pack: Default::default(),
             known_end: Rc::new(Cell::new(0)),
+            healed: Default::default(),
             group: Default::default(),
         };
         let startup_guard = MaintenanceGuard {
@@ -361,13 +364,50 @@ impl ObjectStore {
         Ok(store)
     }
 
-    /// Checks the active pack's index against its checkpoint and rebuilds it
-    /// from the pack when they disagree.
-    pub fn verify_index(&self, _deep: bool) -> anyhow::Result<IndexCheck> {
-        Ok(IndexCheck {
-            objects: 0,
-            repaired: false,
+    /// Checks the active pack's index against its checkpoint with the full
+    /// row counts that opening no longer pays for, and rebuilds the index from
+    /// the pack when they disagree. `deep` rebuilds regardless, which also
+    /// re-hashes every record; a damaged record fails the pass and leaves the
+    /// index as it was. Meant for `furrow verify` and idle maintenance, never
+    /// for open.
+    pub fn verify_index(&self, deep: bool) -> anyhow::Result<IndexCheck> {
+        let _operation = crate::writer_wait::Operation::start();
+        let _maintenance = self.acquire_maintenance_shared()?;
+        let pack_name = self.active_pack.borrow().clone();
+        self.catalog.batch(|| {
+            let agrees = match self.catalog.pack_checkpoint(&pack_name)? {
+                Some(checkpoint) => {
+                    self.catalog
+                        .pack_prefix_object_count(&pack_name, checkpoint.verified_len)?
+                        == checkpoint.object_count
+                        && self
+                            .catalog
+                            .pack_crossing_object_count(&pack_name, checkpoint.verified_len)?
+                            == 0
+                }
+                None => self.catalog.pack_high_water(&pack_name)? == 0,
+            };
+            if !agrees || deep {
+                self.catalog.reset_pack_index(&pack_name)?;
+                self.recover_pack_under_catalog_lock()?;
+            }
+            Ok(IndexCheck {
+                objects: self
+                    .catalog
+                    .pack_checkpoint(&pack_name)?
+                    .map_or(0, |checkpoint| checkpoint.object_count),
+                repaired: !agrees,
+            })
         })
+    }
+
+    /// One rescan per session for a read that fails: a row the index lost, or
+    /// one that points outside the pack, is rebuilt from the pack and the read
+    /// tried again. A read that still fails after that is genuinely damaged.
+    fn heal_index(&self) -> bool {
+        !self.healed.replace(true)
+            && self.catalog.is_idle()
+            && self.verify_index(false).is_ok_and(|check| check.repaired)
     }
 
     pub fn put_bytes(&self, kind: ObjectKind, bytes: &[u8]) -> anyhow::Result<ObjectId> {
@@ -535,6 +575,13 @@ impl ObjectStore {
         expected: ObjectKind,
     ) -> anyhow::Result<Vec<u8>> {
         let _operation = crate::writer_wait::Operation::start();
+        match self.read_located(id, expected) {
+            Err(_) if self.heal_index() => self.read_located(id, expected),
+            result => result,
+        }
+    }
+
+    fn read_located(&self, id: &ObjectId, expected: ObjectKind) -> anyhow::Result<Vec<u8>> {
         let location = self
             .catalog
             .object(id)?

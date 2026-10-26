@@ -628,6 +628,33 @@ impl Catalog {
         Ok(())
     }
 
+    /// Rows of `pack` that end at or before `verified_len`.
+    pub fn pack_prefix_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM objects
+             WHERE pack = ?1 AND offset + len + 4 <= ?2",
+            params![pack, verified_len as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    /// Rows of `pack` that start before `verified_len` and end after it.
+    pub fn pack_crossing_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
+        let _operation = crate::writer_wait::Operation::start();
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM objects
+             WHERE pack = ?1 AND offset < ?2 AND offset + len + 4 > ?2",
+            params![pack, verified_len as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    /// Whether no transaction is open on this connection.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.conn.is_autocommit()
+    }
+
     /// The end of the furthest object row in `pack`: one seek down the
     /// `objects_pack_end` index, however many rows the pack holds.
     pub(crate) fn pack_high_water(&self, pack: &str) -> anyhow::Result<u64> {

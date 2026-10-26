@@ -1013,6 +1013,13 @@ impl FurrowRepository {
         Ok(report)
     }
 
+    /// Checks the global store's object index against its pack; see
+    /// [`ObjectStore::verify_index`].
+    pub fn verify_global(deep: bool) -> anyhow::Result<crate::store::IndexCheck> {
+        let _operation = crate::writer_wait::Operation::start();
+        ObjectStore::open(data_root()?.join(STORE_DIR))?.verify_index(deep)
+    }
+
     pub fn budget_global(
         max_store_bytes: Option<u64>,
         reserved_free_bytes: Option<u64>,

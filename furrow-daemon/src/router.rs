@@ -37,15 +37,18 @@ struct Writer {
 }
 
 impl Writer {
-    fn spawn(data_dir: PathBuf, _maintenance: Maintenance) -> Self {
+    fn spawn(data_dir: PathBuf, maintenance: Maintenance) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let thread = std::thread::spawn(move || {
             let mut handles: HashMap<Target, Handle> = HashMap::new();
             let flusher = Flusher::start(furrow::repository::store_path(&data_dir));
             let mut deadline = Instant::now() + GROUP_INTERVAL;
+            let mut last_request = Instant::now();
+            let mut last_check = Instant::now();
             loop {
                 match inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(job) => {
+                        last_request = Instant::now();
                         let _operation = furrow::writer_wait::Operation::until(job.deadline);
                         if let Err(error) = furrow::writer_wait::check() {
                             let _ = job.reply.send(Err(error.into()));
@@ -92,7 +95,16 @@ impl Writer {
                         }
                         let _ = job.reply.send(result);
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Off the request path: only a writer that has been quiet
+                        // for a while, and then only now and again.
+                        if last_request.elapsed() >= maintenance.idle
+                            && last_check.elapsed() >= maintenance.every
+                        {
+                            last_check = Instant::now();
+                            check_index(&data_dir);
+                        }
+                    }
                     Err(RecvTimeoutError::Disconnected) => {
                         return flusher.finish();
                     }
@@ -103,6 +115,19 @@ impl Writer {
             }
         });
         Self { jobs, thread }
+    }
+}
+
+/// Checks the store's index against its pack and rebuilds it if they differ;
+/// a failure is reported and tried again at the next interval.
+fn check_index(data_dir: &std::path::Path) {
+    let _operation = furrow::writer_wait::Operation::start();
+    let result = furrow::store::ObjectStore::open(furrow::repository::store_path(data_dir))
+        .and_then(|store| store.verify_index(false));
+    match result {
+        Ok(check) if check.repaired => eprintln!("rebuilt the object index: {check:?}"),
+        Ok(_) => {}
+        Err(error) => eprintln!("index check failed: {error:#}"),
     }
 }
 

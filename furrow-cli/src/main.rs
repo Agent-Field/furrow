@@ -315,6 +315,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Check the object index against the pack and rebuild it if they differ.
+    Verify {
+        /// Rebuild from the pack regardless, re-hashing every record.
+        #[arg(long)]
+        deep: bool,
+    },
     /// Inspect or configure the global content-store disk budget.
     Budget {
         /// Maximum physical pack size, for example 20GiB or 500MiB.
@@ -1472,6 +1478,22 @@ fn main() -> anyhow::Result<()> {
                     if dry_run { "reclaimable" } else { "reclaimed" },
                     report.physical_bytes_before,
                     report.physical_bytes_after
+                );
+            }
+        }
+        Command::Verify { deep } => {
+            let check = FurrowRepository::verify_global(deep)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&check)?);
+            } else {
+                println!(
+                    "{} objects indexed; {}",
+                    check.objects,
+                    if check.repaired {
+                        "the index disagreed with the pack and was rebuilt"
+                    } else {
+                        "the index agrees with the pack"
+                    }
                 );
             }
         }
