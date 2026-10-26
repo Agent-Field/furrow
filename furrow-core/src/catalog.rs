@@ -689,10 +689,14 @@ impl Catalog {
         if registered {
             return Ok(());
         }
-        self.conn.execute(
-            "INSERT OR IGNORE INTO workspaces(id, root) VALUES(?1, ?2)",
-            params![id, root],
-        )?;
+        // This can now be the first write of an open, so a busy catalog is
+        // reported as the writer wait it is, as `batch` does.
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO workspaces(id, root) VALUES(?1, ?2)",
+                params![id, root],
+            )
+            .map_err(|error| writer_error(error.into()))?;
         Ok(())
     }
 
