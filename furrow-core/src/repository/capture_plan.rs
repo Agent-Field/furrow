@@ -256,8 +256,8 @@ impl FurrowRepository {
         Ok(())
     }
 
-    /// SQLite opens journal names internally, so scoped backups read an isolated copy of screened bytes.
-    pub(super) fn stage_scoped_database(
+    /// SQLite opens journal names internally, so backups read an isolated copy of verified captured bytes.
+    pub(super) fn stage_captured_database(
         &self,
         source: &Path,
         temp_dir: &Path,
@@ -268,10 +268,12 @@ impl FurrowRepository {
             let mut name = source.as_os_str().to_owned();
             name.push(suffix);
             let path = PathBuf::from(name);
-            if !path.try_exists()? {
-                continue;
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+                Ok(_) => {}
             }
-            let blob = self.capture_file(&path)?;
+            let blob = self.read_file_guarded(&path, true)?.blob;
             let blob: Blob = self.store.read_struct(&blob, ObjectKind::Blob)?;
             let mut output = File::create(staged.path().join(format!("db{suffix}")))?;
             for chunk in blob.chunks {
