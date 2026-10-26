@@ -354,6 +354,19 @@ impl Catalog {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Runs `read` against one snapshot of the catalog without taking its
+    /// write lock, so several queries agree with each other while a writer
+    /// commits between them.
+    pub fn snapshot<T>(&self, read: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        if !self.conn.is_autocommit() {
+            return read();
+        }
+        self.conn.execute_batch("BEGIN")?;
+        let value = read();
+        let _ = self.conn.execute_batch("ROLLBACK");
+        value
+    }
+
     /// Runs `write` as one transaction, so its many small catalog writes cost
     /// one durable commit instead of one each. Inside an open transaction it
     /// simply runs, and the outer commit covers it.
@@ -605,26 +618,8 @@ impl Catalog {
         Ok(())
     }
 
-    pub fn pack_prefix_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
-        let _operation = crate::writer_wait::Operation::start();
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM objects
-             WHERE pack = ?1 AND offset + len + 4 <= ?2",
-            params![pack, verified_len as i64],
-            |row| row.get::<_, i64>(0),
-        )? as u64)
-    }
-
-    pub fn pack_crossing_object_count(&self, pack: &str, verified_len: u64) -> anyhow::Result<u64> {
-        let _operation = crate::writer_wait::Operation::start();
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM objects
-             WHERE pack = ?1 AND offset < ?2 AND offset + len + 4 > ?2",
-            params![pack, verified_len as i64],
-            |row| row.get::<_, i64>(0),
-        )? as u64)
-    }
-
+    /// The end of the furthest object row in `pack`: one seek down the
+    /// `objects_pack_end` index, however many rows the pack holds.
     pub(crate) fn pack_high_water(&self, pack: &str) -> anyhow::Result<u64> {
         let _operation = crate::writer_wait::Operation::start();
         Ok(self.conn.query_row(

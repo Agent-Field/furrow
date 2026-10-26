@@ -590,6 +590,9 @@ impl FurrowRepository {
         timeline: Option<&str>,
     ) -> anyhow::Result<Self> {
         let _operation = crate::writer_wait::Operation::start();
+        if timeline.is_none() {
+            ensure_watched(data_dir, root, overlay.is_some())?;
+        }
         Self::open_timeline_store(
             ObjectStore::open(data_dir.join(STORE_DIR))?,
             root,
@@ -5341,6 +5344,28 @@ fn write_family_id(
     Ok(())
 }
 
+const NOT_WATCHED: &str = "this repository is not watched; run `furrow watch` first";
+
+/// Fails as opening would for a folder the store has never watched, before the
+/// store is opened: the answer is in the workspace folder and the store's
+/// per-workspace records, so it costs no catalog or pack work. Any other
+/// outcome, including an unreadable path, is left to the open itself.
+fn ensure_watched(data_dir: &Path, root: &Path, composed: bool) -> anyhow::Result<()> {
+    let Ok(root) = root.canonicalize() else {
+        return Ok(());
+    };
+    if IdentityHome::of(composed) == IdentityHome::Workspace && read_workspace_file(&root)?.is_some()
+    {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        ObjectStore::find_workspace_in(&data_dir.join(STORE_DIR), root.as_os_str().as_bytes())?
+            .is_some(),
+        NOT_WATCHED
+    );
+    Ok(())
+}
+
 /// Where the ids that name a workspace are kept. An ordinary workspace carries
 /// them in its own `.furrow/` folder, which survives the store being moved. A
 /// composed workspace belongs to a caller that owns a store of its own and
@@ -5395,7 +5420,7 @@ impl IdentityHome {
         }
         let id = store
             .find_workspace(root.as_os_str().as_bytes())?
-            .context("this repository is not watched; run `furrow watch` first")?;
+            .context(NOT_WATCHED)?;
         if self == Self::Workspace {
             write_workspace_file(root, &id)?;
         }

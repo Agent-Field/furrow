@@ -635,8 +635,23 @@ impl ObjectStore {
     }
 
     pub fn find_workspace(&self, root: &[u8]) -> anyhow::Result<Option<String>> {
+        Self::find_workspace_in(&self.root, root)
+    }
+
+    /// As [`Self::find_workspace`], from the store directory alone: the
+    /// answer lives in the per-workspace folders, so it needs neither the
+    /// catalog nor the pack, and a store that does not exist has none.
+    pub(crate) fn find_workspace_in(
+        store_root: &Path,
+        root: &[u8],
+    ) -> anyhow::Result<Option<String>> {
         let _operation = crate::writer_wait::Operation::start();
-        for entry in fs::read_dir(self.root.join("workspaces"))? {
+        let entries = match fs::read_dir(store_root.join("workspaces")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with("t-")
             {
@@ -1206,8 +1221,39 @@ impl ObjectStore {
             }
             return Ok(());
         }
+        // A pack that ends exactly at its verified checkpoint has nothing to
+        // recover, so a reader neither queues behind a writer for the catalog
+        // and pack locks nor writes anything. Anything else, including a
+        // writer that is mid-append, falls through to the locked recovery.
+        if self.pack_is_settled(&name)? {
+            return Ok(());
+        }
         self.catalog
             .batch(|| self.recover_pack_under_catalog_lock())
+    }
+    /// Whether the active pack is exactly its checkpointed, validated prefix,
+    /// judged from one catalog snapshot without taking any lock. A `false`
+    /// only means recovery must look under the locks.
+    fn pack_is_settled(&self, pack_name: &str) -> anyhow::Result<bool> {
+        let Ok(mut pack) = File::open(self.root.join("packs").join(pack_name)) else {
+            return Ok(false);
+        };
+        let file_len = pack.metadata()?.len();
+        self.catalog.snapshot(|| {
+            let Some(checkpoint) = self.catalog.pack_checkpoint(pack_name)? else {
+                return Ok(false);
+            };
+            if checkpoint.verified_len != file_len {
+                return Ok(false);
+            }
+            let durable_len = self
+                .frontier()?
+                .map(|f| f.packs.get(pack_name).copied().unwrap_or(0));
+            if durable_len.is_some_and(|len| len != file_len) {
+                return Ok(false);
+            }
+            self.validate_checkpoint(&mut pack, file_len, &checkpoint)
+        })
     }
 
     fn recover_pack_under_catalog_lock(&self) -> anyhow::Result<()> {
@@ -1385,15 +1431,15 @@ impl ObjectStore {
         file_len: u64,
         checkpoint: &PackCheckpoint,
     ) -> anyhow::Result<bool> {
+        // Every object row ends at or before the checkpoint. A row past it
+        // means a crash between an append and the checkpoint write; a row that
+        // straddles it is a torn record. Both are a high water above
+        // `verified_len`, which is one index seek, not a scan of the pack's rows.
         if checkpoint.verified_len > file_len
-            || self.catalog.pack_prefix_object_count(
-                self.active_pack.borrow().as_str(),
-                checkpoint.verified_len,
-            )? != checkpoint.object_count
-            || self.catalog.pack_crossing_object_count(
-                self.active_pack.borrow().as_str(),
-                checkpoint.verified_len,
-            )? != 0
+            || self
+                .catalog
+                .pack_high_water(self.active_pack.borrow().as_str())?
+                > checkpoint.verified_len
         {
             return Ok(false);
         }
