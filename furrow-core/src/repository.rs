@@ -6327,6 +6327,8 @@ mod change_tracking;
 
 #[cfg(test)]
 mod perf_tests;
+#[cfg(test)]
+mod plan_prune_tests;
 
 fn capture_rules_changed(root: &Path, path: &Path) -> bool {
     changed_path_matches(root, path, POLICY_FILE_BYTES)

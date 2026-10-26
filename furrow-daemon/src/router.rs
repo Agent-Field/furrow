@@ -637,4 +637,62 @@ mod tests {
         assert_eq!(rows(), whole, "the quiet writer never rebuilt the index");
         router.close();
     }
+
+    #[test]
+    fn a_quiet_writer_removes_plans_no_caller_will_seal() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("a"), b"completed capture").unwrap();
+        let target = Target {
+            data_dir: temp.path().join("data"),
+            tree,
+            cell_dir: None,
+            timeline: Some("gone".into()),
+        };
+        let router = Router::with_maintenance(Maintenance {
+            idle: Duration::from_millis(100),
+            every: Duration::from_millis(200),
+        });
+        router
+            .submit(
+                target.clone(),
+                crate::verbs::lookup("seal").unwrap(),
+                json!({}),
+            )
+            .unwrap();
+        // The timeline never plans again, so only the writer can remove these.
+        let plans = furrow::repository::store_path(&target.data_dir)
+            .join("workspaces")
+            .join(furrow::repository::timeline_workspace_id("gone").unwrap())
+            .join("capture-plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let day_ago = std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        let abandoned: Vec<PathBuf> = (0..5)
+            .map(|n| {
+                let path = plans.join(format!("{}.json", blake3::hash(&[n]).to_hex()));
+                std::fs::write(&path, b"{}").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(day_ago)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let fresh = plans.join(format!("{}.json", blake3::hash(b"fresh").to_hex()));
+        std::fs::write(&fresh, b"{}").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while abandoned.iter().any(|path| path.exists()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            abandoned.iter().all(|path| !path.exists()),
+            "the quiet writer never removed abandoned plans"
+        );
+        assert!(fresh.exists(), "a plan a caller may still seal was removed");
+        router.close();
+    }
 }
