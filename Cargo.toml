@@ -3,7 +3,7 @@ resolver = "2"
 members = ["furrow-core", "furrow-cli", "furrow-daemon"]
 
 [workspace.package]
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.83"
 license = "Apache-2.0"
