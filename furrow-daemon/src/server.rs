@@ -10,6 +10,8 @@ use std::io::BufReader;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -60,6 +62,8 @@ impl Activity {
 
 pub struct Server {
     listener: UnixListener,
+    #[cfg(unix)]
+    socket_identity: (u64, u64),
     config: Config,
     stop: Stop,
     router: Arc<Router>,
@@ -80,10 +84,15 @@ impl Server {
         };
         let _ = fs::remove_file(&config.socket);
         let listener = UnixListener::bind(&config.socket).context("bind socket")?;
+        #[cfg(unix)]
+        let metadata =
+            fs::symlink_metadata(&config.socket).context("read bound socket identity")?;
         furrow::platform::set_mode(&config.socket, 0o600)?;
         listener.set_nonblocking(true)?;
         Ok(Some(Self {
             listener,
+            #[cfg(unix)]
+            socket_identity: (metadata.dev(), metadata.ino()),
             config,
             stop: Stop::default(),
             router: Arc::new(Router::new()),
@@ -100,16 +109,24 @@ impl Server {
     }
 
     /// Serves until stopped, signalled or idle, then finishes in-flight
-    /// requests, closes every repository and removes the socket.
+    /// requests, closes every repository and removes the socket if it still owns it.
     pub fn run(self) -> anyhow::Result<()> {
         while !self.should_exit() {
             self.wait_for_client();
             self.accept_pending();
         }
         let flushed = self.router.close_durable();
+        // A surviving daemon must not unlink a replacement created after its socket disappeared.
+        #[cfg(unix)]
+        let remove_socket = fs::symlink_metadata(&self.config.socket)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.socket_identity);
+        #[cfg(windows)]
+        let remove_socket = true;
         #[cfg(windows)]
         drop(self.listener);
-        let _ = fs::remove_file(&self.config.socket);
+        if remove_socket {
+            let _ = fs::remove_file(&self.config.socket);
+        }
         #[cfg(windows)]
         crate::signals::finished();
         flushed
