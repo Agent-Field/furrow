@@ -4775,7 +4775,9 @@ impl FurrowRepository {
     fn path_matches_entry(&self, path: &Path, entry: &TreeEntry) -> anyhow::Result<bool> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(entry.kind == EntryKind::SocketMarker);
+            }
             Err(error) => return Err(error.into()),
         };
         let file_type = metadata.file_type();
