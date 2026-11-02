@@ -48,4 +48,64 @@ fn materialize_portable_work_with_a_socket_marker() {
     );
     assert!(!destination.join(".git/fsmonitor--daemon.ipc").exists());
     assert!(source.join(".git/fsmonitor--daemon.ipc").exists());
+
+    let plan = || -> Value {
+        let output = Command::cargo_bin("furrow")
+            .unwrap()
+            .env("FURROW_DATA_DIR", &data)
+            .args(["--json", "--repo"])
+            .arg(&destination)
+            .args([
+                "rewind",
+                snapshot["snapshot"].as_str().unwrap(),
+                "--dry-run",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).unwrap()
+    };
+    assert!(plan()["changes"].as_array().unwrap().is_empty());
+    for args in [
+        vec!["watch", "--no-daemon"],
+        vec!["snap", "-m", "unchanged destination"],
+    ] {
+        Command::cargo_bin("furrow")
+            .unwrap()
+            .env("FURROW_DATA_DIR", &data)
+            .args(["--json", "--repo"])
+            .arg(&destination)
+            .args(args)
+            .assert()
+            .success();
+        assert!(plan()["changes"].as_array().unwrap().is_empty());
+    }
+
+    fs::write(destination.join("work.txt"), b"local edit\n").unwrap();
+    assert!(plan()["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["path"] == "work.txt"));
+    let marker = destination.join(".git/fsmonitor--daemon.ipc");
+    fs::write(&marker, b"local notes\n").unwrap();
+    assert!(plan()["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["path"] == ".git/fsmonitor--daemon.ipc"));
+    assert_eq!(fs::read(&marker).unwrap(), b"local notes\n");
+    fs::remove_file(&marker).unwrap();
+    std::os::unix::fs::symlink("../work.txt", &marker).unwrap();
+    assert!(plan()["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["path"] == ".git/fsmonitor--daemon.ipc"));
+    assert_eq!(
+        fs::read_link(&marker).unwrap(),
+        std::path::Path::new("../work.txt")
+    );
 }

@@ -4664,8 +4664,14 @@ impl FurrowRepository {
         }
         path.extend_from_slice(&name);
 
+        if before.is_none()
+            && after
+                .as_ref()
+                .is_some_and(|entry| entry.kind == EntryKind::SocketMarker)
+        {
+            return Ok(());
+        }
         let parent_selected = selected(&path, selections);
-        #[cfg(windows)]
         let change_start = changes.len();
         if parent_selected {
             changes.push(RewindChange {
@@ -4696,12 +4702,15 @@ impl FurrowRepository {
         // A changed child needs its container's recorded time restored too.
         // Prune the container only when recursive comparison found no actual
         // child changes, including when nested stale times changed tree IDs.
-        #[cfg(windows)]
-        if parent_selected
-            && changes.len() == change_start + 1
-            && directory_metadata_matches(before.as_ref(), after.as_ref())
-        {
-            changes.pop();
+        if parent_selected && changes.len() == change_start + 1 {
+            let metadata_matches =
+                directory_target_only_difference(before.as_ref(), after.as_ref());
+            #[cfg(windows)]
+            let metadata_matches =
+                metadata_matches || directory_metadata_matches(before.as_ref(), after.as_ref());
+            if metadata_matches {
+                changes.pop();
+            }
         }
         Ok(())
     }
