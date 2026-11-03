@@ -102,6 +102,104 @@ fn p1_complete_but_corrupt_uncommitted_trailer_is_removed() {
 }
 
 #[test]
+#[cfg(unix)]
+fn capture_plan_skips_permission_denied_directories() {
+    // Root bypasses mode bits, so it cannot reproduce this permission failure.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let f = Fixture::new();
+    let blocked = f.root.join("blocked");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("hidden"), b"unreadable subtree").unwrap();
+    let mut repo = f.attach("chat");
+    let permissions = fs::metadata(&blocked).unwrap().permissions();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0)).unwrap();
+    assert_eq!(
+        fs::read_dir(&blocked).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let result = repo.capture_plan(None);
+    // Regaining access must not expand the screened capture scope.
+    fs::set_permissions(&blocked, permissions).unwrap();
+    let capture = result
+        .as_ref()
+        .ok()
+        .map(|plan| repo.seal_plan(None, SnapshotTrigger::AgentRun, &plan.token));
+    let plan = result.expect("an unreadable directory must not abort capture planning");
+    capture
+        .unwrap()
+        .expect("the plan must remain usable for capture");
+    let root = f.root.canonicalize().unwrap();
+    assert!(plan.full);
+    assert!(plan.paths.contains(&root.join("a")));
+    assert!(!plan
+        .paths
+        .iter()
+        .any(|path| path.starts_with(root.join("blocked"))));
+    let json = serde_json::to_value(&plan).unwrap();
+    assert_eq!(json["skipped"], serde_json::json!([root.join("blocked")]));
+}
+
+#[test]
+#[cfg(unix)]
+fn capture_plan_skips_permission_denied_entries_in_a_delta() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let f = Fixture::new();
+    let blocked = f.root.join("blocked");
+    fs::create_dir_all(blocked.join("nested")).unwrap();
+    fs::write(blocked.join("nested/hidden"), b"unreadable entry").unwrap();
+    let mut repo = f.attach("chat");
+    seal(&mut repo);
+    let permissions = fs::metadata(&blocked).unwrap().permissions();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0)).unwrap();
+    let result = repo.capture_plan(Some(&[
+        PathBuf::from("a"),
+        PathBuf::from("blocked/nested/hidden"),
+    ]));
+    let capture = result
+        .as_ref()
+        .ok()
+        .map(|plan| repo.seal_plan(None, SnapshotTrigger::AgentRun, &plan.token));
+    fs::set_permissions(&blocked, permissions).unwrap();
+    let plan = result.expect("an inaccessible entry must not abort a delta plan");
+    let root = f.root.canonicalize().unwrap();
+    assert!(!plan.full);
+    assert_eq!(plan.paths, [root.join("a")]);
+    assert_eq!(plan.skipped, [root.join("blocked/nested/hidden")]);
+    capture
+        .unwrap()
+        .expect("skipped ancestors must not be read");
+}
+
+#[test]
+fn capture_plan_propagates_non_permission_io_errors() {
+    let f = Fixture::new();
+    let mut repo = f.attach("chat");
+    seal(&mut repo);
+    let error = repo
+        .capture_plan(Some(&[PathBuf::from("a/child")]))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::NotADirectory
+    );
+}
+
+#[test]
+fn capture_plan_without_skips_preserves_the_wire_format() {
+    let f = Fixture::new();
+    let plan = f.attach("chat").capture_plan(None).unwrap();
+    let json = serde_json::to_value(&plan).unwrap();
+    assert!(json.get("skipped").is_none());
+    let decoded: CapturePlan = serde_json::from_value(json).unwrap();
+    assert!(decoded.skipped.is_empty());
+    assert_eq!(decoded.paths, plan.paths);
+}
+
+#[test]
 fn p3_first_delta_plan_reports_full_fallback_and_refuses_new_candidates() {
     // P3/C9: an uninitialized index cannot turn a screened delta into an unscreened walk.
     let f = Fixture::new();
