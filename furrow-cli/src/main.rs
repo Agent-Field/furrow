@@ -614,7 +614,8 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Estimate => {
-            let estimate = FurrowRepository::estimate(&cli.repo)?;
+            let estimate =
+                FurrowRepository::estimate_timeline(&cli.repo, selected_timeline().as_deref())?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&estimate)?);
             } else {

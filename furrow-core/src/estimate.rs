@@ -9,7 +9,7 @@ use anyhow::Context;
 use rusqlite::{params, Connection, Transaction};
 use serde::Serialize;
 use std::fs::{self, File, ReadDir};
-use std::io::BufReader;
+use std::io::{BufReader, Seek};
 use std::path::{Path, PathBuf};
 
 const MAX_DEPTH: usize = 1_024;
@@ -29,9 +29,49 @@ pub struct CaptureEstimate {
     pub projected_new_chunk_bytes: u64,
 }
 
+enum WorkspaceSelection {
+    None,
+    Selected(String),
+    Ambiguous,
+}
+
 pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEstimate> {
     let root = root.canonicalize()?;
-    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root)?;
+    let workspace = if crate::chunker::journal_chunks_enabled() {
+        workspace_for_root(&root, store)?
+    } else {
+        WorkspaceSelection::None
+    };
+    calculate_with_workspace(&root, store, workspace)
+}
+
+/// A selected workspace supplies the same recorded layout that capture would consider.
+pub fn calculate_for_workspace(
+    root: &Path,
+    store: &ObjectStore,
+    workspace: &str,
+) -> anyhow::Result<CaptureEstimate> {
+    let root = root.canonicalize()?;
+    let binding = store.workspace_data_dir(workspace);
+    // Onboarding can select a timeline before it is attached, so only its own matching binding permits reuse.
+    let recorded = if crate::chunker::journal_chunks_enabled()
+        && !binding.join("detached").exists()
+        && binding.join("root.path").is_file()
+        && fs::read(binding.join("root.path"))? == root.as_os_str().as_encoded_bytes()
+    {
+        WorkspaceSelection::Selected(workspace.to_owned())
+    } else {
+        WorkspaceSelection::None
+    };
+    calculate_with_workspace(&root, store, recorded)
+}
+
+fn calculate_with_workspace(
+    root: &Path,
+    store: &ObjectStore,
+    workspace: WorkspaceSelection,
+) -> anyhow::Result<CaptureEstimate> {
+    let policy = CapturePolicy::load(root)?.resolve_gitignore(root)?;
     let database = tempfile::NamedTempFile::new()?;
     let mut connection = Connection::open(database.path())?;
     connection.execute_batch(
@@ -44,6 +84,10 @@ pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEsti
             present INTEGER NOT NULL
          ) WITHOUT ROWID;",
     )?;
+    if crate::chunker::journal_chunks_enabled() {
+        // Layout fallback needs a rollback journal to discard partially counted legacy chunks.
+        connection.pragma_update(None, "journal_mode", "DELETE")?;
+    }
     let transaction = connection.transaction()?;
     let mut estimate = CaptureEstimate {
         files: 0,
@@ -58,7 +102,7 @@ pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEsti
         deduplicated_chunk_bytes: 0,
         projected_new_chunk_bytes: 0,
     };
-    let mut stack = vec![Frame::open(root.clone())?];
+    let mut stack = vec![Frame::open(root.to_owned())?];
     let mut savepoint = 0_u64;
     while !stack.is_empty() {
         let next = stack.last_mut().expect("stack is not empty").entries.next();
@@ -68,7 +112,7 @@ pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEsti
         };
         let entry = entry?;
         let path = entry.path();
-        let relative_bytes = crate::platform::path_bytes(path.strip_prefix(&root)?);
+        let relative_bytes = crate::platform::path_bytes(path.strip_prefix(root)?);
         let relative = relative_bytes.as_slice();
         if relative == b".furrow/workspace-id" {
             continue;
@@ -84,7 +128,24 @@ pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEsti
             anyhow::ensure!(stack.len() < MAX_DEPTH, "workspace tree exceeds safe depth");
             stack.push(Frame::open(path)?);
         } else if file_type.is_file() {
-            let usage = estimate_file(&transaction, store, &path, &mut savepoint)?;
+            let usage = if matches!(workspace, WorkspaceSelection::Ambiguous)
+                && crate::chunker::is_journal(&path)
+            {
+                // Capture may repair another layout, so no assumed chunk representation can safely deduplicate this payload.
+                estimate.projected_new_chunk_bytes = estimate
+                    .projected_new_chunk_bytes
+                    .saturating_add(metadata.len());
+                FileUsage {
+                    logical_bytes: metadata.len(),
+                    physical_bytes: metadata.blocks().saturating_mul(512),
+                }
+            } else {
+                let recorded = match &workspace {
+                    WorkspaceSelection::Selected(id) => Some((id.as_str(), relative)),
+                    _ => None,
+                };
+                estimate_file(&transaction, store, &path, recorded, &mut savepoint)?
+            };
             estimate.files = estimate.files.saturating_add(1);
             estimate.logical_bytes = estimate.logical_bytes.saturating_add(usage.logical_bytes);
             estimate.physical_bytes = estimate.physical_bytes.saturating_add(usage.physical_bytes);
@@ -105,7 +166,9 @@ pub fn calculate(root: &Path, store: &ObjectStore) -> anyhow::Result<CaptureEsti
     )?;
     estimate.unique_chunks = unique_chunks as u64;
     estimate.deduplicated_chunk_bytes = deduplicated as u64;
-    estimate.projected_new_chunk_bytes = projected as u64;
+    estimate.projected_new_chunk_bytes = estimate
+        .projected_new_chunk_bytes
+        .saturating_add(projected as u64);
     Ok(estimate)
 }
 
@@ -130,26 +193,38 @@ fn estimate_file(
     transaction: &Transaction<'_>,
     store: &ObjectStore,
     path: &Path,
+    recorded: Option<(&str, &[u8])>,
     sequence: &mut u64,
 ) -> anyhow::Result<FileUsage> {
     for _ in 0..3 {
         *sequence = sequence.saturating_add(1);
         let savepoint = format!("file_{}", *sequence);
         transaction.execute_batch(&format!("SAVEPOINT {savepoint}"))?;
-        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let before = file.metadata()?;
-        let mut stream = ChunkStream::new(BufReader::with_capacity(256 * 1024, file));
-        while let Some(chunk) = stream.next_chunk()? {
-            let id = object_id(ObjectKind::Chunk, &chunk);
-            let inserted = transaction.execute(
-                "INSERT OR IGNORE INTO chunks(id, len, present) VALUES(?1, ?2, 0)",
-                params![id.as_slice(), chunk.len() as i64],
-            )?;
-            if inserted != 0 && store.contains_object(&id)? {
-                transaction.execute(
-                    "UPDATE chunks SET present = 1 WHERE id = ?1",
-                    params![id.as_slice()],
-                )?;
+        let mut reused = false;
+        if crate::chunker::journal_chunks_enabled() && crate::chunker::is_journal(path) {
+            if let Some((workspace, relative)) = recorded {
+                if let Some((_, expected)) =
+                    crate::blob::recorded_for_path(store, workspace, relative, before.len())?
+                {
+                    reused =
+                        crate::blob::visit_matching_chunks(&expected, &mut file, |chunk, _| {
+                            record_chunk(transaction, store, &chunk.id, chunk.len as usize)
+                        })?;
+                    if !reused {
+                        transaction.execute_batch(&format!("ROLLBACK TO {savepoint}"))?;
+                        file.rewind()?;
+                    }
+                }
+            }
+        }
+        if !reused {
+            let mut stream =
+                ChunkStream::for_path(BufReader::with_capacity(256 * 1024, file), path);
+            while let Some(chunk) = stream.next_chunk()? {
+                let id = object_id(ObjectKind::Chunk, &chunk);
+                record_chunk(transaction, store, &id, chunk.len())?;
             }
         }
         let after = fs::metadata(path)?;
@@ -166,6 +241,49 @@ fn estimate_file(
         "file changed repeatedly while estimating: {}",
         path.display()
     )
+}
+
+fn record_chunk(
+    transaction: &Transaction<'_>,
+    store: &ObjectStore,
+    id: &crate::model::ObjectId,
+    len: usize,
+) -> anyhow::Result<()> {
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO chunks(id, len, present) VALUES(?1, ?2, 0)",
+        params![id.as_slice(), len as i64],
+    )?;
+    if inserted != 0 && store.contains_object(id)? {
+        transaction.execute(
+            "UPDATE chunks SET present = 1 WHERE id = ?1",
+            params![id.as_slice()],
+        )?;
+    }
+    Ok(())
+}
+
+// Root-only estimates can reuse a baseline only when it unambiguously identifies capture's workspace.
+fn workspace_for_root(root: &Path, store: &ObjectStore) -> anyhow::Result<WorkspaceSelection> {
+    let root = root.as_os_str().as_encoded_bytes();
+    let mut workspace = None;
+    for entry in fs::read_dir(store.root().join("workspaces"))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && !entry.path().join("detached").exists()
+            && entry.path().join("root.path").is_file()
+            && fs::read(entry.path().join("root.path"))? == root
+        {
+            if workspace.is_some() {
+                // Several baselines can make different reuse decisions, so overestimate rather than guess.
+                return Ok(WorkspaceSelection::Ambiguous);
+            }
+            workspace = Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(match workspace {
+        Some(id) => WorkspaceSelection::Selected(id),
+        None => WorkspaceSelection::None,
+    })
 }
 
 fn stable(before: &fs::Metadata, after: &fs::Metadata) -> bool {

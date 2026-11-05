@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize as SerdeSerialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1041,10 +1041,22 @@ impl FurrowRepository {
     }
 
     pub fn estimate(root: &Path) -> anyhow::Result<CaptureEstimate> {
+        Self::estimate_timeline(root, None)
+    }
+
+    pub fn estimate_timeline(
+        root: &Path,
+        timeline: Option<&str>,
+    ) -> anyhow::Result<CaptureEstimate> {
         let _operation = crate::writer_wait::Operation::start();
         let root = root.canonicalize()?;
         let store = ObjectStore::open(data_root()?.join(STORE_DIR))?;
-        estimate::calculate(&root, &store)
+        match timeline.filter(|_| crate::chunker::journal_chunks_enabled()) {
+            Some(timeline) => {
+                estimate::calculate_for_workspace(&root, &store, &timeline_workspace_id(timeline)?)
+            }
+            None => estimate::calculate(&root, &store),
+        }
     }
 
     pub fn claims(&self) -> anyhow::Result<Vec<ClaimRecord>> {
@@ -4401,7 +4413,7 @@ impl FurrowRepository {
             if self.capture_scope.borrow().is_some() && self.logical_path(path).is_some() {
                 self.check_capture_path(path, &fs::symlink_metadata(path)?)?;
             }
-            let file = if no_follow {
+            let mut file = if no_follow {
                 open_sqlite_capture_file(path)?
             } else {
                 File::open(path).with_context(|| format!("open {}", path.display()))?
@@ -4415,7 +4427,65 @@ impl FurrowRepository {
             let xattrs = self.capture_xattrs(path)?;
             #[cfg(windows)]
             let identity = crate::platform::handle_identity(&file)?;
-            let chunked = self.store_chunks(file)?;
+            let mut reused = None;
+            let mut sqlite = false;
+            if crate::chunker::journal_chunks_enabled() && crate::chunker::is_journal(path) {
+                if let Some(relative) = self.logical_path(path) {
+                    if let Some((id, expected)) = crate::blob::recorded_for_path(
+                        &self.store,
+                        &self.workspace_id,
+                        &relative,
+                        before.len(),
+                    )? {
+                        let mut first = true;
+                        let mut missing = false;
+                        if crate::blob::visit_matching_chunks(
+                            &expected,
+                            &mut file,
+                            |chunk, bytes| {
+                                if first {
+                                    sqlite = sqlite_adapter::has_header(bytes);
+                                    first = false;
+                                }
+                                if !self.store.contains_object(&chunk.id)? {
+                                    missing = true;
+                                }
+                                Ok(())
+                            },
+                        )? {
+                            // A matching prefix must not repair a layout whose later chunks differ.
+                            if missing {
+                                if !stable_metadata(&before, &file.metadata()?)
+                                    || !stable_metadata(&before, &fs::metadata(path)?)
+                                {
+                                    continue;
+                                }
+                                file.rewind()?;
+                                if !crate::blob::visit_matching_chunks(
+                                    &expected,
+                                    &mut file,
+                                    |chunk, bytes| {
+                                        if !self.store.contains_object(&chunk.id)? {
+                                            self.store.put_bytes(ObjectKind::Chunk, bytes)?;
+                                        }
+                                        Ok(())
+                                    },
+                                )? {
+                                    continue;
+                                }
+                            }
+                            reused = Some(id);
+                        } else {
+                            file.rewind()?;
+                        }
+                    }
+                }
+            }
+            let chunked = if reused.is_none() {
+                Some(self.store_chunks(file, path)?)
+            } else {
+                None
+            };
             let after = if no_follow {
                 fs::symlink_metadata(path)
             } else {
@@ -4423,19 +4493,24 @@ impl FurrowRepository {
             }
             .with_context(|| format!("restat {}", path.display()))?;
             if stable_metadata(&before, &after) {
-                let blob = self.store.put_struct(
-                    ObjectKind::Blob,
-                    &Blob {
-                        chunks: chunked.chunks,
-                        total_len: chunked.total_len,
-                    },
-                )?;
+                let blob = if let Some(chunked) = chunked {
+                    sqlite = chunked.sqlite;
+                    self.store.put_struct(
+                        ObjectKind::Blob,
+                        &Blob {
+                            chunks: chunked.chunks,
+                            total_len: chunked.total_len,
+                        },
+                    )?
+                } else {
+                    reused.expect("verified journal Blob")
+                };
                 return Ok(FileRead {
                     blob,
                     xattrs,
                     #[cfg(windows)]
                     identity,
-                    sqlite: chunked.sqlite,
+                    sqlite,
                     stat: after,
                     read_at_nanos,
                 });
@@ -4447,8 +4522,8 @@ impl FurrowRepository {
         )
     }
 
-    fn store_chunks(&self, file: File) -> anyhow::Result<Chunked> {
-        let mut stream = ChunkStream::new(BufReader::with_capacity(256 * 1024, file));
+    fn store_chunks(&self, file: File, path: &Path) -> anyhow::Result<Chunked> {
+        let mut stream = ChunkStream::for_path(BufReader::with_capacity(256 * 1024, file), path);
         let mut chunked = Chunked::default();
         while let Some(chunk) = stream.next_chunk()? {
             let id = self.store.put_bytes(ObjectKind::Chunk, &chunk)?;
@@ -4813,8 +4888,35 @@ impl FurrowRepository {
                 return Ok(false);
             }
             let blob = self.capture_file(path)?;
-            if Some(blob) != entry.target {
-                return Ok(false);
+            #[cfg(test)]
+            journal_tests::after_verification_capture();
+            let expected = entry.target.context("file has no Blob")?;
+            if blob != expected {
+                let file = File::open(path)?;
+                let before = file.metadata()?;
+                if !before.is_file() || !stable_metadata(&metadata, &before) {
+                    return Ok(false);
+                }
+                #[cfg(windows)]
+                let identity = crate::platform::handle_identity(&file)?;
+                let reader = BufReader::new(&file);
+                #[cfg(test)]
+                let reader = journal_tests::VerificationReader(reader);
+                if !crate::blob::matches_reader(&self.store, &expected, None, reader)? {
+                    return Ok(false);
+                }
+                let after = file.metadata()?;
+                let named = fs::symlink_metadata(path)?;
+                if !named.is_file()
+                    || !stable_metadata(&before, &after)
+                    || !stable_metadata(&after, &named)
+                {
+                    return Ok(false);
+                }
+                #[cfg(windows)]
+                if crate::platform::path_identity(path)? != Some(identity) {
+                    return Ok(false);
+                }
             }
         }
         if matches!(entry.kind, EntryKind::File | EntryKind::Directory)
@@ -6336,6 +6438,8 @@ mod capture_plan;
 pub use capture_plan::{prune_abandoned_plans, CapturePlan};
 mod change_tracking;
 
+#[cfg(test)]
+mod journal_tests;
 #[cfg(test)]
 mod perf_tests;
 #[cfg(test)]
