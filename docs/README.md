@@ -8,6 +8,9 @@ and two-machine sync.
 [Performance](performance.md) — reproducible benchmark methodology, current
 measurements, and regression gates.
 
+[Journal chunking](journal-chunks.md) — filename selection, append amplification,
+profile comparisons, compatibility, and the two-step rollout.
+
 ## Repository Notes
 
 - UI dependency notices remain at

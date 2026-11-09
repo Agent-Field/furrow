@@ -1,5 +1,6 @@
 #[cfg(unix)]
 pub mod archive;
+mod blob;
 pub mod budget;
 pub mod bundle;
 pub mod catalog;

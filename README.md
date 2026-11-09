@@ -157,6 +157,18 @@ The load-bearing decisions, for readers who want them:
 
 Reproducible performance harness — `cargo bench -p furrow-core --bench engine` (regression ceilings and a 1M-file reference profile are available). Methodology and historical baselines: [docs/performance.md](docs/performance.md).
 
+The optional journal profile is built but off by default. Set
+`FURROW_JOURNAL_CHUNKS=1` only after every computer has this release's
+profile-independent verification. Capture and `estimate` then
+select case-insensitive `.jsonl` or `.ndjson` filename suffixes for a 32 KiB
+minimum, 64 KiB gear target and 128 KiB maximum, also closing at newlines after
+the minimum. With the switch off, every file uses the existing 64/256/1024 KiB
+profile. With the switch on, unchanged journals retain their existing Blob IDs
+across profile changes; the first edit to an old journal can export its full
+new representation.
+Formats, measurements and the two-step rollout are in the
+[journal chunking change notes](docs/journal-chunks.md).
+
 ## Honest edges
 
 - Cross-machine divergence is preserved and reported, not yet auto-merged — smoothest today: one writer at a time, hand off after convergence.
