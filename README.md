@@ -139,6 +139,7 @@ The CLI is the agent API: `--json` provides command results with stable snapshot
 | `furrow events --follow` | Stream seals/conflicts/merges as NDJSON |
 | `furrow mcp` | Serve furrow over MCP for harnesses that prefer it |
 | `furrow exchange export\|published\|want\|import` | Exchange sealed object frames and track publication ledgers |
+| `furrow exchange want --path [--range]\|peek\|read` | Read one file of a relayed snapshot without fetching the rest ([docs](docs/path-read.md)) |
 | `furrow exchange rebind\|materialize` | Follow a moved workspace or restore an imported head |
 | `furrow serve --socket <path>` | Serve engine requests over a local Unix socket |
 

@@ -4,7 +4,9 @@
 use clap::Subcommand;
 use furrow::exchange::export::DEFAULT_MAX_FRAME;
 use furrow::exchange::keys::keys_from_env;
+use furrow::exchange::open_store;
 use furrow::exchange::ops::{self, ImportMode};
+use furrow::exchange::path::{ByteRange, PathError};
 use furrow::repository::data_root;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -34,10 +36,47 @@ pub enum Exchange {
     },
     /// List the remote ids still needed to complete a snapshot locally.
     /// Reads FURROW_CELL_KEY and FURROW_DEDUP_SECRET.
+    ///
+    /// With --path, walks only the snapshot, the trees on the path and the
+    /// path's own object, and with --range also the chunks covering those
+    /// bytes: reading one file (a chat's transcript) must not cost the rest of
+    /// the snapshot (its project folder).
     Want {
         #[arg(long)]
         head: String,
+        /// Scope the walk to this path of the snapshot, e.g. `.cell/transcript.jsonl`.
+        #[arg(long)]
+        path: Option<String>,
+        /// With --path on a file: also want the chunks overlapping bytes
+        /// [S,E). `S:` means to the end of the file.
+        #[arg(long, value_name = "S:E", requires = "path")]
+        range: Option<String>,
     },
+    /// Describe one path of a snapshot from held objects only, never the
+    /// network: a file's length and chunk ranges (held or not), or a
+    /// directory's entries. A missing index object is `"code":"incomplete"`.
+    Peek {
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        path: String,
+    },
+    /// Write exactly bytes [S,E) of one file of a snapshot from held chunks
+    /// into --out, restoring nothing else. A missing chunk is
+    /// `"code":"incomplete"`.
+    Read {
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long, value_name = "S:E")]
+        range: String,
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+    },
+    /// The verbs this engine has, so a caller can tell a feature is absent
+    /// rather than broken.
+    Capabilities,
     /// Verify and store the objects in an inbox, one file per remote id.
     /// Reads FURROW_CELL_KEY and FURROW_DEDUP_SECRET.
     Import {
@@ -76,7 +115,18 @@ pub enum Exchange {
 }
 
 pub fn run(verb: Exchange, repo: &Path, json: bool) -> anyhow::Result<()> {
-    let ok = execute(verb, repo)?;
+    let ok = match execute(verb, repo) {
+        Ok(ok) => ok,
+        // A path refusal is a JSON object a caller matches by its code, so it
+        // is the whole of stderr rather than behind anyhow's `Error: `.
+        Err(error) => match error.downcast_ref::<PathError>() {
+            Some(refusal) => {
+                eprintln!("{refusal}");
+                std::process::exit(1);
+            }
+            None => return Err(error),
+        },
+    };
     if json {
         println!("{ok}");
     } else {
@@ -104,7 +154,42 @@ fn execute(verb: Exchange, repo: &Path) -> anyhow::Result<Value> {
         Exchange::Published { ledger, frames } => {
             ops::record_published(&data_dir, &ledger, &frames)
         }
-        Exchange::Want { head } => ops::wanted(&data_dir, &keys_from_env()?, &head),
+        Exchange::Want {
+            head,
+            path: None,
+            range: _,
+        } => ops::wanted(&data_dir, &keys_from_env()?, &head),
+        Exchange::Want {
+            head,
+            path: Some(path),
+            range,
+        } => ops::wanted_path_from_store(
+            &open_store(&data_dir)?,
+            &keys_from_env()?,
+            &head,
+            &path,
+            range.as_deref().map(ByteRange::parse).transpose()?,
+        ),
+        Exchange::Peek { head, path } => ops::peek_from_store(
+            &open_store(&data_dir)?,
+            keys_from_env().ok().as_ref(),
+            &head,
+            &path,
+        ),
+        Exchange::Read {
+            head,
+            path,
+            range,
+            out,
+        } => ops::read_from_store(
+            &open_store(&data_dir)?,
+            keys_from_env().ok().as_ref(),
+            &head,
+            &path,
+            ByteRange::parse(&range)?,
+            &out,
+        ),
+        Exchange::Capabilities => Ok(ops::capabilities()),
         Exchange::Import {
             head,
             inbox,
@@ -149,6 +234,12 @@ fn describe(ok: &Value) -> String {
     }
     if let Some(recorded) = ok.get("recorded") {
         return format!("Recorded {recorded} objects");
+    }
+    if let Some(bytes) = ok.get("bytes") {
+        return format!("Wrote {bytes} bytes");
+    }
+    if ok.get("verbs").is_some() || ok.get("kind").is_some() {
+        return ok.to_string();
     }
     if let Some(imported) = ok.get("imported") {
         return format!("Imported {imported} objects");

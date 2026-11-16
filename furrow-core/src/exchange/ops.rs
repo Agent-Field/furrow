@@ -6,8 +6,9 @@ use super::export::{published, ExportJob};
 use super::fetch::{want, Import};
 use super::ledger::Ledger;
 use super::open_store;
+use super::path::{self, want_path, ByteRange};
 use crate::model::{id_hex, parse_id};
-use crate::sealer::{CellSealer, Keys};
+use crate::sealer::{CellSealer, Keys, Sealer};
 use crate::store::ObjectStore;
 use anyhow::Context;
 use serde_json::{json, Value};
@@ -211,4 +212,73 @@ fn moved_path(path: &Path) -> anyhow::Result<PathBuf> {
             Ok(moved_path(parent)?.join(name))
         }
     }
+}
+
+/// `want --path [--range]` as JSON: the same `{"want": [rid, ...]}` answer as
+/// the whole-snapshot `want`, but scoped to one path's spine and, with a
+/// range, to the chunks covering it. Reading a remote chat must not cost its
+/// project folder; see [`super::path`] for why the scope stays this narrow.
+pub fn wanted_path_from_store(
+    store: &ObjectStore,
+    keys: &Keys,
+    head: &str,
+    path: &str,
+    range: Option<ByteRange>,
+) -> anyhow::Result<Value> {
+    let rids = want_path(
+        store,
+        &CellSealer::new(keys),
+        parse_id(head)?,
+        path.as_bytes(),
+        range,
+    )?;
+    Ok(json!({"want": rids.iter().map(id_hex).collect::<Vec<_>>()}))
+}
+
+/// `peek` as JSON. Keys are optional: with them an `incomplete` refusal also
+/// names the remote id to fetch.
+pub fn peek_from_store(
+    store: &ObjectStore,
+    keys: Option<&Keys>,
+    head: &str,
+    path: &str,
+) -> anyhow::Result<Value> {
+    let sealer = keys.map(CellSealer::new);
+    path::peek(
+        store,
+        sealer.as_ref().map(|sealer| sealer as &dyn Sealer),
+        parse_id(head)?,
+        path.as_bytes(),
+    )
+}
+
+/// `read` as JSON: `{"bytes": n}` after writing exactly that range to `out`.
+pub fn read_from_store(
+    store: &ObjectStore,
+    keys: Option<&Keys>,
+    head: &str,
+    path: &str,
+    range: ByteRange,
+    out: &Path,
+) -> anyhow::Result<Value> {
+    let sealer = keys.map(CellSealer::new);
+    path::read(
+        store,
+        sealer.as_ref().map(|sealer| sealer as &dyn Sealer),
+        parse_id(head)?,
+        path.as_bytes(),
+        range,
+        out,
+    )
+}
+
+/// What this engine can do, for a caller deciding whether a feature that
+/// needs a verb is present (absent, not broken, when it is not). A caller
+/// gates on a verb name here rather than on a version number.
+pub fn capabilities() -> Value {
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "verbs": ["export", "published", "want", "import", "materialize", "rebind",
+                  "want-path", "peek", "read"],
+    })
 }
