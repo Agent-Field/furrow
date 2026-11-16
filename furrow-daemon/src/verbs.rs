@@ -5,6 +5,7 @@ use crate::handle::Handle;
 use anyhow::Context;
 use furrow::exchange::keys::parse_secret;
 use furrow::exchange::ops::{self, ImportMode};
+use furrow::exchange::path::ByteRange;
 use furrow::model::id_hex;
 use furrow::sealer::Keys;
 use serde::Deserialize;
@@ -18,7 +19,7 @@ pub trait Verb: Sync {
 
 /// Every verb that works on a store.
 pub fn lookup(name: &str) -> Option<&'static dyn Verb> {
-    const VERBS: [&dyn Verb; 11] = [
+    const VERBS: [&dyn Verb; 14] = [
         &Seal,
         &CapturePlan,
         &SyncStore,
@@ -30,6 +31,9 @@ pub fn lookup(name: &str) -> Option<&'static dyn Verb> {
         &Want,
         &Import,
         &Materialize,
+        &Peek,
+        &Read,
+        &Capabilities,
     ];
     VERBS.into_iter().find(|verb| verb.name() == name)
 }
@@ -286,8 +290,44 @@ struct Want;
 #[derive(Deserialize)]
 struct WantArgs {
     head: String,
+    /// Scopes the walk to one path's spine; absent is the whole snapshot.
+    #[serde(default)]
+    path: Option<String>,
+    /// With `path`: also the chunks overlapping `[start, end)`. `end` absent
+    /// means to the end of the file.
+    #[serde(default)]
+    start: Option<u64>,
+    #[serde(default)]
+    end: Option<u64>,
     #[serde(flatten)]
     keys: KeyArgs,
+}
+
+impl KeyArgs {
+    /// The keys when both were sent: `peek` and `read` work without them and
+    /// only use them to name the remote id an `incomplete` refusal wants.
+    fn optional(self) -> anyhow::Result<Option<Keys>> {
+        if self.cell_key.is_none() && self.dedup.is_none() {
+            return Ok(None);
+        }
+        self.keys().map(Some)
+    }
+}
+
+/// The byte range the daemon's `start`/`end` fields spell, as the command
+/// line's `--range S:E`.
+fn range_of(start: Option<u64>, end: Option<u64>) -> anyhow::Result<Option<ByteRange>> {
+    match (start, end) {
+        (None, None) => Ok(None),
+        (start, end) => {
+            let start = start.unwrap_or(0);
+            anyhow::ensure!(
+                end.is_none_or(|end| end >= start),
+                "bad arguments: end before start"
+            );
+            Ok(Some(ByteRange { start, end }))
+        }
+    }
 }
 
 impl Verb for Want {
@@ -297,7 +337,23 @@ impl Verb for Want {
 
     fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
         let a: WantArgs = secret_args(value)?;
-        ops::wanted_from_store(handle.store()?, &a.keys.keys()?, &a.head)
+        let keys = a.keys.keys()?;
+        match a.path {
+            None => {
+                anyhow::ensure!(
+                    a.start.is_none() && a.end.is_none(),
+                    "bad arguments: a range needs a path"
+                );
+                ops::wanted_from_store(handle.store()?, &keys, &a.head)
+            }
+            Some(path) => ops::wanted_path_from_store(
+                handle.store()?,
+                &keys,
+                &a.head,
+                &path,
+                range_of(a.start, a.end)?,
+            ),
+        }
     }
 }
 
@@ -363,5 +419,83 @@ impl Verb for Materialize {
             answer["held"] = serde_json::to_value(held)?;
         }
         Ok(answer)
+    }
+}
+
+/// `peek` over the socket: the same answer as `furrow peek`, from held
+/// objects only. Opening a remote chat reads its transcript's layout this way
+/// instead of downloading its project folder.
+struct Peek;
+
+#[derive(Deserialize)]
+struct PeekArgs {
+    head: String,
+    path: String,
+    #[serde(flatten)]
+    keys: KeyArgs,
+}
+
+impl Verb for Peek {
+    fn name(&self) -> &'static str {
+        "peek"
+    }
+
+    fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
+        let a: PeekArgs = secret_args(value)?;
+        let keys = a.keys.optional()?;
+        ops::peek_from_store(handle.store()?, keys.as_ref(), &a.head, &a.path)
+    }
+}
+
+/// `read` over the socket: writes one byte range of one file from held
+/// chunks and restores nothing else, as `furrow read` does.
+struct Read;
+
+#[derive(Deserialize)]
+struct ReadArgs {
+    head: String,
+    path: String,
+    #[serde(default)]
+    start: Option<u64>,
+    #[serde(default)]
+    end: Option<u64>,
+    out: PathBuf,
+    #[serde(flatten)]
+    keys: KeyArgs,
+}
+
+impl Verb for Read {
+    fn name(&self) -> &'static str {
+        "read"
+    }
+
+    fn run(&self, handle: &mut Handle, value: Value) -> anyhow::Result<Value> {
+        let a: ReadArgs = secret_args(value)?;
+        let keys = a.keys.optional()?;
+        let range = range_of(a.start, a.end)?.unwrap_or(ByteRange {
+            start: 0,
+            end: None,
+        });
+        ops::read_from_store(
+            handle.store()?,
+            keys.as_ref(),
+            &a.head,
+            &a.path,
+            range,
+            &a.out,
+        )
+    }
+}
+
+/// What this engine can do; see `ops::capabilities`.
+struct Capabilities;
+
+impl Verb for Capabilities {
+    fn name(&self) -> &'static str {
+        "capabilities"
+    }
+
+    fn run(&self, _handle: &mut Handle, _value: Value) -> anyhow::Result<Value> {
+        Ok(ops::capabilities())
     }
 }

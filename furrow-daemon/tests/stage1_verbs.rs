@@ -526,3 +526,91 @@ extern "system" {
     fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
     fn SetStdHandle(kind: u32, handle: *mut std::ffi::c_void) -> i32;
 }
+
+/// `want` with a path and range, `peek` and `read` over the socket answer as
+/// the command line does: only the path's objects are wanted, the read writes
+/// exactly the range, and a refusal's `err` is one JSON object naming
+/// `"code":"incomplete"`.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
+#[test]
+fn path_want_peek_and_read_over_socket() {
+    let daemon = Daemon::start();
+    let (a, b) = (daemon.store("a"), daemon.store("b"));
+    a.fill();
+    let mut client = daemon.connect();
+    let head = client.seal(&a);
+    let report = client.export(&a, &head, &a.root.join("outbox"));
+    let mut relay = BTreeMap::new();
+    for path in frame_files(&report) {
+        for object in frame::decode(&fs::read(path).unwrap()).unwrap().1 {
+            relay.insert(id_hex(&object.rid), object.bytes.to_vec());
+        }
+    }
+    let caps = client.ok("capabilities", &b, json!({}));
+    assert!(caps["verbs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "peek"));
+
+    let mut peek = cell_args();
+    peek["head"] = json!(head);
+    peek["path"] = json!("big.bin");
+    let refused = client.call("peek", &b, peek.clone());
+    let refusal: Value = serde_json::from_str(refused["err"].as_str().unwrap()).unwrap();
+    assert_eq!(refusal["code"], "incomplete");
+
+    let mut want = peek.clone();
+    want["start"] = json!(1000);
+    want["end"] = json!(2000);
+    let inbox = b.root.join("inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    let mut fetched = 0;
+    loop {
+        let rids = client.ok("want", &b, want.clone())["want"].clone();
+        let rids = rids.as_array().unwrap();
+        if rids.is_empty() {
+            break;
+        }
+        for rid in rids {
+            let rid = rid.as_str().unwrap();
+            fs::write(inbox.join(rid), &relay[rid]).unwrap();
+            fetched += 1;
+        }
+        let mut import = cell_args();
+        import["head"] = json!(head);
+        import["inbox"] = json!(inbox);
+        import["ledger"] = json!(LEDGER);
+        client.ok("import", &b, import);
+    }
+    // Snapshot, root tree, the blob and the one chunk holding bytes 1000..2000.
+    assert_eq!(fetched, 4);
+    assert!(fetched < relay.len());
+
+    let layout = client.ok("peek", &b, peek);
+    assert_eq!(layout["len"], 1 << 20);
+    let held: Vec<bool> = layout["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["held"].as_bool().unwrap())
+        .collect();
+    assert_eq!(held.iter().filter(|h| **h).count(), 1);
+    assert!(held[0]);
+
+    let out = b.root.join("range.bin");
+    let mut read = want.clone();
+    read["out"] = json!(out);
+    assert_eq!(client.ok("read", &b, read.clone())["bytes"], 1000);
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        &fs::read(a.tree.join("big.bin")).unwrap()[1000..2000]
+    );
+    read["start"] = json!((1 << 20) - 10);
+    read["end"] = Value::Null;
+    let refused = client.call("read", &b, read);
+    let refusal: Value = serde_json::from_str(refused["err"].as_str().unwrap()).unwrap();
+    assert_eq!(refusal["code"], "incomplete");
+    assert_eq!(refusal["kind"], "chunk");
+    daemon.finish();
+}

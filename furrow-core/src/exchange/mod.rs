@@ -10,6 +10,7 @@ pub mod keys;
 pub mod ledger;
 pub mod materialize;
 pub mod ops;
+pub mod path;
 pub mod survey;
 
 use crate::repository::store_path;

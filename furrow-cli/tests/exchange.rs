@@ -465,3 +465,176 @@ fn materialize_answers_the_paths_it_set_apart_on_a_folding_file_system() {
         assert_eq!(fs::read(plain.join("Readme.md")).unwrap(), b"lower\n");
     }
 }
+
+/// The path-scoped verbs through the real binary, spelled as codeaf spells
+/// them (`furrow --json want …`, no `exchange` word): reading a chat's
+/// transcript out of a relayed snapshot fetches the transcript's spine and
+/// chunks only, and a refusal is one JSON object on stderr.
+// P2/W2/W6: the behavioural contract also runs on native Windows.
+#[test]
+fn a_transcript_reads_through_the_binary_without_its_project() {
+    let src = source();
+    let temp = src.temp.path();
+    let transcript: Vec<u8> = (0..30_000)
+        .flat_map(|n| format!("{{\"turn\":{n},\"text\":\"{}\"}}\n", n * 7919).into_bytes())
+        .collect();
+    fs::write(src.cell.join("transcript.jsonl"), &transcript).unwrap();
+    let mut repo =
+        FurrowRepository::open_composed_in(&src.data, &src.tree, Some(src.cell.clone())).unwrap();
+    let head = id_hex(&repo.snapshot(None, SnapshotTrigger::Manual).unwrap());
+    drop(repo);
+    let (b_data, b_tree, inbox, outbox) = (
+        temp.join("b-data"),
+        temp.join("b-tree"),
+        temp.join("inbox"),
+        temp.join("outbox"),
+    );
+    fs::create_dir_all(&b_tree).unwrap();
+    fs::create_dir_all(&inbox).unwrap();
+    let sent = run(
+        &src.data,
+        &src.tree,
+        &[
+            "export",
+            "--head",
+            &head,
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--ledger",
+            LEDGER,
+        ],
+    );
+    // The relay: every object by rid.
+    let mut relay = BTreeMap::new();
+    for frame_info in sent["frames"].as_array().unwrap() {
+        let bytes = fs::read(frame_info["path"].as_str().unwrap()).unwrap();
+        for object in frame::decode(&bytes).unwrap().1 {
+            relay.insert(hex::encode(object.rid), object.bytes.to_vec());
+        }
+    }
+    let bare = |args: &[&str]| {
+        let mut command = Command::cargo_bin("furrow").unwrap();
+        command
+            .env("FURROW_DATA_DIR", &b_data)
+            .env("FURROW_NO_DAEMON", "1")
+            .env("FURROW_CELL_KEY", CELL_KEY)
+            .env("FURROW_DEDUP_SECRET", DEDUP)
+            .current_dir(&b_tree)
+            .arg("--json")
+            .args(args);
+        command
+    };
+    let ok = |args: &[&str]| -> Value {
+        serde_json::from_slice(&bare(args).assert().success().get_output().stdout).unwrap()
+    };
+    let caps = ok(&["capabilities"]);
+    assert!(caps["verbs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|verb| verb == "read"));
+
+    // Before anything is held, peek refuses with one JSON object on stderr.
+    let refused = bare(&["peek", "--head", &head, "--path", ".cell/transcript.jsonl"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let refusal: Value = serde_json::from_slice(&refused).unwrap();
+    assert_eq!(refusal["code"], "incomplete");
+    assert_eq!(refusal["kind"], "snapshot");
+    assert!(relay.contains_key(refusal["want"].as_str().unwrap()));
+
+    let tail = format!("{}:{}", transcript.len() - 500, transcript.len());
+    let mut fetched = 0;
+    loop {
+        let want = ok(&[
+            "want",
+            "--head",
+            &head,
+            "--path",
+            ".cell/transcript.jsonl",
+            "--range",
+            &tail,
+        ]);
+        let want = want["want"].as_array().unwrap();
+        if want.is_empty() {
+            break;
+        }
+        for rid in want {
+            let rid = rid.as_str().unwrap();
+            fs::write(inbox.join(rid), &relay[rid]).unwrap();
+            fetched += 1;
+        }
+        ok(&[
+            "import",
+            "--head",
+            &head,
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--ledger",
+            LEDGER,
+        ]);
+    }
+    assert!(fetched <= 6, "{fetched} objects for the transcript's tail");
+    assert!(
+        fetched < relay.len() / 2,
+        "the project folder was not fetched"
+    );
+
+    let peek = ok(&["peek", "--head", &head, "--path", ".cell/transcript.jsonl"]);
+    assert_eq!(peek["kind"], "file");
+    assert_eq!(peek["len"], transcript.len() as u64);
+    let chunks = peek["chunks"].as_array().unwrap();
+    assert_eq!(chunks.last().unwrap()["held"], true);
+    assert_eq!(chunks[0]["held"], chunks.len() == 1);
+
+    let out = temp.join("tail.jsonl");
+    let wrote = ok(&[
+        "read",
+        "--head",
+        &head,
+        "--path",
+        ".cell/transcript.jsonl",
+        "--range",
+        &tail,
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(wrote["bytes"], 500);
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        &transcript[transcript.len() - 500..]
+    );
+
+    let dir = ok(&["peek", "--head", &head, "--path", ".cell"]);
+    assert!(dir["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == "transcript.jsonl" && entry["kind"] == "file"));
+
+    let refused = bare(&[
+        "read",
+        "--head",
+        &head,
+        "--path",
+        ".cell/transcript.jsonl",
+        "--range",
+        "0:10",
+        "--out",
+        temp.join("head.jsonl").to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .get_output()
+    .stderr
+    .clone();
+    assert!(chunks.len() > 1, "the fixture spans chunks");
+    {
+        let refusal: Value = serde_json::from_slice(&refused).unwrap();
+        assert_eq!(refusal["code"], "incomplete");
+        assert_eq!(refusal["kind"], "chunk");
+    }
+}
