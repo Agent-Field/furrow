@@ -305,7 +305,13 @@ Evaluation runs in process and needs no Git executable. Tracked
 files are captured even when a pattern matches. Linked worktrees and nested
 repositories use their own index and rules. A missing or unreadable index gives
 no tracked exceptions, and invalid index names are never followed. Outside a
-Git working tree the directive does nothing. On Windows, native paths are
+Git working tree the directive does nothing. Which enclosing repository the
+rules come from follows Git's own discovery boundary: `GIT_CEILING_DIRECTORIES`
+fences the search upward exactly as `git rev-parse` sees it — a ceiling equal
+to the workspace fences nothing, an ancestor ceiling stops discovery before
+entering that ancestor, and a ceiling inside a repository leaves that
+repository's rules in force. The daemon applies each request's own ceiling, so
+a standalone capture and a daemon capture of the same workspace agree. On Windows, native paths are
 normalized to `/` for matching, Git's case setting is honored (with a filesystem
 probe when absent), and absolute Windows `core.excludesFile` paths are supported.
 Shared timelines and indexed exceptions use the same capture rules on NTFS.

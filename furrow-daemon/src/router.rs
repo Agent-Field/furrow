@@ -457,6 +457,7 @@ mod tests {
             tree,
             cell_dir: None,
             timeline: Some("sync".into()),
+            ceiling: None,
         };
         let router = Arc::new(Router::new());
         router
@@ -599,6 +600,7 @@ mod tests {
             tree,
             cell_dir: None,
             timeline: Some("heal".into()),
+            ceiling: None,
         };
         let router = Router::with_maintenance(Maintenance {
             idle: Duration::from_millis(100),
@@ -653,6 +655,7 @@ mod tests {
             tree,
             cell_dir: None,
             timeline: Some("gone".into()),
+            ceiling: None,
         };
         let router = Router::with_maintenance(Maintenance {
             idle: Duration::from_millis(100),

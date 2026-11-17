@@ -34,7 +34,8 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
     let root = root
         .canonicalize()
         .with_context(|| format!("open {}", root.display()))?;
-    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root)?;
+    let ceiling = crate::gitignore::ceiling_from_env();
+    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root, ceiling.as_deref())?;
     let mut candidates = Vec::new();
 
     for include in includes {
@@ -122,7 +123,8 @@ pub fn discover(root: &Path, includes: &[PathBuf]) -> anyhow::Result<ShrinkPlan>
 
 pub fn apply(root: &Path, plan: &ShrinkPlan) -> anyhow::Result<()> {
     let root = root.canonicalize()?;
-    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root)?;
+    let ceiling = crate::gitignore::ceiling_from_env();
+    let policy = CapturePolicy::load(&root)?.resolve_gitignore(&root, ceiling.as_deref())?;
     for candidate in &plan.candidates {
         let relative = validate_relative(&candidate.relative)?;
         refuse_internal_path(&relative)?;

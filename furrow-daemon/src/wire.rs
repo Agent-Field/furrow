@@ -22,6 +22,13 @@ pub struct Target {
     pub cell_dir: Option<PathBuf>,
     #[serde(default)]
     pub timeline: Option<String>,
+    /// The client's `GIT_CEILING_DIRECTORIES`, bounding Git's policy
+    /// discovery exactly as the client's own environment would: absent keeps
+    /// the daemon's environment (older clients), an empty value is no ceiling
+    /// at all. It is part of `Target` because `Target` keys the retained
+    /// repositories, and a different ceiling means different Git rules.
+    #[serde(default)]
+    pub ceiling: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,4 +104,45 @@ pub fn parse_request(line: &str) -> Result<Request, Response> {
         ));
     }
     Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ceiling rides the wire Target: absent keeps the daemon's
+    /// environment for older clients, an empty value is no ceiling at all,
+    /// and a value names the client's own `GIT_CEILING_DIRECTORIES`.
+    #[test]
+    fn w1_ceiling_wire_semantics() {
+        let seal = |target: serde_json::Value| {
+            let mut request = serde_json::json!({"V": 1, "id": 1, "verb": "seal", "args": {}});
+            request["target"] = target;
+            request.to_string()
+        };
+        let target = |ceiling: Option<&str>| {
+            let mut target = serde_json::json!({"data_dir": "/d", "tree": "/t"});
+            if let Some(ceiling) = ceiling {
+                target["ceiling"] = serde_json::Value::String(ceiling.to_owned());
+            }
+            target
+        };
+        let request = parse_request(&seal(target(None))).unwrap();
+        assert_eq!(
+            request.target.as_ref().unwrap().ceiling,
+            None,
+            "absent ceiling keeps the daemon's environment"
+        );
+        let request = parse_request(&seal(target(Some("")))).unwrap();
+        assert_eq!(
+            request.target.as_ref().unwrap().ceiling,
+            Some(String::new()),
+            "an empty ceiling is no ceiling at all"
+        );
+        let request = parse_request(&seal(target(Some("/x/boundary")))).unwrap();
+        assert_eq!(
+            request.target.as_ref().unwrap().ceiling,
+            Some("/x/boundary".to_owned())
+        );
+    }
 }

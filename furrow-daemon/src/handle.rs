@@ -42,6 +42,16 @@ impl Handle {
         Ok(store)
     }
 
+    /// Git's discovery boundary for this target's policy: a client that
+    /// names its ceiling decides the boundary exactly as its own capture
+    /// would; an older client keeps the daemon's environment.
+    fn ceiling(&self) -> Option<std::ffi::OsString> {
+        match &self.target.ceiling {
+            Some(value) => Some(std::ffi::OsString::from(value)),
+            None => std::env::var_os("GIT_CEILING_DIRECTORIES"),
+        }
+    }
+
     pub fn target(&self) -> &Target {
         &self.target
     }
@@ -61,6 +71,7 @@ impl Handle {
                 &target.tree,
                 target.cell_dir.clone(),
                 target.timeline.as_deref(),
+                self.ceiling(),
             )?);
             self.repo
                 .as_ref()
@@ -79,6 +90,7 @@ impl Handle {
                 &t.tree,
                 t.timeline.as_deref(),
                 t.cell_dir.clone(),
+                self.ceiling(),
             )?);
             self.repo
                 .as_ref()

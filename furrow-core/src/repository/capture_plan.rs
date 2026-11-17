@@ -249,7 +249,7 @@ impl FurrowRepository {
                 .transpose()?
                 .unwrap_or(false)
         {
-            crate::gitignore::control_identity(&self.root)?
+            crate::gitignore::control_identity(&self.root, self.git_ceiling.as_deref())?
         } else {
             Vec::new()
         };

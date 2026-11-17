@@ -4,7 +4,7 @@ mod sparse;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -260,6 +260,81 @@ fn git_dir(root: &Path) -> Option<PathBuf> {
     (directory.join("HEAD").is_file() && common.join("objects").is_dir()).then_some(directory)
 }
 
+/// The value of `GIT_CEILING_DIRECTORIES` as the capture's environment carries it.
+pub(crate) fn ceiling_from_env() -> Option<OsString> {
+    std::env::var_os("GIT_CEILING_DIRECTORIES")
+}
+
+/// Git's discovery fence for `root`: the longest `GIT_CEILING_DIRECTORIES`
+/// entry that is a proper ancestor of `root`. Entries are separated by `:`
+/// (`;` on Windows); empty and relative entries are dropped, and absolute
+/// entries are canonicalized — nonexistent ones dropped — until an empty entry
+/// turns canonicalization off for the rest of the list. A ceiling equal to
+/// `root` fences nothing, and no fence leaves every ancestor discoverable.
+fn discovery_fence(root: &Path, ceiling: Option<&OsStr>) -> Option<PathBuf> {
+    let raw = ceiling?;
+    let separator = if cfg!(windows) { b';' } else { b':' };
+    let root_bytes = root.as_os_str().as_encoded_bytes();
+    let mut canonicalize = true;
+    let mut fence: Option<Vec<u8>> = None;
+    for entry in raw.as_encoded_bytes().split(|byte| *byte == separator) {
+        if entry.is_empty() {
+            canonicalize = false;
+            continue;
+        }
+        let path = bytes_path(entry);
+        if !path.is_absolute() {
+            continue;
+        }
+        let candidate = if canonicalize {
+            // Git resolves symlinks and `..` in ceiling entries, so a macOS
+            // `/var` alias fences like its `/private/var` spelling; an entry
+            // that does not exist cannot fence anything.
+            let Ok(canonical) = fs::canonicalize(&path) else {
+                continue;
+            };
+            canonical.as_os_str().as_encoded_bytes().to_vec()
+        } else {
+            entry.to_vec()
+        };
+        if proper_ancestor(root_bytes, &candidate)
+            && fence
+                .as_ref()
+                .is_none_or(|longest| candidate.len() > longest.len())
+        {
+            fence = Some(candidate);
+        }
+    }
+    fence.map(|bytes| bytes_path(&bytes))
+}
+
+/// `path` lies strictly inside `prefix` as Git matches ceiling entries: the
+/// prefix bytes compare equal and the next byte is the separator, so `/x/y`
+/// never matches `/xyz`. The filesystem root `/` matches every absolute path
+/// and the walk never tests it as a repository root.
+fn proper_ancestor(path: &[u8], prefix: &[u8]) -> bool {
+    path.len() > prefix.len()
+        && path.starts_with(prefix)
+        && (prefix == b"/" || path[prefix.len()] == b'/')
+}
+
+/// The enclosing repository Git itself would find for `root`: the nearest
+/// directory from `root` upward — bounded by the ceiling, never the ceiling
+/// itself — with a Git directory, as `(worktree, gitdir)`.
+fn enclosing_repository(root: &Path, ceiling: Option<&OsStr>) -> Option<(PathBuf, PathBuf)> {
+    let fence = discovery_fence(root, ceiling);
+    root.ancestors()
+        .take_while(|p| {
+            fence.as_ref().is_none_or(|f| {
+                proper_ancestor(
+                    p.as_os_str().as_encoded_bytes(),
+                    f.as_os_str().as_encoded_bytes(),
+                )
+            })
+        })
+        .find_map(|p| git_dir(p).map(|g| (p.to_owned(), g)))
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct ConfigKey {
     environment: Vec<(OsString, OsString)>,
@@ -448,11 +523,8 @@ impl Rules {
         &self.root
     }
 
-    pub(crate) fn discover(root: &Path) -> anyhow::Result<Option<Self>> {
-        let Some((repo_root, dir)) = root
-            .ancestors()
-            .find_map(|p| git_dir(p).map(|g| (p.to_owned(), g)))
-        else {
+    pub(crate) fn discover(root: &Path, ceiling: Option<&OsStr>) -> anyhow::Result<Option<Self>> {
+        let Some((repo_root, dir)) = enclosing_repository(root, ceiling) else {
             return Ok(None);
         };
         let repo = Arc::new(Repository::open(&repo_root, &dir)?);
@@ -662,8 +734,8 @@ fn is_git_control_path(relative: &[u8]) -> bool {
 }
 
 /// Includes, global excludes and environment overrides can change without an event inside the worktree.
-pub(crate) fn control_identity(root: &Path) -> anyhow::Result<Vec<u8>> {
-    let Some(gitdir) = root.ancestors().find_map(git_dir) else {
+pub(crate) fn control_identity(root: &Path, ceiling: Option<&OsStr>) -> anyhow::Result<Vec<u8>> {
+    let Some((_repo_root, gitdir)) = enclosing_repository(root, ceiling) else {
         return Ok(Vec::new());
     };
     let common = fs::read_to_string(gitdir.join("commondir"))
@@ -778,5 +850,187 @@ mod tests {
         assert!(!paths.contains(b"one.log".as_slice(), false));
         assert!(paths.contains(b"two.log".as_slice(), false));
         assert_eq!(INDEX_READS.with(|reads| reads.get()), before + 2);
+    }
+
+    /// Runs Git itself against the same ceiling value discovery receives, so
+    /// the fence must agree with `rev-parse --show-toplevel` on every shape:
+    /// unset, equal, ancestor, at the repository root, multiple, nonexistent,
+    /// trailing slash, relative, empty-entry and symlinked entries.
+    #[test]
+    #[cfg(unix)]
+    fn g2_discovery_agrees_with_git_rev_parse_across_ceiling_shapes() {
+        let temp = tempfile::tempdir().unwrap();
+        // Canonical from the start: on macOS /var is a symlink to /private/var,
+        // and the differential compares byte strings on both sides.
+        let case = fs::canonicalize(temp.path()).unwrap();
+        let repo = case.join("repo");
+        let boundary = repo.join("boundary");
+        let work = boundary.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let output = std::process::Command::new("git")
+            .env("HOME", &case)
+            .arg("-C")
+            .arg(&case)
+            .args(["init", "-q", repo.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let rev_parse = |ceiling: Option<&OsStr>| -> Option<PathBuf> {
+            let mut command = std::process::Command::new("git");
+            command
+                .env("HOME", &case)
+                .arg("-C")
+                .arg(&work)
+                .args(["rev-parse", "--show-toplevel"]);
+            match ceiling {
+                Some(value) => {
+                    command.env("GIT_CEILING_DIRECTORIES", value);
+                }
+                None => {
+                    command.env_remove("GIT_CEILING_DIRECTORIES");
+                }
+            }
+            let output = command.output().unwrap();
+            if output.status.success() {
+                Some(fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim()).unwrap())
+            } else {
+                // Git failure is the fence itself, not a licence to discover.
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("not a git repository"),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                None
+            }
+        };
+        let ours = |ceiling: Option<&OsStr>| -> Option<PathBuf> {
+            Rules::discover(&work, ceiling).unwrap().map(|rules| {
+                rules
+                    .repositories
+                    .keys()
+                    .next()
+                    .expect("a discovered rule set names its repository")
+                    .clone()
+            })
+        };
+
+        let inert_or_fence = [
+            (None, "unset"),
+            (
+                Some(work.clone().into_os_string()),
+                "equal to the workspace",
+            ),
+            (Some(boundary.clone().into_os_string()), "ancestor"),
+            (
+                Some(repo.clone().into_os_string()),
+                "at the repository root",
+            ),
+            (
+                Some(format!("/nonexistent:{}", boundary.display()).into()),
+                "nonexistent entry before a real one",
+            ),
+            (
+                Some(format!("/nonexistent:{}", work.display()).into()),
+                "nonexistent entry alone",
+            ),
+            (
+                Some(format!("{}/", boundary.display()).into()),
+                "trailing slash",
+            ),
+            (
+                Some(format!("relative:{}", boundary.display()).into()),
+                "relative entry dropped",
+            ),
+        ];
+        for (ceiling, shape) in inert_or_fence {
+            let found = ours(ceiling.as_deref());
+            assert_eq!(
+                found,
+                rev_parse(ceiling.as_deref()),
+                "{shape}: discovery disagreed with git"
+            );
+        }
+
+        // Symlinked entries canonicalize like Git's, and an empty first entry
+        // turns canonicalization off for the rest of the list.
+        let alias = case.join("alias");
+        std::os::unix::fs::symlink(&boundary, &alias).unwrap();
+        let alias_shapes = [
+            (Some(alias.clone().into_os_string()), "symlinked"),
+            (
+                Some(format!(":{}", alias.display()).into()),
+                "empty entry disables canonicalization",
+            ),
+            (
+                Some(format!("/nonexistent:{}", alias.display()).into()),
+                "nonexistent before a symlinked entry",
+            ),
+        ];
+        for (ceiling, shape) in alias_shapes {
+            let found = ours(ceiling.as_deref());
+            assert_eq!(
+                found,
+                rev_parse(ceiling.as_deref()),
+                "{shape}: discovery disagreed with git"
+            );
+        }
+    }
+
+    /// A repository discovered inside the fence keeps applying its own rules:
+    /// ignored confidential content stays out while tracked exceptions stay
+    /// in, and the control identity names the same repository as without a
+    /// fence. A ceiling at the repository root fences it entirely.
+    #[test]
+    #[cfg(unix)]
+    fn g3_ceiling_inside_the_boundary_preserves_tracked_exceptions() {
+        let temp = tempfile::tempdir().unwrap();
+        let case = fs::canonicalize(temp.path()).unwrap();
+        let repo = case.join("boundary");
+        let work = repo.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .env("HOME", &case)
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&case, &["init", "-q", repo.to_str().unwrap()]);
+        fs::write(repo.join(".gitignore"), "bad*\n").unwrap();
+        fs::write(work.join("bad.ignored"), "x").unwrap();
+        fs::write(work.join("bad.tracked"), "y").unwrap();
+        fs::write(work.join("kept"), "z").unwrap();
+        git(&repo, &["add", "-f", "work/bad.tracked"]);
+
+        // The fence sits above the repository, so the repository is discoverable.
+        let fenced = Some(case.into_os_string());
+        assert!(Rules::discover(&work, fenced.as_deref()).unwrap().is_some());
+        let mut rules = Rules::discover(&work, fenced.as_deref()).unwrap().unwrap();
+        assert!(rules.excludes(b"bad.ignored"));
+        assert!(!rules.excludes(b"bad.tracked"));
+        assert!(!rules.excludes(b"kept"));
+        let identity = control_identity(&work, fenced.as_deref()).unwrap();
+        assert!(!identity.is_empty());
+        assert_eq!(identity, control_identity(&work, None).unwrap());
+
+        // A ceiling equal to the enclosing repository fences it entirely.
+        assert!(Rules::discover(&work, Some(repo.as_os_str()))
+            .unwrap()
+            .is_none());
+        assert!(control_identity(&work, Some(repo.as_os_str()))
+            .unwrap()
+            .is_empty());
     }
 }

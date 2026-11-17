@@ -2551,9 +2551,15 @@ fn daemon_seal(
         }
     };
     let cell_dir = options.overlay.map(std::path::absolute).transpose()?;
+    // The client's own ceiling decides Git's discovery boundary for its
+    // capture; an empty value is no ceiling at all. A value that is not valid
+    // Unicode travels lossily, which no real `GIT_CEILING_DIRECTORIES` needs.
+    let ceiling = std::env::var_os("GIT_CEILING_DIRECTORIES")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let request = serde_json::json!({
         "V": 1, "id": 1, "verb": "seal",
-        "target": {"data_dir": data_dir, "tree": root.canonicalize()?, "cell_dir": cell_dir, "timeline": selected_timeline()},
+        "target": {"data_dir": data_dir, "tree": root.canonicalize()?, "cell_dir": cell_dir, "timeline": selected_timeline(), "ceiling": ceiling},
         "args": {"agent": agent, "turn": turn, "changed": options.changed, "plan": plan, "durable": durable}
     });
     furrow_daemon::client::exchange(stream, &request)

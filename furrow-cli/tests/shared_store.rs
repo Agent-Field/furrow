@@ -78,6 +78,10 @@ impl Rig {
             tree: self.tree.clone(),
             cell_dir: None,
             timeline: Some(timeline.to_owned()),
+            // As the real client: its own `GIT_CEILING_DIRECTORIES` decides
+            // the capture's discovery boundary.
+            ceiling: std::env::var_os("GIT_CEILING_DIRECTORIES")
+                .map(|value| value.to_string_lossy().into_owned()),
         }
     }
 }
@@ -1269,5 +1273,330 @@ fn ordinary_sqlite_capture_refuses_symlink_sidecars_without_touching_targets() {
         assert_eq!(fs::read(&outside).ok(), outside_before);
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(fs::read_link(&sidecar).unwrap(), outside);
+    }
+}
+
+/// The issue #27 fixture: a workspace inside an enclosing repository whose
+/// `.gitignore` names `boundary/work/`, with Git's ceiling set at the
+/// boundary. `workspace_policy`/`cell_policy` decide which `.furrowpolicy`
+/// carries the `gitignore` directive.
+fn ceiling_case(
+    workspace_policy: bool,
+    cell_policy: bool,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    // Canonical from the start: on macOS /var is a symlink to /private/var,
+    // and the ceiling compares byte strings.
+    let case = fs::canonicalize(temp.path()).unwrap();
+    let repo = case.join("repo");
+    let work = repo.join("boundary").join("work");
+    let cell = case.join("cell");
+    let restored = case.join("restored");
+    let restored_cell = case.join("restored-cell");
+    let data = case.join("store");
+    let home = case.join("home");
+    for dir in [&work, &cell, &restored, &restored_cell, &data, &home] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join(".gitignore"), "boundary/work/\n").unwrap();
+    if workspace_policy {
+        fs::write(work.join(".furrowpolicy"), "gitignore\n").unwrap();
+    }
+    if cell_policy {
+        fs::write(cell.join(".furrowpolicy"), "gitignore\n").unwrap();
+    }
+    fs::write(work.join("words.txt"), "FURROW_CEILING_SAVED_WORDS\n").unwrap();
+    fs::write(cell.join("meta.json"), "{\"id\":\"ceiling-fixture\"}\n").unwrap();
+    let boundary = repo.join("boundary");
+    let probe = Command::new("git")
+        .arg("-C")
+        .arg(&work)
+        .env("HOME", &home)
+        .env("GIT_CEILING_DIRECTORIES", &boundary)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .unwrap();
+    assert!(
+        !probe.status.success(),
+        "the fixture itself must be fenced: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    (
+        temp,
+        work,
+        cell,
+        restored,
+        restored_cell,
+        data,
+        home,
+        boundary,
+        case,
+    )
+}
+
+/// One `furrow` run with the fixture's store, a clean home, and the
+/// capture's own `GIT_CEILING_DIRECTORIES`; the last NDJSON line is the answer.
+fn ceiling_cli(
+    data: &Path,
+    home: &Path,
+    ceiling: Option<&std::ffi::OsStr>,
+    args: &[&std::ffi::OsStr],
+) -> Value {
+    let mut command = Command::new(furrow_exe());
+    command
+        .env("FURROW_DATA_DIR", data)
+        .env("HOME", home)
+        .env("FURROW_NO_DAEMON", "1");
+    match ceiling {
+        Some(value) => {
+            command.env("GIT_CEILING_DIRECTORIES", value);
+        }
+        None => {
+            command.env_remove("GIT_CEILING_DIRECTORIES");
+        }
+    }
+    command.arg("--json").args(args);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "furrow {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter::<Value>()
+        .map(Result::unwrap)
+        .last()
+        .unwrap()
+}
+
+/// The explicit workspace `gitignore` directive must not let the enclosing
+/// repository's rules — fenced off by the ceiling — hide the workspace's
+/// words or its `.cell/` metadata: through native `snap --cell-dir` and
+/// `materialize --head --cell-dir`, with the directive in either or both
+/// policies, and the control without any directive.
+#[test]
+fn ceiling_fence_keeps_an_explicit_workspace_policy_whole() {
+    for (workspace_policy, cell_policy) in
+        [(true, false), (false, true), (true, true), (false, false)]
+    {
+        let (_temp, work, cell, restored, restored_cell, data, home, boundary, _case) =
+            ceiling_case(workspace_policy, cell_policy);
+        let ceiling = boundary.as_os_str();
+        ceiling_cli(
+            &data,
+            &home,
+            Some(ceiling),
+            &["--repo".as_ref(), work.as_os_str(), "watch".as_ref()],
+        );
+        let answer = ceiling_cli(
+            &data,
+            &home,
+            Some(ceiling),
+            &[
+                "--repo".as_ref(),
+                work.as_os_str(),
+                "snap".as_ref(),
+                "--cell-dir".as_ref(),
+                cell.as_os_str(),
+            ],
+        );
+        let snapshot = answer["snapshot"].as_str().unwrap().to_owned();
+        ceiling_cli(
+            &data,
+            &home,
+            Some(ceiling),
+            &[
+                "--repo".as_ref(),
+                restored.as_os_str(),
+                "materialize".as_ref(),
+                "--head".as_ref(),
+                snapshot.as_ref(),
+                "--cell-dir".as_ref(),
+                restored_cell.as_os_str(),
+            ],
+        );
+        let what = match (workspace_policy, cell_policy) {
+            (true, false) => "workspace policy",
+            (false, true) => "cell policy",
+            (true, true) => "both policies",
+            (false, false) => "no directive",
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            fs::read_to_string(restored.join("words.txt")).unwrap(),
+            "FURROW_CEILING_SAVED_WORDS\n",
+            "{what}: the saved words were not captured"
+        );
+        assert_eq!(
+            fs::read_to_string(restored_cell.join("meta.json")).unwrap(),
+            "{\"id\":\"ceiling-fixture\"}\n",
+            "{what}: the sealed metadata was not captured"
+        );
+    }
+}
+
+/// The same fixture through the daemon's real writer router: the client's
+/// ceiling travels in the wire Target, the capture keeps the whole
+/// workspace, and materialization through the daemon restores both markers.
+#[test]
+fn ceiling_fence_holds_through_daemon_capture_and_materialization() {
+    let (_temp, work, cell, restored, restored_cell, data, _home, boundary, _case) =
+        ceiling_case(true, false);
+    let router = Router::new();
+    let capture = Target {
+        data_dir: data.clone(),
+        tree: work,
+        cell_dir: Some(cell),
+        timeline: Some("ceiling".into()),
+        ceiling: Some(boundary.to_string_lossy().into_owned()),
+    };
+    let answer = router
+        .submit(
+            capture,
+            verbs::lookup("seal").unwrap(),
+            serde_json::json!({"agent": "agent"}),
+        )
+        .unwrap();
+    let snapshot = answer["snapshot"].as_str().unwrap().to_owned();
+    let restore = Target {
+        data_dir: data,
+        tree: restored,
+        cell_dir: Some(restored_cell),
+        timeline: None,
+        ceiling: Some(boundary.to_string_lossy().into_owned()),
+    };
+    router
+        .submit(
+            restore,
+            verbs::lookup("materialize").unwrap(),
+            serde_json::json!({"head": snapshot}),
+        )
+        .unwrap();
+    router.close();
+}
+
+/// A repository the fence still allows — at or below the ceiling — keeps
+/// applying its rules: the ignored confidential marker stays out, the
+/// included marker is captured and restored, for a fence above the
+/// repository, a ceiling equal to the workspace, and no ceiling at all.
+#[test]
+fn ceiling_inside_the_boundary_still_excludes_ignored_content() {
+    for shape in ["above", "equal", "none"] {
+        let temp = tempfile::tempdir().unwrap();
+        let case = fs::canonicalize(temp.path()).unwrap();
+        let repo = case.join("repo");
+        let data = case.join("store");
+        let home = case.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        fs::write(repo.join(".furrowpolicy"), "gitignore\n").unwrap();
+        fs::write(repo.join(".gitignore"), "confidential*\n").unwrap();
+        fs::write(repo.join("confidential.txt"), "secret").unwrap();
+        fs::write(repo.join("included.txt"), "fine").unwrap();
+        let ceiling = match shape {
+            "above" => Some(case.clone().into_os_string()),
+            "equal" => Some(repo.clone().into_os_string()),
+            _ => None,
+        };
+        let mut command = Command::new(furrow_exe());
+        command
+            .env("FURROW_DATA_DIR", &data)
+            .env("HOME", &home)
+            .env("FURROW_NO_DAEMON", "1")
+            .arg("--json")
+            .arg("--repo")
+            .arg(&repo)
+            .args(["hook", "turn-end"]);
+        match ceiling.as_deref() {
+            Some(value) => {
+                command.env("GIT_CEILING_DIRECTORIES", value);
+            }
+            None => {
+                command.env_remove("GIT_CEILING_DIRECTORIES");
+            }
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot = serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<Value>()
+            .map(Result::unwrap)
+            .last()
+            .unwrap()["snapshot"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let held = FurrowRepository::open_timeline_in(&data, &repo, None, None).unwrap();
+        let captured = captured_files(&held, &snapshot);
+        assert!(
+            captured.iter().any(|path| path.ends_with("included.txt")),
+            "{shape}: the included marker was not captured"
+        );
+        assert!(
+            !captured
+                .iter()
+                .any(|path| path.ends_with("confidential.txt")),
+            "{shape}: ignored confidential content was captured"
+        );
+        // The included marker restores; the ignored one never entered the snapshot.
+        let restored = case.join("restored");
+        fs::create_dir_all(&restored).unwrap();
+        let output = Command::new(furrow_exe())
+            .env("FURROW_DATA_DIR", &data)
+            .env("HOME", &home)
+            .env("FURROW_NO_DAEMON", "1")
+            .arg("--json")
+            .arg("--repo")
+            .arg(&restored)
+            .args(["materialize", "--head", &snapshot])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(restored.join("included.txt")).unwrap(),
+            "fine"
+        );
+        assert!(!restored.join("confidential.txt").exists());
     }
 }

@@ -63,6 +63,11 @@ pub struct FurrowRepository {
     overlay: Option<Overlay>,
     path_index: std::cell::RefCell<Option<PathIndex>>,
     capture_scope: std::cell::RefCell<Option<capture_plan::PreparedPlan>>,
+    /// Git's discovery boundary for policy, as this capture source saw
+    /// `GIT_CEILING_DIRECTORIES`: the daemon names its request's value, every
+    /// other construction reads the process environment. Threaded through the
+    /// constructors because recovery runs while they build the repository.
+    git_ceiling: Option<OsString>,
     #[cfg(windows)]
     previous_modes: std::cell::RefCell<BTreeMap<Vec<u8>, (EntryKind, u32)>>,
     // One-shot callers have no tracker; a failed daemon watch remains an explicit full-walk fallback.
@@ -482,7 +487,13 @@ impl FurrowRepository {
             "workspace cannot contain the furrow store"
         );
         let store = ObjectStore::open(store_root)?;
-        Self::attach_using_store(root, timeline, overlay, store)
+        Self::attach_using_store(
+            root,
+            timeline,
+            overlay,
+            store,
+            crate::gitignore::ceiling_from_env(),
+        )
     }
 
     /// Attaches another timeline using this thread's already-open store and pack handles.
@@ -493,18 +504,27 @@ impl FurrowRepository {
         overlay: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let _operation = crate::writer_wait::Operation::start();
-        Self::attach_using_store(root.canonicalize()?, timeline, overlay, self.store.clone())
+        Self::attach_using_store(
+            root.canonicalize()?,
+            timeline,
+            overlay,
+            self.store.clone(),
+            crate::gitignore::ceiling_from_env(),
+        )
     }
 
-    /// Attaches a timeline to a store session already held by its daemon writer.
+    /// Attaches a timeline to a store session already held by its daemon
+    /// writer, with `git_ceiling` bounding Git discovery as the client's own
+    /// environment would.
     pub fn attach_timeline_store(
         store: ObjectStore,
         root: &Path,
         timeline: Option<&str>,
         overlay: Option<PathBuf>,
+        git_ceiling: Option<OsString>,
     ) -> anyhow::Result<Self> {
         let _operation = crate::writer_wait::Operation::start();
-        Self::attach_using_store(root.canonicalize()?, timeline, overlay, store)
+        Self::attach_using_store(root.canonicalize()?, timeline, overlay, store, git_ceiling)
     }
 
     fn attach_using_store(
@@ -512,6 +532,7 @@ impl FurrowRepository {
         timeline: Option<&str>,
         overlay: Option<PathBuf>,
         mut store: ObjectStore,
+        git_ceiling: Option<OsString>,
     ) -> anyhow::Result<Self> {
         let home = IdentityHome::of(overlay.is_some() || timeline.is_some());
         let workspace_id = match timeline {
@@ -533,6 +554,7 @@ impl FurrowRepository {
                 .map(Overlay::new),
             path_index: Default::default(),
             capture_scope: Default::default(),
+            git_ceiling,
             #[cfg(windows)]
             previous_modes: Default::default(),
             change_tracker: Default::default(),
@@ -598,15 +620,19 @@ impl FurrowRepository {
             root,
             overlay,
             timeline,
+            crate::gitignore::ceiling_from_env(),
         )
     }
 
-    /// Opens an attached timeline without reopening the shared catalog or pack session.
+    /// Opens an attached timeline without reopening the shared catalog or pack
+    /// session, with `git_ceiling` bounding Git discovery as the client's own
+    /// environment would.
     pub fn open_timeline_store(
         mut store: ObjectStore,
         root: &Path,
         overlay: Option<PathBuf>,
         timeline: Option<&str>,
+        git_ceiling: Option<OsString>,
     ) -> anyhow::Result<Self> {
         let _operation = crate::writer_wait::Operation::start();
         let root = root
@@ -639,6 +665,7 @@ impl FurrowRepository {
                 .map(Overlay::new),
             path_index: Default::default(),
             capture_scope: Default::default(),
+            git_ceiling,
             #[cfg(windows)]
             previous_modes: Default::default(),
             change_tracker: Default::default(),
@@ -1754,6 +1781,7 @@ impl FurrowRepository {
                 self.store.root().parent().context("store has no parent")?,
                 &destination,
                 base,
+                self.git_ceiling.clone(),
             )?;
             (fork_repository, base)
         } else {
@@ -1927,6 +1955,7 @@ impl FurrowRepository {
                 self.store.root().parent().context("store has no parent")?,
                 destination,
                 base,
+                self.git_ceiling.clone(),
             )?;
             let head = repository.snapshot(None, SnapshotTrigger::ForkBase)?;
             Ok((repository, head))
@@ -2015,6 +2044,7 @@ impl FurrowRepository {
         data_dir: &Path,
         root: &Path,
         snapshot_id: ObjectId,
+        git_ceiling: Option<OsString>,
     ) -> anyhow::Result<Self> {
         let root = root.canonicalize()?;
         fs::create_dir_all(root.join(".furrow"))?;
@@ -2042,6 +2072,7 @@ impl FurrowRepository {
             overlay: None,
             path_index: Default::default(),
             capture_scope: Default::default(),
+            git_ceiling,
             #[cfg(windows)]
             previous_modes: Default::default(),
             change_tracker: Default::default(),
@@ -3359,7 +3390,7 @@ impl FurrowRepository {
             Some(overlay) => own.union(&CapturePolicy::load(overlay.source())?),
             None => own,
         };
-        let policy = policy.resolve_gitignore(&self.root)?;
+        let policy = policy.resolve_gitignore(&self.root, self.git_ceiling.as_deref())?;
         Ok(if self.overlay.is_some() {
             policy.with_virtual_subtree(overlay::NAME)
         } else {

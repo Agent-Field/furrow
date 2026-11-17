@@ -4,6 +4,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
@@ -148,9 +149,15 @@ impl CapturePolicy {
     }
 
     /// Resolving policy reads control files only; capture discovers omitted names as it walks.
-    pub fn resolve_gitignore(mut self, root: &Path) -> anyhow::Result<Self> {
+    /// `ceiling` is Git's discovery boundary for `root`, the same value Git
+    /// reads from `GIT_CEILING_DIRECTORIES`; none leaves every ancestor discoverable.
+    pub fn resolve_gitignore(
+        mut self,
+        root: &Path,
+        ceiling: Option<&OsStr>,
+    ) -> anyhow::Result<Self> {
         if self.gitignore {
-            self.matcher = crate::gitignore::Rules::discover(root)?.map(RefCell::new);
+            self.matcher = crate::gitignore::Rules::discover(root, ceiling)?.map(RefCell::new);
         }
         Ok(self)
     }
@@ -313,7 +320,7 @@ mod tests {
         fs::write(root.join(".gitignore"), "bad*\n").unwrap();
         let policy = CapturePolicy::load(root)
             .unwrap()
-            .resolve_gitignore(root)
+            .resolve_gitignore(root, None)
             .unwrap();
         for suffix in 128..154 {
             let mut name = b"bad".to_vec();

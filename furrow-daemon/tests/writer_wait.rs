@@ -43,6 +43,7 @@ fn m1_retained_daemon_catalog_then_pack_wait_has_one_deadline() {
         tree: temp.path().join("tree"),
         timeline: Some("chat".into()),
         cell_dir: None,
+        ceiling: None,
     };
     let router = Router::new();
     router.submit(target.clone(), &Open, json!({})).unwrap();
@@ -116,6 +117,7 @@ fn m1_expired_queued_request_is_refused_before_its_verb_runs() {
         tree: temp.path().join("tree"),
         timeline: Some("chat".into()),
         cell_dir: None,
+        ceiling: None,
     };
     let router = Arc::new(Router::new());
     let worker_router = Arc::clone(&router);
@@ -159,6 +161,7 @@ fn m1_p1_running_work_is_not_reported_as_writer_contention() {
         tree: temp.path().join("tree"),
         timeline: Some("chat".into()),
         cell_dir: None,
+        ceiling: None,
     };
     let router = Router::new();
     router.submit(target.clone(), &Open, json!({})).unwrap();
@@ -203,6 +206,7 @@ fn q1_queue_proceeds_when_the_holder_releases() {
         tree: temp.path().join("tree"),
         timeline: None,
         cell_dir: None,
+        ceiling: None,
     };
     let router = Arc::new(Router::new());
     let worker_router = router.clone();

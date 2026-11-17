@@ -71,7 +71,8 @@ fn calculate_with_workspace(
     store: &ObjectStore,
     workspace: WorkspaceSelection,
 ) -> anyhow::Result<CaptureEstimate> {
-    let policy = CapturePolicy::load(root)?.resolve_gitignore(root)?;
+    let ceiling = crate::gitignore::ceiling_from_env();
+    let policy = CapturePolicy::load(root)?.resolve_gitignore(root, ceiling.as_deref())?;
     let database = tempfile::NamedTempFile::new()?;
     let mut connection = Connection::open(database.path())?;
     connection.execute_batch(

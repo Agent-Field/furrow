@@ -63,6 +63,7 @@ fn setup() -> (tempfile::TempDir, Target) {
         data_dir: dir.path().join("data"),
         cell_dir: None,
         timeline: Some("first".to_owned()),
+        ceiling: None,
     };
     (dir, target)
 }
