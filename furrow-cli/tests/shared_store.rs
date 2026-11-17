@@ -1447,7 +1447,6 @@ fn ceiling_fence_keeps_an_explicit_workspace_policy_whole() {
             (false, true) => "cell policy",
             (true, true) => "both policies",
             (false, false) => "no directive",
-            _ => unreachable!(),
         };
         assert_eq!(
             fs::read_to_string(restored.join("words.txt")).unwrap(),
