@@ -295,7 +295,14 @@ fn discovery_fence(root: &Path, ceiling: Option<&OsStr>) -> Option<PathBuf> {
             };
             canonical.as_os_str().as_encoded_bytes().to_vec()
         } else {
-            entry.to_vec()
+            // Raw entries still fence: Git's `longest_ancestor_length` strips
+            // one trailing separator before matching, so a raw `dir/` fences
+            // `dir` the way a canonicalized one does.
+            let mut bytes = entry.to_vec();
+            if bytes.len() > 1 && bytes.last() == Some(&b'/') {
+                bytes.pop();
+            }
+            bytes
         };
         if proper_ancestor(root_bytes, &candidate)
             && fence
@@ -948,6 +955,30 @@ mod tests {
             ),
         ];
         for (ceiling, shape) in inert_or_fence {
+            let found = ours(ceiling.as_deref());
+            assert_eq!(
+                found,
+                rev_parse(ceiling.as_deref()),
+                "{shape}: discovery disagreed with git"
+            );
+        }
+
+        // Raw entries (after an empty entry) compare byte for byte against
+        // the resolved path, the way Git matches them once
+        // longest_ancestor_length has stripped one trailing separator; the
+        // filesystem root fences nothing.
+        let raw_shapes = [
+            (
+                Some(format!(":{}", boundary.display()).into()),
+                "empty entry then ancestor",
+            ),
+            (
+                Some(format!(":{}/", boundary.display()).into()),
+                "empty entry then trailing slash",
+            ),
+            (Some(OsString::from("/")), "filesystem root ceiling"),
+        ];
+        for (ceiling, shape) in raw_shapes {
             let found = ours(ceiling.as_deref());
             assert_eq!(
                 found,
