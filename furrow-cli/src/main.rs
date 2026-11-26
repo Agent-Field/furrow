@@ -785,21 +785,30 @@ fn main() -> anyhow::Result<()> {
             let mut repository = open_selected(&cli.repo, cell_dir)?;
             let target = repository.resolve_snapshot(&snapshot)?;
             let plan = repository.plan_rewind(&target, &paths)?;
-            if cli.json || dry_run {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-            } else {
-                print_plan(&plan);
-            }
             if dry_run || plan.changes.is_empty() {
+                if cli.json || dry_run {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    print_plan(&plan);
+                }
                 return Ok(());
+            }
+            if !cli.json {
+                print_plan(&plan);
             }
             if !yes {
                 anyhow::ensure!(
                     io::stdin().is_terminal(),
                     "non-interactive rewind requires --yes"
                 );
-                print!("Apply this rewind? [y/N] ");
-                io::stdout().flush()?;
+                if cli.json {
+                    eprintln!("{}", serde_json::to_string_pretty(&plan)?);
+                    eprint!("Apply this rewind? [y/N] ");
+                    io::stderr().flush()?;
+                } else {
+                    print!("Apply this rewind? [y/N] ");
+                    io::stdout().flush()?;
+                }
                 let mut answer = String::new();
                 io::stdin().read_line(&mut answer)?;
                 anyhow::ensure!(answer.trim().eq_ignore_ascii_case("y"), "rewind cancelled");

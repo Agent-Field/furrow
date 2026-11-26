@@ -339,11 +339,18 @@ fn path_rewind_restores_ignored_secret_without_touching_new_work() {
         b"TOKEN=destroyed\n"
     );
 
-    fixture
+    let applied = fixture
         .furrow()
-        .args(["rewind", &snapshot, "--paths", ".env", "--yes"])
+        .args(["--json", "rewind", &snapshot, "--paths", ".env", "--yes"])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let applied: Value = serde_json::from_slice(&applied).unwrap();
+    assert_eq!(applied["restored"], snapshot);
+    assert_eq!(applied["changes"], 1);
+    assert_eq!(applied["pre_rewind_snapshot"].as_str().unwrap().len(), 64);
     assert_eq!(
         fs::read(fixture.repo.join(".env")).unwrap(),
         b"TOKEN=original\n"
